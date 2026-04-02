@@ -54,6 +54,14 @@ wspr-ctl health
 journalctl -u wspr-recorder -f
 ```
 
+To upgrade (idempotent - updates all dependencies including ka9q-python):
+```bash
+cd wspr-recorder
+git pull
+sudo ./install.sh
+sudo systemctl restart wspr-recorder
+```
+
 To uninstall:
 ```bash
 sudo ./install.sh --uninstall

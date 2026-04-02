@@ -1,16 +1,20 @@
 #!/bin/bash
 #
-# wspr-recorder installation script
+# wspr-recorder installation/upgrade script
 #
-# Installs wspr-recorder as a systemd service with:
+# Installs or upgrades wspr-recorder as a systemd service with:
 # - Virtual environment in /opt/wspr-recorder
 # - Configuration in /etc/wspr-recorder
 # - Runtime files in /run/wspr-recorder (tmpfs)
 # - WAV output in /dev/shm/wspr-recorder (tmpfs)
 # - Logs via journald
 #
+# The script is idempotent - running it multiple times will upgrade
+# the installation, including all dependencies (e.g., ka9q-python).
+#
 # Usage:
-#   sudo ./install.sh [--uninstall]
+#   sudo ./install.sh              # Install or upgrade
+#   sudo ./install.sh --uninstall  # Remove installation
 #
 
 set -e
@@ -99,22 +103,43 @@ install_application() {
     # Create installation directory
     mkdir -p "$INSTALL_DIR"
     
-    # Create virtual environment
-    info "Creating virtual environment..."
-    python3 -m venv "$INSTALL_DIR/venv"
+    # Check if this is an upgrade
+    local IS_UPGRADE=false
+    if [[ -d "$INSTALL_DIR/venv" ]]; then
+        IS_UPGRADE=true
+        info "Existing installation detected - performing upgrade"
+    fi
     
-    # Upgrade pip
+    # Create or upgrade virtual environment
+    if [[ "$IS_UPGRADE" == true ]]; then
+        info "Upgrading virtual environment..."
+        python3 -m venv --upgrade "$INSTALL_DIR/venv"
+    else
+        info "Creating virtual environment..."
+        python3 -m venv "$INSTALL_DIR/venv"
+    fi
+    
+    # Upgrade pip and wheel
     "$INSTALL_DIR/venv/bin/pip" install --upgrade pip wheel
     
-    # Install the package
-    info "Installing wspr-recorder..."
+    # Install/upgrade the package and all dependencies
+    info "Installing/upgrading wspr-recorder and dependencies..."
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
-    "$INSTALL_DIR/venv/bin/pip" install "$SCRIPT_DIR"
+    if [[ "$IS_UPGRADE" == true ]]; then
+        # Force upgrade of all dependencies including ka9q-python
+        "$INSTALL_DIR/venv/bin/pip" install --upgrade --force-reinstall "$SCRIPT_DIR"
+    else
+        "$INSTALL_DIR/venv/bin/pip" install "$SCRIPT_DIR"
+    fi
     
     # Set ownership
     chown -R "$SERVICE_USER:$SERVICE_GROUP" "$INSTALL_DIR"
     
-    info "Application installed"
+    if [[ "$IS_UPGRADE" == true ]]; then
+        info "Application upgraded"
+    else
+        info "Application installed"
+    fi
 }
 
 install_config() {
@@ -274,32 +299,56 @@ uninstall() {
 }
 
 show_status() {
+    local IS_UPGRADE=false
+    if systemctl is-enabled --quiet wspr-recorder 2>/dev/null; then
+        IS_UPGRADE=true
+    fi
+    
     echo ""
-    echo "=============================================="
-    echo "  wspr-recorder installation complete"
-    echo "=============================================="
+    if [[ "$IS_UPGRADE" == true ]]; then
+        echo "=============================================="
+        echo "  wspr-recorder upgrade complete"
+        echo "=============================================="
+    else
+        echo "=============================================="
+        echo "  wspr-recorder installation complete"
+        echo "=============================================="
+    fi
     echo ""
     echo "Installation directory: $INSTALL_DIR"
     echo "Configuration file:     $CONFIG_DIR/config.toml"
     echo "IPC socket:             $RUN_DIR/control.sock"
     echo "WAV output:             $OUTPUT_DIR/<band>/"
     echo ""
-    echo "Next steps:"
-    echo "  1. Edit configuration:"
-    echo "     sudo nano $CONFIG_DIR/config.toml"
-    echo ""
-    echo "  2. Start the service:"
-    echo "     sudo systemctl start wspr-recorder"
-    echo ""
-    echo "  3. Enable on boot:"
-    echo "     sudo systemctl enable wspr-recorder"
-    echo ""
-    echo "  4. Check status:"
-    echo "     sudo systemctl status wspr-recorder"
-    echo "     wspr-ctl health"
-    echo ""
-    echo "  5. View logs:"
-    echo "     journalctl -u wspr-recorder -f"
+    if [[ "$IS_UPGRADE" == true ]]; then
+        echo "Next steps:"
+        echo "  1. Restart the service to use updated version:"
+        echo "     sudo systemctl restart wspr-recorder"
+        echo ""
+        echo "  2. Check status:"
+        echo "     sudo systemctl status wspr-recorder"
+        echo "     wspr-ctl health"
+        echo ""
+        echo "  3. View logs:"
+        echo "     journalctl -u wspr-recorder -f"
+    else
+        echo "Next steps:"
+        echo "  1. Edit configuration:"
+        echo "     sudo nano $CONFIG_DIR/config.toml"
+        echo ""
+        echo "  2. Start the service:"
+        echo "     sudo systemctl start wspr-recorder"
+        echo ""
+        echo "  3. Enable on boot:"
+        echo "     sudo systemctl enable wspr-recorder"
+        echo ""
+        echo "  4. Check status:"
+        echo "     sudo systemctl status wspr-recorder"
+        echo "     wspr-ctl health"
+        echo ""
+        echo "  5. View logs:"
+        echo "     journalctl -u wspr-recorder -f"
+    fi
     echo ""
 }
 

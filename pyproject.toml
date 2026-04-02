@@ -10,7 +10,7 @@ readme = "README.md"
 license = {text = "MIT"}
 requires-python = ">=3.9"
 authors = [
-    {name = "MJH", email = "mjh@example.com"}
+    {name = "Michael James Hauan", email = "ac0g@hauan.org"}
 ]
 keywords = ["wspr", "sdr", "ka9q", "radio", "recording"]
 classifiers = [
