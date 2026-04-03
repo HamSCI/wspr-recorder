@@ -178,12 +178,13 @@ class WavWriter:
             tmp_path = band_dir / f".{filename}.tmp"
             json_path = band_dir / f"{filename[:-4]}.json"  # Replace .wav with .json
             
-            # Convert samples if needed
+            # Samples arrive as float32 from BandRecorder.
+            # Write directly as float32 (default) or convert to int16 if configured.
             if self.sample_format == "int16":
                 output_samples = samples_to_int16(samples)
                 sample_width = 2
             else:
-                output_samples = samples.astype(np.float32)
+                output_samples = samples
                 sample_width = 4
             
             # Write WAV file atomically

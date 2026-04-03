@@ -9,7 +9,6 @@ Per-band recording logic:
 """
 
 import logging
-import struct
 import numpy as np
 from dataclasses import dataclass, field
 from typing import Optional, Callable, List
@@ -19,12 +18,6 @@ from concurrent.futures import ThreadPoolExecutor
 from .rtp_ingest import RTPHeader
 
 logger = logging.getLogger(__name__)
-
-
-# Constants
-# Constants
-# SAMPLES_PER_MINUTE is now calculated per instance: self.sample_rate * 60
-SAMPLES_PER_PACKET = 960 // 4  # 960 bytes / 4 bytes per float32 = 240 samples
 
 
 @dataclass
@@ -136,9 +129,10 @@ class BandRecorder:
         self._initialized = False
         self._synced = False  # True after first minute boundary
         
-        # Max gap to fill (2 seconds)
+        # Cached constants
+        self._samples_per_minute = self.sample_rate * 60
         self.max_gap_samples = self.sample_rate * 2
-        
+
         # Sample buffer
         self._buffer = self._create_buffer()
         
@@ -147,9 +141,8 @@ class BandRecorder:
     
     def _create_buffer(self) -> MinuteBuffer:
         """Create a new minute buffer."""
-        samples_per_minute = self.sample_rate * 60
         return MinuteBuffer(
-            samples=np.zeros(samples_per_minute, dtype=np.float32),
+            samples=np.zeros(self._samples_per_minute, dtype=np.float32),
             sample_count=0,
             gaps=[],
             start_rtp_timestamp=None,
@@ -302,8 +295,7 @@ class BandRecorder:
                 return
         
         # Calculate how many samples we can add
-        samples_per_minute = self.sample_rate * 60
-        space_available = samples_per_minute - self._buffer.sample_count
+        space_available = self._samples_per_minute - self._buffer.sample_count
         samples_to_add = min(len(samples), space_available)
         
         if samples_to_add > 0:
@@ -321,8 +313,7 @@ class BandRecorder:
     
     def _add_zeros(self, count: int) -> None:
         """Add zero samples to fill a gap."""
-        samples_per_minute = self.sample_rate * 60
-        space_available = samples_per_minute - self._buffer.sample_count
+        space_available = self._samples_per_minute - self._buffer.sample_count
         zeros_to_add = min(count, space_available)
         
         if zeros_to_add > 0:
@@ -349,13 +340,13 @@ class BandRecorder:
         else:
             self._buffer.start_wallclock = datetime.now(timezone.utc)
         
-        # Trigger callback
+        # Trigger callback — hand off the buffer slice directly (no copy needed
+        # since we already allocated a fresh buffer above)
         if self.on_minute_complete:
-            samples = completed_buffer.samples[:completed_buffer.sample_count].copy()
-            gaps = completed_buffer.gaps.copy()
+            samples = completed_buffer.samples[:completed_buffer.sample_count]
+            gaps = completed_buffer.gaps
             start_time = completed_buffer.start_wallclock or datetime.now(timezone.utc)
             rtp_start = completed_buffer.start_rtp_timestamp
-            # Calculate end RTP timestamp from start + samples
             rtp_end = rtp_start + len(samples) if rtp_start is not None else None
             
             self.stats.samples_written += len(samples)

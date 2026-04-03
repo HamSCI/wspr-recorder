@@ -145,7 +145,7 @@ class RecorderConfig:
     status_file: str = "status.json"
     max_file_age_minutes: int = 60
     max_files_per_band: int = 35
-    sample_format: str = "int16"  # "int16" or "float32"
+    sample_format: str = "float32"  # "int16" or "float32"
 
     @classmethod
     def from_dict(cls, data: dict) -> 'RecorderConfig':
@@ -155,7 +155,7 @@ class RecorderConfig:
             status_file=data.get("status_file", "status.json"),
             max_file_age_minutes=data.get("max_file_age_minutes", 60),
             max_files_per_band=data.get("max_files_per_band", 35),
-            sample_format=data.get("sample_format", "int16"),
+            sample_format=data.get("sample_format", "float32"),
         )
 
 
