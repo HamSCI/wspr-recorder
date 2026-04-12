@@ -35,16 +35,17 @@ The system is a pipeline: RTP multicast packets flow in, get demuxed by SSRC (on
 
 ```
 radiod RTP stream (12kHz S16BE per band)
-    → RTPIngest (rtp_ingest.py)           # Threaded UDP receiver, routes by SSRC
-        → BandRecorder (band_recorder.py) # Ring buffer, minute boundaries, decode scheduling
-            → at period boundary: extract_slice → WAV on tmpfs
-                → DecoderRunner (decoder.py)
-                    → wsprd (2-pass: standard + spreading, merged)
-                    → jt9 -Y --fst4w (with numeric hash output)
-                → CallsignDB (callsign_db.py)
-                    → resolves type-3 hashes across decoders and bands
-                → SpotProcessor (spot_processor.py)
-                    → filter → dedup → Vincenty geodesic → 34-field enhanced spots
+    → ka9q-python ManagedStream (per band)  # Channel provisioning, health monitor, auto-restore
+        → RadiodStream                      # UDP multicast, packet resequencing, S16BE→float32
+            → BandRecorder.on_samples()     # float32→int16 conversion, ring buffer, decode scheduling
+                → at period boundary: extract_slice → WAV on tmpfs
+                    → DecoderRunner (decoder.py)
+                        → wsprd (2-pass: standard + spreading, merged)
+                        → jt9 -Y --fst4w (with numeric hash output)
+                    → CallsignDB (callsign_db.py)
+                        → resolves type-3 hashes across decoders and bands
+                    → SpotProcessor (spot_processor.py)
+                        → filter → dedup → Vincenty geodesic → 34-field enhanced spots
 ```
 
 ### Five Decode Modes
@@ -62,11 +63,11 @@ All boundaries are epoch-aligned (`unix_timestamp % period == 0`). Modes are con
 ### Key Components
 
 **Orchestrator**: `WsprRecorder` in `__main__.py` wires everything together via callbacks:
-- `ReceiverManager` connects to radiod, creates channels, discovers SSRCs and multicast addresses
-- `_on_channel_ready` creates a `BandRecorder` with decode modes from config and a `SyncStrategy` from `TimingService`
+- `ReceiverManager` connects to radiod, provisions channels via ka9q-python `ManagedStream`
+- `_on_channel_ready` creates a `BandRecorder` and wires its `on_samples` callback into the ManagedStream
 - `_on_period_complete` triggers `WavWriter.write_period()` in a thread pool
 
-**Ring Buffer** (`ring_buffer.py`): Circular int16 sample buffer per band, sized to the longest configured decode period. Tracks `MinuteMark` positions so multi-minute slices can be extracted. No locking needed — all writes happen in the RTP ingest thread, `extract_slice` copies data before handing to the thread pool.
+**Ring Buffer** (`ring_buffer.py`): Circular int16 sample buffer per band, sized to the longest configured decode period. Tracks `MinuteMark` positions so multi-minute slices can be extracted. No locking needed — all writes happen in the ManagedStream callback thread, `extract_slice` copies data before handing to the thread pool.
 
 **Decode Scheduling** (`decode_mode.py`): `modes_completing_at_minute()` checks which decode modes have a period boundary at each minute. `BandRecorder._on_minute_boundary()` groups completing modes by period and extracts ring buffer slices.
 
@@ -88,16 +89,16 @@ All boundaries are epoch-aligned (`unix_timestamp % period == 0`). Modes are con
 ## Key Design Decisions
 
 - **Ring buffer replaces 1-minute files**: Instead of writing 1-minute WAVs and concatenating with sox (v3's approach), samples stay in a per-band circular buffer. At decode boundaries, the relevant window is sliced out and written as a single WAV. Eliminates sox, reduces file I/O, handles all period lengths uniformly.
-- **Int16 throughout**: Samples are kept as native int16 from RTP ingest through WAV output. No float32 intermediate — both wsprd and jt9 require int16 PCM and silently produce garbage with float32. S16BE from radiod is byte-swapped to S16LE at WAV write time.
+- **Int16 in ring buffer and WAV output**: ka9q-python decodes S16BE wire format to float32 in the `RadiodStream` callback. `BandRecorder.on_samples()` converts float32 → int16 via `clip(±1.0) × 32767` before writing to the ring buffer. Both wsprd and jt9 require int16 PCM WAV input. The float32 intermediate is a brief conversion at the callback boundary; the ring buffer and all downstream storage is int16.
 - **Sample-count minute boundaries**: Minutes are exactly 720,000 samples. Once the initial boundary is found, every subsequent minute is triggered by the ring buffer filling — no further clock checks. The grid is maintained via arithmetic propagation from the initial sync point.
 - **Cross-decoder hash resolution**: wsprd and jt9 use incompatible hash systems (15-bit vs 22-bit). `CallsignDB` maintains a unified lookup table, pre-populates both decoder formats before each run, and resolves jt9 `-Y` numeric hashes after decoding. This recovers type-3 spots that v3 discards as `<...>`.
 - **wsprd two-pass**: Standard pass + spreading variant, merged by preferring spots with spreading data, then best SNR. The spreading value replaces the metric field.
 - **Timing-aware initial sync**: `BandRecorder` delegates boundary detection to a `SyncStrategy`. `RtpSyncStrategy` correlates once with the wall clock and then uses the GPSDO-clocked RTP counter for sample-accurate alignment. `ClockSyncStrategy` uses microsecond-precision wall clock.
 - **Mid-packet boundaries**: When a minute boundary falls mid-packet, pre-boundary samples are skipped (`SyncDecision.sample_offset`) and the ring buffer naturally absorbs the remainder.
-- **Gap filling**: RTP sequence gaps are filled with zeros, tracked per minute in the ring buffer, and rebased when multi-minute slices are extracted.
+- **Gap filling**: ka9q-python's `PacketResequencer` fills RTP sequence gaps with zeros and reports them in `StreamQuality.batch_gaps`. `BandRecorder` records these in the ring buffer per minute, rebased when multi-minute slices are extracted for decoding.
 - **Atomic writes**: WAV files write to `.tmp` then rename, preventing partial reads by downstream consumers.
 - **Output on tmpfs**: Default output is `/dev/shm/wspr-recorder/` with auto-cleanup (max age + max files per band).
-- **Threaded RTP receiver**: `RTPIngest` uses a dedicated thread with 25MB socket buffer (not asyncio UDP) for reliable multicast reception. All ring buffer mutations happen in this thread — no locking needed.
+- **Standard ka9q-python stream infrastructure**: Uses `ManagedStream` (one per band) for all RTP reception, packet resequencing, S16BE decoding, and stream health monitoring — the same infrastructure as psk-recorder and hf-timestd. No custom UDP socket code.
 
 ## Configuration
 
@@ -129,7 +130,7 @@ pytest with pytest-asyncio (`asyncio_mode = "auto"`). Tests are in `tests/`. 159
 - `test_decode_mode.py` — scheduling logic, period boundaries, mode grouping
 - `test_drift_tracker.py` — drift measurement, ppm calculation, history
 - `test_ring_buffer.py` — write/extract, wrap-around, gap handling, eviction
-- `test_band_recorder_ring.py` — end-to-end: packets → ring → DecodeRequest with int16, multi-period, gaps, drift
+- `test_band_recorder_ring.py` — end-to-end: float32 samples → int16 ring → DecodeRequest, multi-period, gaps, drift
 - `test_callsign_db.py` — both hash algorithms, cross-decoder resolution, persistence
 - `test_decoder.py` — ALL_WSPR.TXT parsing, fst4_decodes.dat parsing, 2-pass merge, -Y hash resolution
 - `test_spot_processor.py` — grid→latlon, Vincenty geodesic, filter/dedup, 34-field and 11-field output
@@ -142,3 +143,58 @@ WAV format confirmed compatible with both decoders via live radiod recording:
 - `wsprd-x86-v27` (in `/home/mjh/git/wsprdaemon/bin/`): accepts 12kHz int16 mono WAV, writes .c2
 - `jt9-x86-v27` with `-Y` flag: accepts same WAV, outputs numeric 22-bit hashes
 - `wsprd.spread-x86-v27`: no-drift behavior built in, does not accept `-n` flag
+
+## Significant Changes
+
+### 2026-04-12: Replace custom RTP ingest with ka9q-python ManagedStream
+
+**What changed.** Deleted `rtp_ingest.py` (382 lines) and the custom
+health-monitor thread in `receiver_manager.py`. All RTP packet
+reception, resequencing, gap filling, sample decoding, and stream
+recovery are now handled by ka9q-python's `ManagedStream` — the
+same infrastructure used by `psk-recorder` and `hf-timestd`. Net
+result: −521 lines, 159/159 tests pass.
+
+**Why.** wspr-recorder had reimplemented three layers of functionality
+already present in ka9q-python:
+
+1. `rtp_ingest.py` — custom RTP header parser, multicast socket
+   management, SSRC demux, and threaded receive loop, duplicating
+   `RadiodStream`.
+2. `receiver_manager.py` health monitor — stale-channel detection and
+   `ensure_channel()` restore loop, duplicating `ManagedStream`'s
+   auto-recovery.
+3. Raw S16BE payload byte handling — per-packet `np.frombuffer()` in
+   `BandRecorder.on_packet()`, duplicating `RadiodStream._parse_samples()`.
+
+Maintaining parallel implementations across clients creates divergent
+behavior, complicates debugging, and means upstream improvements to
+ka9q-python (like the S16BE fix in v3.7.1) don't reach wspr-recorder.
+Standardizing on `ManagedStream` ensures all HamSCI clients share
+one tested, well-understood stream path.
+
+**Byte-order bug fixed.** The old `BandRecorder.on_packet()` parsed
+S16BE (big-endian) payloads as native (little-endian) int16 via
+`np.frombuffer(payload, dtype=np.int16)`. On x86, this byte-swaps
+every sample: a value of 1000 (0x03E8) became −6141 (0xE803). The
+ring buffer stored these garbled values, and `wave.writeframes()`
+wrote them to disk. wsprd still decoded spots because WSPR's FSK
+modulation is robust to signal distortion, but SNR values were
+incorrect and marginal signals that should have decoded were lost.
+
+ka9q-python 3.7.1 correctly decodes S16BE payloads to float32 in
+`RadiodStream._parse_samples()`. `BandRecorder.on_samples()` then
+converts float32 → int16 via `clip(±1.0) × 32767`, producing
+correctly-valued native int16 samples. There is a ±1 LSB rounding
+difference from the float32 intermediate (e.g., 1000 → 999), which
+is 0.003% and inaudible. Decode yield on marginal signals should
+improve.
+
+**New sample flow:**
+```
+radiod S16BE wire → ka9q-python RadiodStream (S16BE→float32, resequenced, gap-filled)
+  → ManagedStream callback → BandRecorder.on_samples(float32, StreamQuality)
+    → clip(±1.0) × 32767 → int16 → ring buffer → extract_slice → WAV
+```
+
+**Requires:** ka9q-python ≥ 3.7.1 (PyPI: `pip install ka9q-python>=3.7.1`).
