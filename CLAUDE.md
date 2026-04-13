@@ -35,9 +35,9 @@ The system is a pipeline: RTP multicast packets flow in, get demuxed by SSRC (on
 
 ```
 radiod RTP stream (12kHz S16BE per band)
-    → ka9q-python ManagedStream (per band)  # Channel provisioning, health monitor, auto-restore
-        → RadiodStream                      # UDP multicast, packet resequencing, S16BE→float32
-            → BandRecorder.on_samples()     # float32→int16 conversion, ring buffer, decode scheduling
+    → ka9q-python MultiStream (one per multicast group, shared socket)
+        → per-channel ChannelSink → BandRecorder.on_samples()
+                                    (float32→int16, ring buffer, decode scheduling)
                 → at period boundary: extract_slice → WAV on tmpfs
                     → DecoderRunner (decoder.py)
                         → wsprd (2-pass: standard + spreading, merged)
@@ -63,11 +63,11 @@ All boundaries are epoch-aligned (`unix_timestamp % period == 0`). Modes are con
 ### Key Components
 
 **Orchestrator**: `WsprRecorder` in `__main__.py` wires everything together via callbacks:
-- `ReceiverManager` connects to radiod, provisions channels via ka9q-python `ManagedStream`
-- `_on_channel_ready` creates a `BandRecorder` and wires its `on_samples` callback into the ManagedStream
+- `ReceiverManager` connects to radiod; for each frequency calls `ensure_channel()`, keys a `MultiStream` by `(mcast_addr, port)`, and registers the channel on the matching `MultiStream`
+- `_build_sink` (the sink factory) creates the `BandRecorder` and returns a `ChannelSink` holding `on_samples`/`on_stream_dropped`/`on_stream_restored` — passed straight into `MultiStream.add_channel()` at registration (no post-hoc callback wiring)
 - `_on_period_complete` triggers `WavWriter.write_period()` in a thread pool
 
-**Ring Buffer** (`ring_buffer.py`): Circular int16 sample buffer per band, sized to the longest configured decode period. Tracks `MinuteMark` positions so multi-minute slices can be extracted. No locking needed — all writes happen in the ManagedStream callback thread, `extract_slice` copies data before handing to the thread pool.
+**Ring Buffer** (`ring_buffer.py`): Circular int16 sample buffer per band, sized to the longest configured decode period. Tracks `MinuteMark` positions so multi-minute slices can be extracted. No locking needed — all writes happen in the MultiStream callback thread, `extract_slice` copies data before handing to the thread pool.
 
 **Decode Scheduling** (`decode_mode.py`): `modes_completing_at_minute()` checks which decode modes have a period boundary at each minute. `BandRecorder._on_minute_boundary()` groups completing modes by period and extracts ring buffer slices.
 
@@ -98,7 +98,7 @@ All boundaries are epoch-aligned (`unix_timestamp % period == 0`). Modes are con
 - **Gap filling**: ka9q-python's `PacketResequencer` fills RTP sequence gaps with zeros and reports them in `StreamQuality.batch_gaps`. `BandRecorder` records these in the ring buffer per minute, rebased when multi-minute slices are extracted for decoding.
 - **Atomic writes**: WAV files write to `.tmp` then rename, preventing partial reads by downstream consumers.
 - **Output on tmpfs**: Default output is `/dev/shm/wspr-recorder/` with auto-cleanup (max age + max files per band).
-- **Standard ka9q-python stream infrastructure**: Uses `ManagedStream` (one per band) for all RTP reception, packet resequencing, S16BE decoding, and stream health monitoring — the same infrastructure as psk-recorder and hf-timestd. No custom UDP socket code.
+- **Standard ka9q-python stream infrastructure**: Uses `MultiStream` (one per multicast group, shared socket) for all RTP reception, packet resequencing, S16BE decoding, and stream health monitoring — the same infrastructure as psk-recorder and hf-timestd. No custom UDP socket code.
 
 ## Configuration
 
@@ -146,7 +146,7 @@ WAV format confirmed compatible with both decoders via live radiod recording:
 
 ## Significant Changes
 
-### 2026-04-12: Replace custom RTP ingest with ka9q-python ManagedStream
+### 2026-04-12: Replace custom RTP ingest with ka9q-python MultiStream
 
 **What changed.** Deleted `rtp_ingest.py` (382 lines) and the custom
 health-monitor thread in `receiver_manager.py`. All RTP packet

@@ -20,7 +20,7 @@ from typing import Dict, List, Optional
 import numpy as np
 
 from .config import Config, load_config, freq_to_band_name
-from .receiver_manager import ReceiverManager, ChannelState
+from .receiver_manager import ReceiverManager, ChannelState, ChannelSink
 from .band_recorder import BandRecorder, GapEvent, DecodeRequest
 from .wav_writer import WavWriter
 from .timing_service import TimingService
@@ -35,7 +35,7 @@ class WsprRecorder:
     Main WSPR recorder application.
 
     Coordinates:
-    - ReceiverManager: radiod channel lifecycle via ka9q-python ManagedStream
+    - ReceiverManager: radiod channel lifecycle via ka9q-python MultiStream
     - BandRecorder: per-band sample buffering + decode scheduling
     - WavWriter: file output
     """
@@ -69,20 +69,19 @@ class WsprRecorder:
         self._shutdown_event: Optional[asyncio.Event] = None
         self._start_time: Optional[float] = None
     
-    def _on_channel_ready(self, ssrc: int, channel_state: ChannelState) -> None:
-        """
-        Called when a channel is ready in radiod.
+    def _build_sink(self, ssrc: int, channel_state: ChannelState) -> ChannelSink:
+        """Sink factory: build BandRecorder and return its ChannelSink.
 
-        Creates BandRecorder and wires its on_samples callback into
-        the channel's ManagedStream via ReceiverManager.
+        Called by ReceiverManager during provisioning, once per channel,
+        with the SSRC and ChannelState freshly populated from
+        ensure_channel(). The returned callbacks are handed directly to
+        MultiStream.add_channel() — no post-hoc wiring.
         """
         logger.info(f"Channel ready: SSRC {ssrc} -> {channel_state.band_name}")
 
-        # Look up per-band decode modes from config
         band_config = self.config.get_band_config(channel_state.frequency_hz)
         decode_modes = [DecodeMode(m) for m in band_config.modes]
 
-        # Create band recorder with timing-aware sync strategy
         sync_strategy = self.timing_service.create_sync_strategy(
             sample_rate=self.config.channel_defaults.sample_rate,
         )
@@ -96,28 +95,25 @@ class WsprRecorder:
             executor=self.executor,
             sync_strategy=sync_strategy,
         )
-
         self.band_recorders[ssrc] = recorder
 
-        # Wire sample callback into ManagedStream
-        def on_samples_wrapper(samples, quality):
+        def on_samples(samples, quality):
             if self.receiver_manager:
                 self.receiver_manager.record_samples(ssrc, len(samples))
             recorder.on_samples(samples, quality)
 
-        def on_dropped_wrapper(reason):
+        def on_stream_dropped(reason):
             logger.warning(f"{channel_state.band_name}: Stream dropped — {reason}")
             channel_state.drop_count += 1
 
-        def on_restored_wrapper(channel_info):
+        def on_stream_restored(channel_info):
             logger.info(f"{channel_state.band_name}: Stream restored")
             channel_state.restore_count += 1
 
-        self.receiver_manager.set_sample_callback(
-            ssrc,
-            on_samples_cb=on_samples_wrapper,
-            on_dropped_cb=on_dropped_wrapper,
-            on_restored_cb=on_restored_wrapper,
+        return ChannelSink(
+            on_samples=on_samples,
+            on_stream_dropped=on_stream_dropped,
+            on_stream_restored=on_stream_restored,
         )
     
     def _on_period_complete(self, request: DecodeRequest) -> None:
@@ -168,7 +164,7 @@ class WsprRecorder:
         """Periodically log channel health.
 
         Channel recovery is handled automatically by ka9q-python's
-        ManagedStream (auto-restore on stream drop). This loop only
+        MultiStream (auto-restore on stream drop). This loop only
         logs status.
         """
         await asyncio.sleep(self.STARTUP_GRACE_PERIOD)
@@ -356,20 +352,19 @@ class WsprRecorder:
         
         self.receiver_manager = ReceiverManager(
             config=self.config,
-            on_channel_ready=self._on_channel_ready,
+            sink_factory=self._build_sink,
         )
-        
+
         try:
-            # Connect to radiod and provision channels via ManagedStream.
-            # on_channel_ready callbacks create BandRecorders and wire
-            # sample callbacks into each ManagedStream.
+            # Provision all channels (ensure_channel + MultiStream.add_channel).
+            # sink_factory builds BandRecorders and returns their callbacks.
             logger.info("Connecting to radiod...")
             if not self.receiver_manager.connect():
                 logger.error("Failed to connect to radiod")
                 return
 
-            # Start all ManagedStreams (begins sample delivery)
-            logger.info("Starting ManagedStreams...")
+            # Start shared-socket MultiStreams (begins sample delivery)
+            logger.info("Starting MultiStreams...")
             self.receiver_manager.start_streams()
 
             # Start IPC server
@@ -414,7 +409,7 @@ class WsprRecorder:
         if self.ipc_server:
             await self.ipc_server.stop()
 
-        # Disconnect from radiod (stops all ManagedStreams)
+        # Disconnect from radiod (stops all MultiStreams)
         if self.receiver_manager:
             self.receiver_manager.shutdown()
         
