@@ -70,7 +70,18 @@ All boundaries are epoch-aligned (`unix_timestamp % period == 0`). Modes are con
 - `_build_sink` (the sink factory) creates the `BandRecorder` and returns a `ChannelSink` holding `on_samples`/`on_stream_dropped`/`on_stream_restored` — passed straight into `MultiStream.add_channel()` at registration (no post-hoc callback wiring)
 - `_on_period_complete` triggers `WavWriter.write_period()` in a thread pool
 
-**Ring Buffer** (`ring_buffer.py`): Circular int16 sample buffer per band, sized to the longest configured decode period. Tracks `MinuteMark` positions so multi-minute slices can be extracted. No locking needed — all writes happen in the MultiStream callback thread, `extract_slice` copies data before handing to the thread pool.
+**Ring Buffer** (`ring_buffer.py`): Circular float32 sample buffer per band. Tracks `MinuteMark` positions so multi-minute slices can be extracted. No locking needed — all writes happen in the MultiStream callback thread, `extract_slice` copies data before handing to the thread pool.
+
+*Sizing rule*: `capacity = max_period_seconds(band.modes) + 120`. The capacity is derived per band from its configured decode modes — each band pays only for what its `modes = [...]` list requires. A W2-only HF band allocates a 4-minute ring; only bands that enable F30 (typically 2200 m and 630 m) pay the full 32-minute ring.
+
+The +120 s headroom above the longest period exists so that the W2 cycle that straddles the longest period's odd boundary (e.g. W2 covering minutes 4-5, which completes at minute 6, one tick *after* F5 fires at minute 5) remains fully in the ring with margin against a delayed minute-boundary tick. This is exercised by `test_w2_straddles_f5_boundary`.
+
+| Band's configured modes | Longest period | Ring capacity | Memory (float32, 12 kHz) |
+|---|---|---|---|
+| `[W2]` or `[W2, F2]` | 120 s | 240 s (4 min) | 11 MB |
+| `[W2, F2, F5]` | 300 s | 420 s (7 min) | 20 MB |
+| `[W2, F2, F5, F15]` | 900 s | 1020 s (17 min) | 49 MB |
+| `[W2, F2, F5, F15, F30]` | 1800 s | 1920 s (32 min) | 92 MB |
 
 **Decode Scheduling** (`decode_mode.py`): `modes_completing_at_minute()` checks which decode modes have a period boundary at each minute. `BandRecorder._on_minute_boundary()` groups completing modes by period and extracts ring buffer slices.
 
@@ -94,6 +105,7 @@ All boundaries are epoch-aligned (`unix_timestamp % period == 0`). Modes are con
 - **Ring buffer replaces 1-minute files**: Instead of writing 1-minute WAVs and concatenating with sox (v3's approach), samples stay in a per-band circular buffer. At decode boundaries, the relevant window is sliced out and written as a single WAV. Eliminates sox, reduces file I/O, handles all period lengths uniformly.
 - **Float32 in ring buffer, per-period peak-normalized int16 WAV output**: ka9q-python delivers float32 samples to `BandRecorder.on_samples()` regardless of wire encoding (configurable via `channel_defaults.encoding`; default `f32` preserves radiod's internal precision). Samples are stored as float32 in the ring buffer — the full dynamic range is preserved all the way to WAV-write time. `WavWriter.write_period()` computes the float32 peak across the entire period, scales to full int16 range (`scale = 32767 / peak`), and writes int16 PCM. The applied `int16_scale` and `float32_peak` are recorded in the JSON sidecar so absolute amplitude can be reconstructed. This maximizes decoder SNR on weak WSPR signals, where a fixed `× 32767` conversion would waste 5-6 bits of the int16 range.
 - **Sample-count minute boundaries**: Minutes are exactly 720,000 samples. Once the initial boundary is found, every subsequent minute is triggered by the ring buffer filling — no further clock checks. The grid is maintained via arithmetic propagation from the initial sync point.
+- **Per-band ring sizing from configured modes**: Ring capacity = longest decode period for that band + 120 s headroom. The ring is a continuous sliding window — `extract_slice()` copies samples without evicting them; eviction happens only when a new minute closes and the bounded deque is at `maxlen`. The +120 s headroom ensures the W2 cycle that straddles an odd F-cycle boundary (F5 at :05, F15 at :15) still has both of its minutes resident when W2 fires one minute later.
 - **Cross-decoder hash resolution**: wsprd and jt9 use incompatible hash systems (15-bit vs 22-bit). `CallsignDB` maintains a unified lookup table, pre-populates both decoder formats before each run, and resolves jt9 `-Y` numeric hashes after decoding. This recovers type-3 spots that v3 discards as `<...>`.
 - **wsprd two-pass**: Standard pass + spreading variant, merged by preferring spots with spreading data, then best SNR. The spreading value replaces the metric field.
 - **Timing-aware initial sync**: `BandRecorder` delegates boundary detection to a `SyncStrategy`. `RtpSyncStrategy` correlates once with the wall clock and then uses the GPSDO-clocked RTP counter for sample-accurate alignment. `ClockSyncStrategy` uses microsecond-precision wall clock.

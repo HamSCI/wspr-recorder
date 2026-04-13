@@ -103,8 +103,15 @@ high = 1700
 # float32 to preserve dynamic range; int16 conversion + per-period peak
 # normalization happens at WAV-write time).
 #
-# Memory per band (float32): W2/F2 = ~5.8 MB, F5 = ~14 MB,
-#                             F15 = ~43 MB, F30 = ~86 MB
+# Ring capacity per band = longest configured period + 120 s headroom.
+# The +120 s keeps the W2 cycle that straddles an odd F-cycle boundary
+# (e.g. F5 at minute 5, F15 at minute 15) fully in the ring with margin.
+#
+# Memory per band (float32 @ 12 kHz):
+#   W2/F2 only          (ring =  4 min)  ≈ 11 MB
+#   + F5   adds 300 s   (ring =  7 min)  ≈ 20 MB
+#   + F15  adds 900 s   (ring = 17 min)  ≈ 49 MB
+#   + F30  adds 1800 s  (ring = 32 min)  ≈ 92 MB
 # --------------------------------------------------------------------------
 
 [[band]]
