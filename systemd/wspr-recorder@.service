@@ -16,6 +16,15 @@ NotifyAccess=main
 EnvironmentFile=-/etc/sigmond/coordination.env
 EnvironmentFile=-/etc/wspr-recorder/env/%i.env
 
+# Limit glibc malloc arenas to 2. Default is 8*ncpus, which on a 16-core
+# host fragments heavily when F15/F30 slices allocate+free 86-172 MB
+# numpy buffers per decode cycle. Profiled 2026-04-14: tracemalloc-tracked
+# Python heap stays flat while RSS grows ~2-10 MB/min from arena
+# high-water marks; malloc_trim(0) instantly releases ~100 MB.
+# MALLOC_ARENA_MAX=2 eliminates the fragmentation at negligible
+# allocator-contention cost for this workload.
+Environment=MALLOC_ARENA_MAX=2
+
 WorkingDirectory=/opt/wspr-recorder
 
 ExecStartPre=+/bin/mkdir -p /dev/shm/wspr-recorder

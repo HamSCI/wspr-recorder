@@ -12,6 +12,7 @@ import logging
 import signal
 import sys
 import time
+import tracemalloc
 from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
@@ -44,15 +45,21 @@ class WsprRecorder:
     STATUS_INTERVAL = 60    # 1 minute
     HEALTH_CHECK_INTERVAL = 120  # 2 minutes - give time for packets to arrive
     STARTUP_GRACE_PERIOD = 180  # 3 minutes before health checks start
+    MEMPROFILE_INTERVAL = 60  # tracemalloc snapshot cadence (seconds)
+    MEMPROFILE_TOP_N = 15     # top allocators reported per snapshot
     
-    def __init__(self, config: Config):
+    def __init__(self, config: Config, memprofile: bool = False):
         """
         Initialize WSPR recorder.
-        
+
         Args:
             config: Loaded configuration
+            memprofile: If True, enable tracemalloc and log top allocators
+                periodically. See MEMPROFILE_INTERVAL / MEMPROFILE_TOP_N.
         """
         self.config = config
+        self._memprofile = memprofile
+        self._memprofile_baseline: Optional[tracemalloc.Snapshot] = None
         
         # Components
         self.receiver_manager: Optional[ReceiverManager] = None
@@ -147,6 +154,58 @@ class WsprRecorder:
             except Exception as e:
                 logger.error(f"Cleanup error: {e}")
     
+    def _executor_backlog(self) -> int:
+        """Number of submitted tasks not yet picked up by a worker.
+
+        `ThreadPoolExecutor` has no public accessor; `_work_queue.qsize()`
+        is the standard workaround used throughout stdlib discussions.
+        Returns 0 if introspection fails.
+        """
+        try:
+            return self.executor._work_queue.qsize()
+        except Exception:
+            return 0
+
+    async def _memprofile_loop(self) -> None:
+        """Periodically log top tracemalloc allocators vs. baseline.
+
+        Only runs when --memprofile was passed. Baseline is captured once
+        after first snapshot so subsequent reports show *growth*, which
+        is what we care about for leak hunting.
+        """
+        if not self._memprofile:
+            return
+        while self._running:
+            try:
+                await asyncio.sleep(self.MEMPROFILE_INTERVAL)
+                snap = tracemalloc.take_snapshot().filter_traces((
+                    tracemalloc.Filter(False, tracemalloc.__file__),
+                    tracemalloc.Filter(False, "<frozen importlib._bootstrap>"),
+                ))
+                current, peak = tracemalloc.get_traced_memory()
+                if self._memprofile_baseline is None:
+                    self._memprofile_baseline = snap
+                    logger.info(
+                        "memprofile: baseline captured "
+                        f"current={current/1e6:.1f}MB peak={peak/1e6:.1f}MB "
+                        f"executor_backlog={self._executor_backlog()}"
+                    )
+                    continue
+                diff = snap.compare_to(self._memprofile_baseline, "lineno")
+                lines = [
+                    "memprofile: growth since baseline "
+                    f"current={current/1e6:.1f}MB peak={peak/1e6:.1f}MB "
+                    f"executor_backlog={self._executor_backlog()}"
+                ]
+                for stat in diff[: self.MEMPROFILE_TOP_N]:
+                    lines.append(f"  +{stat.size_diff/1e6:+.2f}MB "
+                                 f"({stat.count_diff:+d} blocks) {stat.traceback[0]}")
+                logger.info("\n".join(lines))
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"memprofile error: {e}")
+
     async def _status_loop(self) -> None:
         """Periodically write status file."""
         status_path = Path(self.config.recorder.output_dir) / self.config.recorder.status_file
@@ -203,6 +262,15 @@ class WsprRecorder:
             },
         }
         
+        status["executor_backlog"] = self._executor_backlog()
+        status["executor_workers"] = self.executor._max_workers
+        if self._memprofile:
+            current, peak = tracemalloc.get_traced_memory()
+            status["tracemalloc"] = {
+                "current_mb": round(current / 1e6, 2),
+                "peak_mb": round(peak / 1e6, 2),
+            }
+
         if self.receiver_manager:
             status["receiver_manager"] = self.receiver_manager.get_status()
         
@@ -281,12 +349,18 @@ class WsprRecorder:
         
         active_bands = sum(1 for r in self.band_recorders.values() if r._synced)
         
+        backlog = self._executor_backlog()
+        if backlog > self.executor._max_workers * 4:
+            issues.append(f"Executor backlog high: {backlog} queued")
+
         return {
             "healthy": healthy,
             "issues": issues,
             "active_bands": active_bands,
             "total_bands": len(self.band_recorders),
             "uptime_seconds": time.time() - self._start_time if self._start_time else 0,
+            "executor_backlog": backlog,
+            "executor_workers": self.executor._max_workers,
         }
     
     def _ipc_config(self, params: Optional[Dict]) -> Dict:
@@ -296,7 +370,6 @@ class WsprRecorder:
             "sample_format": self.config.recorder.sample_format,
             "sample_rate": self.config.channel_defaults.sample_rate,
             "radiod_address": self.config.radiod.status_address,
-            "destination": self.config.radiod.destination,
             "port": self.config.radiod.port,
             "frequencies": self.config.frequencies,
             "max_file_age_minutes": self.config.recorder.max_file_age_minutes,
@@ -329,7 +402,11 @@ class WsprRecorder:
         self._running = True
         self._start_time = time.time()
         self._shutdown_event = asyncio.Event()
-        
+
+        if self._memprofile and not tracemalloc.is_tracing():
+            tracemalloc.start(25)
+            logger.info("memprofile: tracemalloc started (25-frame traces)")
+
         logger.info("Starting WSPR recorder")
         logger.info(f"Output directory: {self.config.recorder.output_dir}")
         logger.info(f"Frequencies: {len(self.config.frequencies)}")
@@ -374,6 +451,7 @@ class WsprRecorder:
             cleanup_task = asyncio.create_task(self._cleanup_loop())
             status_task = asyncio.create_task(self._status_loop())
             health_task = asyncio.create_task(self._health_check_loop())
+            memprofile_task = asyncio.create_task(self._memprofile_loop())
             
             logger.info("WSPR recorder running")
             
@@ -384,9 +462,13 @@ class WsprRecorder:
             cleanup_task.cancel()
             status_task.cancel()
             health_task.cancel()
-            
+            memprofile_task.cancel()
+
             try:
-                await asyncio.gather(cleanup_task, status_task, health_task, return_exceptions=True)
+                await asyncio.gather(
+                    cleanup_task, status_task, health_task, memprofile_task,
+                    return_exceptions=True,
+                )
             except Exception:
                 pass
             
@@ -415,6 +497,9 @@ class WsprRecorder:
         
         # Shutdown thread pool
         self.executor.shutdown(wait=True, cancel_futures=False)
+
+        if self._memprofile and tracemalloc.is_tracing():
+            tracemalloc.stop()
         
         # Write final status
         status_path = Path(self.config.recorder.output_dir) / self.config.recorder.status_file
@@ -479,6 +564,12 @@ Examples:
         help="Override output directory from config",
     )
     parser.add_argument(
+        "--memprofile",
+        action="store_true",
+        help="Enable tracemalloc; log top allocators every minute. "
+             "Also exposes tracemalloc totals via IPC status.",
+    )
+    parser.add_argument(
         "--version",
         action="version",
         version="wspr-recorder 0.1.0",
@@ -504,7 +595,7 @@ Examples:
         config.recorder.output_dir = args.output_dir
     
     # Create recorder
-    recorder = WsprRecorder(config)
+    recorder = WsprRecorder(config, memprofile=args.memprofile)
     
     # Setup signal handlers
     def signal_handler(sig, frame):
