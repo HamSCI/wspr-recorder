@@ -24,8 +24,8 @@ INSTALL_DIR="/opt/wspr-recorder"
 CONFIG_DIR="/etc/wspr-recorder"
 RUN_DIR="/run/wspr-recorder"
 OUTPUT_DIR="/dev/shm/wspr-recorder"
-SERVICE_USER="wspr-recorder"
-SERVICE_GROUP="wspr-recorder"
+SERVICE_USER="wsprrec"
+SERVICE_GROUP="wsprrec"
 
 # Colors for output
 RED='\033[0;31m'
@@ -97,9 +97,27 @@ create_user() {
     fi
 }
 
+check_pattern_a() {
+    # Contract v0.4 §12.5: the repo must be traversable by the service
+    # user. The canonical location is /opt/git/wspr-recorder (group-readable);
+    # repos under a mode-700 home directory are unreachable even if
+    # individual files are world-readable.
+    local repo_root
+    repo_root="$(cd "$(dirname "$0")" && pwd)"
+    local marker="$repo_root/wspr_recorder/__init__.py"
+    if ! sudo -u "$SERVICE_USER" test -r "$marker"; then
+        error "Service user $SERVICE_USER cannot read $marker — Pattern A violation.
+    Fix: place the repo at /opt/git/wspr-recorder (not under a mode-700 home),
+    or: chmod g+rx the path and add $SERVICE_USER to the owner's group."
+    fi
+    info "Pattern A check passed ($SERVICE_USER can traverse $repo_root)"
+}
+
 install_application() {
     info "Installing application to $INSTALL_DIR..."
-    
+
+    check_pattern_a
+
     # Create installation directory
     mkdir -p "$INSTALL_DIR"
     

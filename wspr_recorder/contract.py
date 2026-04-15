@@ -8,23 +8,41 @@ from importlib.metadata import version as pkg_version
 from pathlib import Path
 from typing import Any
 
-from .config import Config
+from .config import Config, _derive_radiod_id
 from .version import GIT_INFO
 
 CONTRACT_VERSION = "0.4"
+KA9Q_PYTHON_MIN_VERSION = "3.8.0"
 
 
 def _instance_id(config: Config) -> str:
-    status = (config.radiod.status_address or "").strip()
-    if not status:
-        return "default"
-    # trim common trailing pieces for readability
-    base = status
-    for suffix in ("-status.local", ".local"):
-        if base.endswith(suffix):
-            base = base[: -len(suffix)]
-            break
-    return base or "default"
+    return _derive_radiod_id(config.radiod.status_address)
+
+
+def _chain_delay_ns(radiod_id: str) -> int | None:
+    """Read RADIOD_<ID>_CHAIN_DELAY_NS from coordination.env (§8).
+
+    Surfaced in inventory only — not applied to sample-to-UTC conversion
+    since WSPR decoders are slot-quantized to minute boundaries, far
+    outside the chain-delay regime. Present so a future tightening for
+    sub-second drift work has the hook in place.
+    """
+    env_key = f"RADIOD_{radiod_id.upper().replace('-', '_')}_CHAIN_DELAY_NS"
+    raw = os.environ.get(env_key, "").strip()
+    if not raw:
+        return None
+    try:
+        return int(raw)
+    except ValueError:
+        return None
+
+
+def _version_tuple(v: str) -> tuple[int, ...]:
+    parts = []
+    for p in v.split("."):
+        m = "".join(ch for ch in p if ch.isdigit())
+        parts.append(int(m) if m else 0)
+    return tuple(parts)
 
 
 def _log_dir(config: Config) -> str:
@@ -73,7 +91,7 @@ def build_inventory(config: Config, config_path: Path) -> dict:
         ],
         "uses_timing_calibration": config.timing.authority in ("fusion", "auto"),
         "provides_timing_calibration": False,
-        "chain_delay_ns_applied": None,
+        "chain_delay_ns_applied": _chain_delay_ns(instance_id),
     }
 
     log_paths: dict[str, Any] = {
@@ -163,5 +181,22 @@ def _collect_issues(config: Config) -> list[dict]:
             })
         else:
             seen[key] = hz
+
+    # §12.6 ka9q-python PyPI-lag check — warn when installed version is
+    # older than the minimum declared in pyproject.toml.
+    try:
+        installed = pkg_version("ka9q-python")
+    except Exception:
+        installed = None
+    if installed and _version_tuple(installed) < _version_tuple(KA9Q_PYTHON_MIN_VERSION):
+        issues.append({
+            "severity": "warn",
+            "instance": instance_id,
+            "message": (
+                f"ka9q-python {installed} installed, "
+                f"minimum required is {KA9Q_PYTHON_MIN_VERSION} — "
+                f"run `pip install --upgrade ka9q-python`"
+            ),
+        })
 
     return issues

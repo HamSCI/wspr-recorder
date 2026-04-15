@@ -4,6 +4,7 @@ Configuration parsing and validation for wspr-recorder.
 Reads config.toml and provides validated configuration objects.
 """
 
+import os
 import sys
 import re
 import logging
@@ -132,6 +133,39 @@ class RadiodConfig:
     """Radiod connection settings."""
     status_address: str = "hf.local"
     port: int = 5004
+
+
+def _derive_radiod_id(status_address: str) -> str:
+    """Strip common trailing pieces from the mDNS status name.
+
+    Mirrors contract._instance_id so env-override lookups use the same key
+    that inventory --json reports as `radiod_id`.
+    """
+    base = (status_address or "").strip()
+    for suffix in ("-status.local", ".local"):
+        if base.endswith(suffix):
+            base = base[: -len(suffix)]
+            break
+    return base or "default"
+
+
+def resolve_radiod_status(config: "Config") -> None:
+    """Apply RADIOD_<ID>_STATUS override from coordination.env.
+
+    Contract v0.4 §2: sigmond may override the radiod mDNS status name at
+    runtime without editing the native config. The id is derived from the
+    configured `status_address` so the override is keyed off the same
+    string that inventory --json surfaces.
+    """
+    radiod_id = _derive_radiod_id(config.radiod.status_address)
+    env_key = f"RADIOD_{radiod_id.upper().replace('-', '_')}_STATUS"
+    override = os.environ.get(env_key, "").strip()
+    if override:
+        logger.info(
+            "Applying %s=%s (was %s)",
+            env_key, override, config.radiod.status_address,
+        )
+        config.radiod.status_address = override
 
 
 @dataclass
@@ -343,6 +377,10 @@ def load_config(config_path: str) -> Config:
                     config.bands.append(BandConfig(frequency=freq_hz))
                 except ValueError as e:
                     logger.warning(f"Skipping invalid frequency: {e}")
+
+    # Apply sigmond RADIOD_<ID>_STATUS override before validation so the
+    # resolved status_address is what validate() and callers observe.
+    resolve_radiod_status(config)
 
     # Validate
     errors = config.validate()
