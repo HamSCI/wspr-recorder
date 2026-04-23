@@ -411,11 +411,14 @@ class WsprRecorder:
         logger.info(f"Output directory: {self.config.recorder.output_dir}")
         logger.info(f"Frequencies: {len(self.config.frequencies)}")
         
-        # Initialize timing service
+        # Initialize timing service. Pass our radiod identifier so sidecars
+        # can be compared against hf-timestd's governor_radiod for
+        # multi-radiod station disambiguation (see METROLOGY.md §4.5.1).
         self.timing_service = TimingService(
             enable_chrony=True,
             enable_hf_timestd=True,
-            authority=self.config.timing.authority
+            authority=self.config.timing.authority,
+            client_radiod=self.config.radiod.status_address,
         )
         logger.info(f"Timing service initialized: {self.timing_service.get_status()['best_source']}")
         self.timing_service.check_clock_health()

@@ -148,6 +148,15 @@ class TimingMetadata:
     # Corrected timestamps
     estimated_true_start_utc: Optional[datetime] = None
     estimated_true_end_utc: Optional[datetime] = None
+
+    # Radiod attribution (multi-radiod stations — see hf-timestd §4.5.1).
+    # `fusion_governor_radiod` is the governor from authority.json
+    # (the radiod hf-timestd reads from). `client_radiod` is the one
+    # this wspr-recorder subscribes to. When they differ the per-host
+    # clock-skew uncertainty between the two radiods' hosts applies on
+    # top of hf_uncertainty_ms.
+    fusion_governor_radiod: Optional[str] = None
+    client_radiod: Optional[str] = None
     
     def to_dict(self) -> Dict[str, Any]:
         """Convert to dictionary for JSON serialization."""
@@ -178,6 +187,8 @@ class TimingMetadata:
             'wallclock_end_utc': dt_to_iso(self.wallclock_end_utc),
             'estimated_true_start_utc': dt_to_iso(self.estimated_true_start_utc),
             'estimated_true_end_utc': dt_to_iso(self.estimated_true_end_utc),
+            'fusion_governor_radiod': self.fusion_governor_radiod,
+            'client_radiod': self.client_radiod,
         }
 
 
@@ -198,18 +209,24 @@ class TimingService:
         enable_chrony: bool = True,
         enable_hf_timestd: bool = True,
         authority: str = 'auto',
+        client_radiod: Optional[str] = None,
     ):
         """
         Initialize timing service.
-        
+
         Args:
             enable_chrony: Whether to query chrony for timing status
             enable_hf_timestd: Whether to pull timing cues from hf-timestd
             authority: 'auto' (read from hf-timestd), 'rtp', or 'fusion'
+            client_radiod: The radiod this recorder subscribes to (e.g.
+                config.radiod.status_address). Stamped into sidecars so
+                per-host clock-skew can be reasoned about when
+                fusion_governor_radiod differs from it.
         """
         self.enable_chrony = enable_chrony
         self.enable_hf_timestd = enable_hf_timestd
         self.authority = authority
+        self.client_radiod = client_radiod
         
         # Cached values
         self._last_chrony_status: Optional[ChronyStatus] = None
@@ -477,7 +494,19 @@ class TimingService:
             metadata.estimated_true_start_utc = wallclock_start + offset
             if wallclock_end:
                 metadata.estimated_true_end_utc = wallclock_end + offset
-        
+
+        # Radiod attribution — stamped into sidecars. The governor comes
+        # from authority.json if hf-timestd is publishing it; the client
+        # comes from our own config.
+        metadata.client_radiod = self.client_radiod
+        try:
+            from .authority_reader import AuthorityReader
+            snap = AuthorityReader().read()
+            if snap is not None and snap.governor_radiod:
+                metadata.fusion_governor_radiod = snap.governor_radiod
+        except Exception as e:
+            logger.debug(f"Could not read governor_radiod from authority.json: {e}")
+
         return metadata
     
     def get_status(self) -> Dict[str, Any]:

@@ -106,6 +106,18 @@ class TestAuthorityReader(unittest.TestCase):
         self.assertEqual(s.stations_contributing, [])
         self.assertEqual(s.disagreement_flags, [])
 
+    def test_governor_radiod_parsed_when_present(self) -> None:
+        self._write(_good(governor_radiod="bee1-hf-status.local"))
+        s = self._reader().read()
+        self.assertEqual(s.governor_radiod, "bee1-hf-status.local")
+
+    def test_governor_radiod_is_none_when_absent(self) -> None:
+        payload = _good()
+        self.assertNotIn("governor_radiod", payload)
+        self._write(payload)
+        s = self._reader().read()
+        self.assertIsNone(s.governor_radiod)
+
 
 if __name__ == "__main__":
     unittest.main()

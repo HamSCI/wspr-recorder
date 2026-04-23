@@ -48,6 +48,13 @@ class AuthoritySnapshot:
     stations_contributing: List[str]
     last_transition_utc: Optional[str]
     disagreement_flags: List[str]
+    governor_radiod: Optional[str] = None
+    """Name of the radiod whose RTP timebase this offset is computed
+    against. Optional — set when hf-timestd's authority manager publishes
+    it (multi-radiod stations). Clients that subscribe to a different
+    radiod on the same station can compare their own radiod identifier
+    against this field to flag per-host clock-skew uncertainty in the
+    sidecar."""
 
     @property
     def offset_usable(self) -> bool:
@@ -125,6 +132,11 @@ class AuthorityReader:
                 stations_contributing=list(data.get("stations_contributing") or []),
                 last_transition_utc=data.get("last_transition_utc"),
                 disagreement_flags=list(data.get("disagreement_flags") or []),
+                governor_radiod=(
+                    str(data["governor_radiod"])
+                    if data.get("governor_radiod")
+                    else None
+                ),
             )
         except (KeyError, TypeError, ValueError) as e:
             logger.debug("authority.json field error: %s", e)
