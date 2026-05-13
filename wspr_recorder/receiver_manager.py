@@ -259,7 +259,14 @@ class ReceiverManager:
             _wait_for_chrony_settled()
 
             logger.info(f"Connecting to radiod at {self.config.radiod.status_address}")
-            self._control = RadiodControl(self.config.radiod.status_address)
+            # client_id makes ka9q-python derive a per-(client, radiod)
+            # multicast destination so this recorder's WSPR channels
+            # never share a multicast group with peer clients on the
+            # same radiod.  CONTRACT v0.3 §7 / ka9q-python ≥ 3.14.0.
+            self._control = RadiodControl(
+                self.config.radiod.status_address,
+                client_id="wspr-recorder",
+            )
             self.state.connected = True
 
             success = 0
