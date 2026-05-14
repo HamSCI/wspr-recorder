@@ -20,6 +20,7 @@ from __future__ import annotations
 
 import logging
 import os
+import signal
 import socket
 import threading
 import time
@@ -30,6 +31,38 @@ from .decoder import RawSpot
 from .noise import NoiseMeasurement
 
 logger = logging.getLogger(__name__)
+
+
+# Path the wd-upload-hs consumer writes its PID to.  When set, every
+# CycleBatcher._flush() that committed spots sends SIGUSR1 to that
+# PID so the uploader skips the rest of its polling sleep and ships
+# immediately.  Silently no-op if the file is missing, the PID is
+# stale, or we lack permission to signal — the consumer's regular
+# 60 s polling fallback still works.
+_UPLOADER_PID_FILE = "/run/wsprdaemon/wd-upload-hs.pid"
+
+
+def _maybe_notify_uploader() -> None:
+    """Best-effort signal to the wd-upload-hs consumer to wake + pump.
+
+    Gated by ``WD_UPLOAD_NOTIFY`` env var (default off so the change is
+    inert on existing deployments that haven't been updated on both
+    sides yet).
+    """
+    if os.environ.get("WD_UPLOAD_NOTIFY", "").strip().lower() not in (
+        "1", "true", "yes", "on",
+    ):
+        return
+    try:
+        with open(_UPLOADER_PID_FILE) as f:
+            pid = int(f.read().strip())
+        os.kill(pid, signal.SIGUSR1)
+    except (FileNotFoundError, ProcessLookupError, PermissionError, ValueError):
+        # Missing pidfile / stale pid / no perm / bad content — all
+        # acceptable.  The consumer's polling timer still catches us.
+        pass
+    except OSError as exc:
+        logger.debug("spot_sink: notify uploader failed: %s", exc)
 
 
 SCHEMA_VERSION = 2  # tracks wdlib/spots/row.py:SCHEMA_VERSION
@@ -750,6 +783,11 @@ class CycleBatcher:
             hhmm[:2], hhmm[2:], n, n_noise,
             len(batch.bands) or len(batch.noise), elapsed_ms,
         )
+        # Wake the uploader immediately so it doesn't have to wait
+        # for its next polling tick.  No-op if the producer isn't
+        # opted in or if no uploader pid file exists.
+        if n > 0:
+            _maybe_notify_uploader()
 
     # --- lifecycle -------------------------------------------------------
 
