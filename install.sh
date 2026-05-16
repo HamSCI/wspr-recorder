@@ -140,15 +140,33 @@ install_application() {
     
     # Upgrade pip and wheel
     "$INSTALL_DIR/venv/bin/pip" install --upgrade pip wheel
-    
+
     # Install/upgrade the package and all dependencies
     info "Installing/upgrading wspr-recorder and dependencies..."
     SCRIPT_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+    # Sibling repos that aren't on PyPI yet — wspr-recorder declares them
+    # as standard deps (callhash>=1.0.0, hs-uploader>=0.1.0) so plain pip
+    # would try PyPI first.  pyproject.toml's [tool.uv.sources] overrides
+    # are uv-only.  Pre-install from local paths so pip's resolver finds
+    # them already-satisfied when it processes wspr-recorder's deps.
+    local SIBLING_REPOS=("callhash" "hs-uploader")
+    local sibling_args=()
+    for repo in "${SIBLING_REPOS[@]}"; do
+        local candidate="$SCRIPT_DIR/../$repo"
+        if [[ -f "$candidate/pyproject.toml" ]]; then
+            sibling_args+=("$candidate")
+        else
+            warn "Sibling repo $repo not found at $candidate — pip will try PyPI"
+        fi
+    done
     if [[ "$IS_UPGRADE" == true ]]; then
         # Force upgrade of all dependencies including ka9q-python
-        "$INSTALL_DIR/venv/bin/pip" install --upgrade --force-reinstall "$SCRIPT_DIR"
+        "$INSTALL_DIR/venv/bin/pip" install --upgrade --force-reinstall \
+            "${sibling_args[@]}" "$SCRIPT_DIR"
     else
-        "$INSTALL_DIR/venv/bin/pip" install "$SCRIPT_DIR"
+        "$INSTALL_DIR/venv/bin/pip" install \
+            "${sibling_args[@]}" "$SCRIPT_DIR"
     fi
     
     # Set ownership
