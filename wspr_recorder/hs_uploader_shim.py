@@ -1,24 +1,24 @@
 """hs-uploader-driven wspr upload shim.
 
-In-process uploader for wspr-recorder.  Owns the same two output
-pipelines the standalone ``wd-upload-hs@.service`` used to own; lifted
-in-process for v3 Phase A (wsprdaemon-client dissolution).
+In-process uploader for wspr-recorder.  Owns the same three output
+pipelines the standalone ``wd-upload-hs@.service`` used to own;
+lifted in-process for v3 Phase A (wsprdaemon-client dissolution).
 
-Two pipelines run inside one ``Uploader``:
+Pipelines run inside one ``Uploader``:
 
-  * **wsprdaemon-tar** — ``SqliteSource`` on ``wspr.spots`` →
+  * **wsprdaemon-tar (spots)** — ``SqliteSource`` on ``wspr.spots`` →
     ``WsprdaemonTarSftp`` → wsprdaemon.org via SFTP.  The transport
     rebuilds the v3 wire-format tar (byte-identical to v1) from
     SqliteSource row payloads.  Optional ``FileTreeSource`` fallback
     over the legacy spool dir for pre-cutover hosts.
-  * **wsprdaemon-noise** — ``SqliteSource`` on ``wspr.noise`` →
-    ``WsprdaemonTarSftp`` (same transport, detects ``table`` attribute
+  * **wsprdaemon-tar (noise)** — ``SqliteSource`` on ``wspr.noise`` →
+    same ``WsprdaemonTarSftp`` transport (detects ``table`` attribute
     and emits ``wsprdaemon/noise/...`` arcnames).
   * **wsprnet** — ``SqliteSource`` on ``wspr.spots`` → ``WsprNet`` →
     wsprnet.org via HTTP multipart POST.  Identical MEPT line format
     to the legacy uploader.
 
-Why three pipelines: the same `wspr.spots` queue feeds wsprdaemon.org
+Why three pipelines: the same ``wspr.spots`` queue feeds wsprdaemon.org
 (tar/SFTP) and wsprnet.org (HTTP MEPT) — each pipeline has its own
 watermark so both consumers track independently.  Noise rows ship
 separately because ``SqliteSource`` is single-table.
@@ -31,14 +31,32 @@ shim's contract so existing env files keep working.
 
 Lifecycle (matches ``psk_recorder.core.hs_uploader_shim`` for
 operational symmetry):
-    start()   — construct pipelines, spawn pump thread
-    stop()    — signal stop, join thread, close transports
-    is_active — True iff the pump thread is alive
+    start()   — construct pipelines, spawn pump thread + optional
+                verifier; install SIGUSR1 wake handler.
+    stop()    — signal stop, kick wake, join thread, stop verifier,
+                close transports, remove pid file.
+    is_active — True iff the pump thread is alive.
+
+SIGUSR1 wake: the pump loop normally polls every PUMP_INTERVAL_SEC
+(60 s).  ``wspr-recorder``'s ``CycleBatcher`` signals us as soon as
+a cycle's spots are committed to sink.db (via spot_sink's
+``_maybe_notify_uploader``, gated on ``WD_UPLOAD_NOTIFY=1``), so
+end-to-end latency from "decoded" to "shipped" drops from up to 60s
+to a few hundred ms.  A pid file at
+``/run/wsprdaemon/wd-upload-hs.pid`` is preserved for back-compat
+with operators who already deployed the wake signaller before
+Phase A.
+
+WD_VERIFY_FLUSH: optional verify-and-flush thread polls wsprnet for
+this reporter's accepted spots and deletes confirmed rows from
+``pending_uploads``.  Off by default; opt in with WD_VERIFY_FLUSH=1.
+See ``wsprnet_verifier.py`` for the full rationale.
 """
 from __future__ import annotations
 
 import logging
 import os
+import signal
 import threading
 from pathlib import Path
 from typing import Optional
@@ -46,10 +64,10 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
-# Pump cadence.  WSPR is 2-minute decode cycles; wspr-recorder writes
-# new rows to wspr.spots after each cycle, so polling every 60 s
-# catches every cycle with ≤ 30 s of latency.  Matches the legacy
-# wd-upload-hs cadence (same value, same rationale).
+# Pump cadence.  WSPR is 2-minute decode cycles; wd-post writes new
+# files after each cycle, so polling every 60 s catches every cycle
+# with ≤ 30 s of latency.  Lower would just waste cycles on empty
+# spool dirs.  Matches the legacy wd-upload-wsprdaemon's loop sleep.
 PUMP_INTERVAL_SEC = 60.0
 
 # Default sigmond sink location (matches storage_migrate.SINK_DB_PATH).
@@ -57,14 +75,13 @@ DEFAULT_SINK_DB = "/var/lib/sigmond/sink.db"
 
 
 class WsprUploaderHs:
-    """Pump wspr spots + noise → wsprdaemon.org + wsprnet.org via hs-uploader.
+    """Pump wspr spools → wsprdaemon.org + wsprnet.org via hs-uploader.
 
-    Constructed from environment variables already set by sigmond /
-    wsprdaemon-client envgen in /etc/wsprdaemon/env/wd-ka9q-record@*.env
-    or /etc/sigmond/coordination.env.  Same identity inputs the
-    pre-Phase-A standalone uploader used, so the transition is a
-    service-unit change (stop wd-upload-hs@*, wspr-recorder absorbs)
-    rather than a config rewrite.
+    Constructed from environment variables already set by wd-ctl in
+    /etc/wsprdaemon/env/wd-upload-*.env — same identity inputs the
+    legacy uploader uses, so swapping one for the other doesn't
+    require any operator config changes beyond setting the feature
+    flag.
     """
 
     def __init__(
@@ -94,6 +111,7 @@ class WsprUploaderHs:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._uploader = None
+        self._verifier = None       # set in start() if WD_VERIFY_FLUSH=1
         self._transports: list = []
         # Per-pump per-pipeline tallies; the on_batch_outcome callback
         # populates these so the journal log line reflects what
@@ -101,8 +119,10 @@ class WsprUploaderHs:
         # iteration.
         self._pump_wsprdaemon_records = 0
         self._pump_wsprnet_records = 0
+        self._pump_wsprnet_accepted = 0    # what wsprnet actually added (parsed from response body)
         self._total_wsprdaemon_records = 0
         self._total_wsprnet_records = 0
+        self._total_wsprnet_accepted = 0
         self._pump_count = 0
         self._work_count = 0
 
@@ -110,14 +130,18 @@ class WsprUploaderHs:
 
     @classmethod
     def from_env(cls, env: Optional[dict] = None) -> "WsprUploaderHs":
-        """Build from the envgen-populated env vars.
+        """Build from the wd-ctl-generated env vars.
 
         Required:
             WD_RECEIVER_CALL           e.g. AC0G/B1
             WD_RECEIVER_GRID           e.g. EM38ww
         Optional (each pipeline is skipped if its dir is unset):
-            WD_UPLOAD_WSPRDAEMON_DIR   wsprdaemon.org spool root (legacy)
-            WD_UPLOAD_WSPRNET_DIR      wsprnet.org spool root (legacy)
+            WD_UPLOAD_WSPRDAEMON_DIR   wsprdaemon.org spool root
+            WD_UPLOAD_WSPRNET_DIR      wsprnet.org spool root (legacy
+                                        path; we ignore in favor of
+                                        SqliteSource — but keeping
+                                        the read for diagnostics
+                                        when SQLite is absent)
             WD_SFTP_SERVERS            user@host,user@host,...
             WD_SFTP_SERVER             single user@host (legacy fallback)
             WD_SFTP_USER               override SFTP user
@@ -136,7 +160,7 @@ class WsprUploaderHs:
         wsprdaemon_dir = e.get("WD_UPLOAD_WSPRDAEMON_DIR") or None
         wsprnet_dir = e.get("WD_UPLOAD_WSPRNET_DIR") or None
         # SFTP servers: WD_SFTP_SERVERS preferred, WD_SFTP_SERVER as
-        # legacy single-entry fallback.
+        # legacy single-entry fallback — matches wd-upload-wsprdaemon.
         servers_raw = e.get("WD_SFTP_SERVERS") or e.get("WD_SFTP_SERVER") or ""
         sftp_servers = [
             s.strip() for s in servers_raw.split(",") if s.strip()
@@ -158,8 +182,8 @@ class WsprUploaderHs:
         if not os.environ.get("WSPR_USE_HS_UPLOADER", "").strip():
             logger.info(
                 "wspr-uploader-hs: WSPR_USE_HS_UPLOADER unset — "
-                "in-process uploader is disabled; operator presumably "
-                "running a separate shipping path"
+                "shim is disabled; legacy wd-upload-* path is "
+                "expected to handle uploads"
             )
             return
 
@@ -177,10 +201,19 @@ class WsprUploaderHs:
             return
 
         watermark = SqliteWatermarkStore(default_path())
-        identity = StationIdentity(
-            call=self._call,
-            grid=self._grid,
-        )
+        # Pick up HS_UPLOADER_SSH_KEY_FILE (and any other identity env
+        # overrides) — without this, ssh_key_file defaults to
+        # /etc/hs-uploader/keys/id_ed25519 regardless of operator
+        # config, so the SFTP transport authenticates with the wrong
+        # key against gateways that already authorized a different key
+        # (e.g. /home/wsprdaemon/.ssh/id_ed25519 from a legacy install).
+        identity = StationIdentity.load()
+        # WD_RECEIVER_CALL / WD_RECEIVER_GRID are the canonical
+        # wsprdaemon-side env names; override the StationIdentity
+        # values (which read HS_UPLOADER_CALL / HS_UPLOADER_GRID) so
+        # the shim's existing env contract still wins.
+        identity.call = self._call
+        identity.grid = self._grid
         pipelines = []
 
         # --- pipeline 1: wsprdaemon.org via tar/SFTP (spots) ---
@@ -224,6 +257,55 @@ class WsprUploaderHs:
         )
 
         self._stop.clear()
+        # Wake event: pump loop waits on this OR a PUMP_INTERVAL_SEC
+        # timeout, whichever comes first.  SIGUSR1 sets it from the
+        # outside — wspr-recorder's CycleBatcher signals us as soon as
+        # a cycle's spots are committed to sink.db, so end-to-end
+        # latency from "decoded" to "shipped" drops from up to PUMP_INTERVAL_SEC
+        # (60 s with the original polling design) to a few hundred ms.
+        # Falls back to plain polling if no producer sends the signal.
+        self._wake = threading.Event()
+        try:
+            signal.signal(signal.SIGUSR1, self._on_wake_signal)
+        except (ValueError, AttributeError):
+            # signal.signal requires the main thread on Linux/macOS;
+            # if we're being constructed in a worker thread (tests),
+            # accept the polling fallback rather than crash.
+            logger.debug("hs-uploader-shim: SIGUSR1 handler not installable; "
+                         "polling-only mode")
+
+        # Pid file at the shared /run/wsprdaemon IPC dir so peer
+        # processes (the wspr-recorder decoder) can locate us via a
+        # single well-known path.  Best-effort: missing dir or perm
+        # failure is non-fatal.
+        try:
+            os.makedirs("/run/wsprdaemon", exist_ok=True)
+            with open(self._pid_file_path(), "w") as f:
+                f.write(f"{os.getpid()}\n")
+        except OSError as exc:
+            logger.warning("hs-uploader-shim: could not write pid file: %s", exc)
+
+        # Optional: verify-and-flush thread polls wsprnet for our
+        # reporter's accepted spots and deletes confirmed rows from
+        # pending_uploads.  Off by default; opt in with WD_VERIFY_FLUSH=1.
+        # See wsprnet_verifier.py for the full rationale.
+        # (Note: in the upstream wsprdaemon-client shim this block had
+        # landed after a return statement inside _pid_file_path() — dead
+        # code that never started the verifier.  Phase A relocates it
+        # to its correct home inside start().)
+        if os.environ.get("WD_VERIFY_FLUSH", "").strip().lower() in (
+            "1", "true", "yes", "on",
+        ):
+            try:
+                from .wsprnet_verifier import WsprnetVerifier
+                self._verifier = WsprnetVerifier(reporter=self._call)
+                self._verifier.start()
+            except Exception:
+                logger.exception(
+                    "wspr-uploader-hs: failed to start wsprnet verifier; "
+                    "continuing without it"
+                )
+
         self._thread = threading.Thread(
             target=self._run, daemon=True, name="wspr-uploader-hs",
         )
@@ -233,10 +315,47 @@ class WsprUploaderHs:
             self._call, self._grid, len(pipelines), int(PUMP_INTERVAL_SEC),
         )
 
+    def _on_wake_signal(self, _signum, _frame) -> None:
+        # Signal handlers run on the main thread; setting an Event is
+        # async-signal-safe.  No I/O or locks here.
+        self._wake.set()
+
+    def wake(self) -> None:
+        """Trigger an immediate pump iteration without a signal.
+
+        Used by in-process producers (wspr-recorder's CycleBatcher
+        once it switches from SIGUSR1+pidfile to a direct call) to
+        nudge the pump as soon as new rows hit sink.db.  No-op if the
+        wake event hasn't been created yet (uploader not started).
+        """
+        wake = getattr(self, "_wake", None)
+        if wake is not None:
+            wake.set()
+
+    @staticmethod
+    def _pid_file_path() -> str:
+        return "/run/wsprdaemon/wd-upload-hs.pid"
+
     def stop(self, timeout: float = 5.0) -> None:
         self._stop.set()
+        # Kick the pump loop awake so it observes _stop without
+        # waiting out the rest of its PUMP_INTERVAL_SEC.
+        try:
+            self._wake.set()
+        except AttributeError:
+            pass
         if self._thread is not None:
             self._thread.join(timeout=timeout)
+        # Best-effort pid file cleanup.
+        try:
+            os.unlink(self._pid_file_path())
+        except OSError:
+            pass
+        if self._verifier is not None:
+            try:
+                self._verifier.stop(timeout=timeout)
+            except Exception:
+                logger.exception("wspr-uploader-hs: verifier.stop failed")
         for t in self._transports:
             close = getattr(t, "close", None)
             if callable(close):
@@ -260,22 +379,49 @@ class WsprUploaderHs:
     # ----- pump loop -----
 
     def _run(self) -> None:
-        while not self._stop.wait(PUMP_INTERVAL_SEC):
+        while not self._stop.is_set():
+            # Wait for either the regular pump interval OR a SIGUSR1
+            # wake-up from a producer that just committed new spots.
+            # When the wake event fires before the timeout, pump
+            # immediately; otherwise this is a normal polling tick.
+            woke = self._wake.wait(PUMP_INTERVAL_SEC)
+            self._wake.clear()
+            if self._stop.is_set():
+                break
             try:
                 self._pump_count += 1
                 self._pump_wsprdaemon_records = 0
                 self._pump_wsprnet_records = 0
+                self._pump_wsprnet_accepted = 0
                 if self._uploader is not None and self._uploader.pump():
                     self._work_count += 1
                     self._total_wsprdaemon_records += self._pump_wsprdaemon_records
                     self._total_wsprnet_records += self._pump_wsprnet_records
+                    self._total_wsprnet_accepted += self._pump_wsprnet_accepted
+                    # wsprnet acceptance disclosure: server may add fewer
+                    # spots than we POSTed (duplicates from prior batches,
+                    # MAX_SPOTS truncation, malformed lines).  Show both
+                    # the posted count AND the actually-added count when
+                    # they differ — otherwise the log line stays compact.
+                    if self._pump_wsprnet_records != self._pump_wsprnet_accepted:
+                        wsprnet_field = (
+                            f"wsprnet=posted:{self._pump_wsprnet_records}"
+                            f"/added:{self._pump_wsprnet_accepted}"
+                        )
+                        total_wsprnet_field = (
+                            f"wsprnet=posted:{self._total_wsprnet_records}"
+                            f"/added:{self._total_wsprnet_accepted}"
+                        )
+                    else:
+                        wsprnet_field = f"wsprnet={self._pump_wsprnet_records}"
+                        total_wsprnet_field = f"wsprnet={self._total_wsprnet_records}"
                     logger.info(
-                        "wspr-uploader-hs: shipped wsprdaemon=%d wsprnet=%d "
-                        "(total wsprdaemon=%d wsprnet=%d, work=%d)",
+                        "wspr-uploader-hs: shipped wsprdaemon=%d %s "
+                        "(total wsprdaemon=%d %s, work=%d)",
                         self._pump_wsprdaemon_records,
-                        self._pump_wsprnet_records,
+                        wsprnet_field,
                         self._total_wsprdaemon_records,
-                        self._total_wsprnet_records,
+                        total_wsprnet_field,
                         self._work_count,
                     )
             except Exception:
@@ -285,15 +431,68 @@ class WsprUploaderHs:
 
     def _on_batch_outcome(self, pipeline, batch, outcome) -> None:
         """Tally per-pipeline ship counts; outcomes other than acked /
-        partial_ack are skipped (those records will retry next pass)."""
+        partial_ack are skipped (those records will retry next pass).
+
+        For wsprnet, outcome.reason carries "N/M added" parsed from
+        the server response body — see WsprNet._post().  We tally both
+        the posted count (batch.records) AND the actual accepted count
+        so the journal can report the true server-side acceptance rate.
+        """
         if outcome.kind not in ("acked", "partial_ack"):
             return
-        if pipeline.name.startswith("wsprdaemon-tar") or pipeline.name.startswith("wsprdaemon-noise"):
+        if pipeline.name.startswith("wsprdaemon-tar"):
             self._pump_wsprdaemon_records += len(batch.records)
         elif pipeline.name.startswith("wsprnet"):
             self._pump_wsprnet_records += len(batch.records)
+            # Parse "N/M added" from outcome.reason if present.
+            import re
+            m = re.match(r"(\d+)/(\d+) added", outcome.reason or "")
+            if m:
+                self._pump_wsprnet_accepted += int(m.group(1))
+            else:
+                # No diagnostic — assume all posted records were accepted
+                # (older transport version without the parse).
+                self._pump_wsprnet_accepted += len(batch.records)
 
     # ----- pipeline construction -----
+
+    def _build_wsprdaemon_ftp_fallback(self, *, spool_root, receiver):
+        """Construct an optional ``WsprdaemonTarFtp`` for SFTP-failure
+        bootstrap, or return None to disable.
+
+        Disabled when ``WD_FTP_FALLBACK=0``.  Defaults mirror the legacy
+        ``wd-upload-wsprdaemon`` script: FTP listener lives on gw2 only,
+        anonymous-style ``noisegraphs`` login, ``upload`` remote path.
+        The transport rebuilds the tar with ``client_upload_info.txt``
+        so the gateway can auto-provision SFTP for this reporter on the
+        next cycle.
+        """
+        if os.environ.get("WD_FTP_FALLBACK", "1").strip() in ("0", "", "no", "off"):
+            return None
+        try:
+            from hs_uploader.transports.wsprdaemon import WsprdaemonTarFtp
+        except ImportError:
+            return None
+        ftp_servers_raw = (
+            os.environ.get("WD_FTP_SERVERS")
+            or os.environ.get("WD_FTP_SERVER")
+            or "gw2.wsprdaemon.org"
+        )
+        ftp_servers = [s.strip() for s in ftp_servers_raw.split(",") if s.strip()]
+        if not ftp_servers:
+            return None
+        ftp_password_file = os.environ.get("WD_FTP_PASSWORD_FILE") or None
+        return WsprdaemonTarFtp(
+            servers=ftp_servers,
+            spool_root=spool_root,
+            ftp_user=os.environ.get("WD_FTP_USER", "noisegraphs"),
+            ftp_password=os.environ.get("WD_FTP_PASSWORD", "xahFie6g"),
+            ftp_password_file=ftp_password_file,
+            remote_path=os.environ.get("WD_FTP_PATH", "upload"),
+            version=self._version,
+            upload_id=self._upload_id,
+            receiver=receiver,
+        )
 
     def _build_wsprdaemon_pipeline(self, *, identity, watermark):
         if not self._sftp_servers:
@@ -320,6 +519,9 @@ class WsprUploaderHs:
             return None
 
         receiver = os.environ.get("WD_RECEIVER_NAME", "") or self._instance_name
+        fallback_ftp = self._build_wsprdaemon_ftp_fallback(
+            spool_root=self._wsprdaemon_dir, receiver=receiver,
+        )
         transport = WsprdaemonTarSftp(
             servers=[_server_host(s) for s in self._sftp_servers],
             spool_root=self._wsprdaemon_dir,   # legacy file path, optional
@@ -327,6 +529,7 @@ class WsprUploaderHs:
             version=self._version,
             upload_id=self._upload_id,
             receiver=receiver,                  # required for SqliteSource path
+            fallback_ftp=fallback_ftp,
         )
         pipeline = Pipeline(
             name=f"wsprdaemon-tar-{self._instance_name}",
@@ -407,6 +610,9 @@ class WsprUploaderHs:
             return None
 
         receiver = os.environ.get("WD_RECEIVER_NAME", "") or self._instance_name
+        fallback_ftp = self._build_wsprdaemon_ftp_fallback(
+            spool_root=None, receiver=receiver,
+        )
         transport = WsprdaemonTarSftp(
             servers=[_server_host(s) for s in self._sftp_servers],
             spool_root=None,
@@ -415,6 +621,7 @@ class WsprUploaderHs:
             upload_id=self._upload_id,
             receiver=receiver,
             name=f"wsprdaemon-tar-sftp-noise:{','.join(_server_host(s) for s in self._sftp_servers)}",
+            fallback_ftp=fallback_ftp,
         )
         pipeline = Pipeline(
             name=f"wsprdaemon-noise-{self._instance_name}",
@@ -449,8 +656,9 @@ class WsprUploaderHs:
 
     def _build_wsprnet_pipeline(self, *, identity, watermark):
         # WsprNet reads record.columns — natural fit for SqliteSource
-        # on the local wspr.spots queue.  Falls back to FileTreeSource
-        # over the legacy _spots.txt files if SQLite isn't available.
+        # on the local wspr.spots queue (already populated by
+        # wd-ch-write).  Falls back to FileTreeSource over the
+        # legacy _spots.txt files if SQLite isn't available.
         from hs_uploader import Pipeline, RetryPolicy
         from hs_uploader.transports.wsprnet import WsprNet
         source = self._build_wsprnet_source()
