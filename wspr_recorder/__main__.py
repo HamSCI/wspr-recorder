@@ -964,6 +964,16 @@ class WsprRecorder:
             return
         if self.uploader.is_active:
             logger.info("hs-uploader: in-process pump thread active")
+            # Wire the cycle batcher's wake hook to the uploader so
+            # every committed cycle nudges the pump immediately,
+            # cutting decode→ship latency from up to one
+            # PUMP_INTERVAL_SEC (60 s) to a few hundred ms.  Replaces
+            # the legacy SIGUSR1+pidfile dance retired post-Phase-A.
+            if self.cycle_batcher is not None:
+                self.cycle_batcher.set_wake_callback(self.uploader.wake)
+                logger.info(
+                    "hs-uploader: cycle-batcher wake callback wired"
+                )
 
     async def _shutdown(self) -> None:
         """Shutdown the recorder gracefully."""

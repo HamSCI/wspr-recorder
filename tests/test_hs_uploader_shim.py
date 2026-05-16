@@ -111,6 +111,47 @@ class TestFeatureFlag(unittest.TestCase):
         self.assertIsNone(u._thread)
 
 
+# ---- direct wake() path (replaces SIGUSR1+pidfile) -------------------
+
+
+class TestWakeMethod(unittest.TestCase):
+    """``wake()`` is now the canonical path the in-process producer
+    (CycleBatcher) uses to nudge the pump.  The legacy SIGUSR1+pidfile
+    dance was retired post-Phase-A; verify the direct-call path works
+    and that the pid file is no longer written/cleaned-up."""
+
+    def _shim(self):
+        return WsprUploaderHs.from_env({
+            "WD_RECEIVER_CALL": "AC0G", "WD_RECEIVER_GRID": "EM38ww",
+        })
+
+    def test_wake_is_safe_before_start(self):
+        """Construction-time wake() (e.g. a callback fires before
+        start() has happened) is a clean no-op."""
+        u = self._shim()
+        u.wake()                                # no-op, no AttributeError
+        self.assertFalse(hasattr(u, "_wake"))
+
+    def test_wake_sets_event_after_start(self):
+        """Once start() has constructed the Event, wake() sets it."""
+        u = self._shim()
+        # Bypass real start() — we don't need real pipelines, just the
+        # _wake Event the pump loop would block on.
+        import threading
+        u._wake = threading.Event()
+        u.wake()
+        self.assertTrue(u._wake.is_set())
+
+    def test_shim_does_not_write_pid_file(self):
+        """Post-Phase-A retirement: the shim must NOT create the
+        legacy /run/wsprdaemon/wd-upload-hs.pid file.  Guards against
+        a regression that would put the pidfile back."""
+        self.assertFalse(
+            hasattr(WsprUploaderHs, "_pid_file_path"),
+            "pid file path helper should have been removed post-Phase-A",
+        )
+
+
 # ---- pipeline wiring ----------------------------------------------------
 
 

@@ -165,5 +165,75 @@ class TestCycleBatcherDisabledSink(unittest.TestCase):
             b.stop()
 
 
+class TestCycleBatcherWakeCallback(unittest.TestCase):
+    """Replacement for the legacy SIGUSR1+pidfile uploader-notify path.
+    After Phase A absorbed the in-process uploader, CycleBatcher's
+    wake callback hooks directly into WsprUploaderHs.wake — no signal,
+    no pid file, no env-var gate.  These tests pin the contract:
+    callback fires after commits of spots; not fired on noise-only
+    cycles or when unregistered; an exception from the callback is
+    contained.
+    """
+
+    def test_callback_invoked_after_flush_with_spots(self):
+        sink = _RecordingSink()
+        b = CycleBatcher(sink, deadline_sec=0.1)
+        fired = threading.Event()
+        b.set_wake_callback(lambda: fired.set())
+        try:
+            b.add(("260512", "2030"), "20", [_make_spot()],
+                  radiod_id="rx")
+            self.assertTrue(fired.wait(timeout=1.0))
+        finally:
+            b.stop()
+
+    def test_no_callback_when_unregistered(self):
+        """The legacy default — no uploader configured — must remain a
+        clean no-op (no AttributeError, no crash)."""
+        sink = _RecordingSink()
+        b = CycleBatcher(sink, deadline_sec=0.1)
+        try:
+            b.add(("260512", "2030"), "20", [_make_spot()],
+                  radiod_id="rx")
+            # Wait long enough for the flush to fire — we're asserting
+            # the absence of a crash, not the absence of a wake.
+            time.sleep(0.4)
+            self.assertEqual(len(sink.calls), 1)
+        finally:
+            b.stop()
+
+    def test_callback_exception_does_not_propagate(self):
+        """A buggy callback must not take down the batcher thread or
+        block subsequent cycles."""
+        sink = _RecordingSink()
+        b = CycleBatcher(sink, deadline_sec=0.1)
+        b.set_wake_callback(lambda: (_ for _ in ()).throw(RuntimeError("boom")))
+        try:
+            b.add(("260512", "2030"), "20", [_make_spot()], radiod_id="rx")
+            time.sleep(0.4)
+            # Flush still happened despite the bad callback.
+            self.assertEqual(len(sink.calls), 1)
+            # Subsequent cycle still flushes (writer thread alive).
+            b.add(("260512", "2032"), "20", [_make_spot()], radiod_id="rx")
+            time.sleep(0.4)
+            self.assertEqual(len(sink.calls), 2)
+        finally:
+            b.stop()
+
+    def test_clearing_callback_with_none_disables(self):
+        sink = _RecordingSink()
+        b = CycleBatcher(sink, deadline_sec=0.1)
+        fired = threading.Event()
+        b.set_wake_callback(lambda: fired.set())
+        b.set_wake_callback(None)
+        try:
+            b.add(("260512", "2030"), "20", [_make_spot()], radiod_id="rx")
+            time.sleep(0.4)
+            self.assertFalse(fired.is_set())
+            self.assertEqual(len(sink.calls), 1)
+        finally:
+            b.stop()
+
+
 if __name__ == "__main__":
     unittest.main()

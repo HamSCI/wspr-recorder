@@ -32,20 +32,15 @@ shim's contract so existing env files keep working.
 Lifecycle (matches ``psk_recorder.core.hs_uploader_shim`` for
 operational symmetry):
     start()   — construct pipelines, spawn pump thread + optional
-                verifier; install SIGUSR1 wake handler.
+                verifier.
     stop()    — signal stop, kick wake, join thread, stop verifier,
-                close transports, remove pid file.
+                close transports.
     is_active — True iff the pump thread is alive.
-
-SIGUSR1 wake: the pump loop normally polls every PUMP_INTERVAL_SEC
-(60 s).  ``wspr-recorder``'s ``CycleBatcher`` signals us as soon as
-a cycle's spots are committed to sink.db (via spot_sink's
-``_maybe_notify_uploader``, gated on ``WD_UPLOAD_NOTIFY=1``), so
-end-to-end latency from "decoded" to "shipped" drops from up to 60s
-to a few hundred ms.  A pid file at
-``/run/wsprdaemon/wd-upload-hs.pid`` is preserved for back-compat
-with operators who already deployed the wake signaller before
-Phase A.
+    wake()    — set the pump's wake Event so the next iteration
+                fires immediately; wired by ``WsprRecorder.run`` to
+                ``CycleBatcher``'s wake callback so every cycle
+                commit fires us within milliseconds instead of
+                waiting out a PUMP_INTERVAL_SEC polling tick.
 
 WD_VERIFY_FLUSH: optional verify-and-flush thread polls wsprnet for
 this reporter's accepted spots and deletes confirmed rows from
@@ -56,7 +51,6 @@ from __future__ import annotations
 
 import logging
 import os
-import signal
 import threading
 from pathlib import Path
 from typing import Optional
@@ -258,32 +252,12 @@ class WsprUploaderHs:
 
         self._stop.clear()
         # Wake event: pump loop waits on this OR a PUMP_INTERVAL_SEC
-        # timeout, whichever comes first.  SIGUSR1 sets it from the
-        # outside — wspr-recorder's CycleBatcher signals us as soon as
-        # a cycle's spots are committed to sink.db, so end-to-end
-        # latency from "decoded" to "shipped" drops from up to PUMP_INTERVAL_SEC
-        # (60 s with the original polling design) to a few hundred ms.
-        # Falls back to plain polling if no producer sends the signal.
+        # timeout, whichever comes first.  WsprRecorder.run wires
+        # CycleBatcher's wake callback to our public wake() method
+        # so end-to-end latency from "decoded" to "shipped" drops
+        # from up to PUMP_INTERVAL_SEC (60 s) to a few hundred ms.
+        # Falls back to plain polling if no callback is registered.
         self._wake = threading.Event()
-        try:
-            signal.signal(signal.SIGUSR1, self._on_wake_signal)
-        except (ValueError, AttributeError):
-            # signal.signal requires the main thread on Linux/macOS;
-            # if we're being constructed in a worker thread (tests),
-            # accept the polling fallback rather than crash.
-            logger.debug("hs-uploader-shim: SIGUSR1 handler not installable; "
-                         "polling-only mode")
-
-        # Pid file at the shared /run/wsprdaemon IPC dir so peer
-        # processes (the wspr-recorder decoder) can locate us via a
-        # single well-known path.  Best-effort: missing dir or perm
-        # failure is non-fatal.
-        try:
-            os.makedirs("/run/wsprdaemon", exist_ok=True)
-            with open(self._pid_file_path(), "w") as f:
-                f.write(f"{os.getpid()}\n")
-        except OSError as exc:
-            logger.warning("hs-uploader-shim: could not write pid file: %s", exc)
 
         # Optional: verify-and-flush thread polls wsprnet for our
         # reporter's accepted spots and deletes confirmed rows from
@@ -315,26 +289,18 @@ class WsprUploaderHs:
             self._call, self._grid, len(pipelines), int(PUMP_INTERVAL_SEC),
         )
 
-    def _on_wake_signal(self, _signum, _frame) -> None:
-        # Signal handlers run on the main thread; setting an Event is
-        # async-signal-safe.  No I/O or locks here.
-        self._wake.set()
-
     def wake(self) -> None:
-        """Trigger an immediate pump iteration without a signal.
+        """Trigger an immediate pump iteration.
 
-        Used by in-process producers (wspr-recorder's CycleBatcher
-        once it switches from SIGUSR1+pidfile to a direct call) to
-        nudge the pump as soon as new rows hit sink.db.  No-op if the
-        wake event hasn't been created yet (uploader not started).
+        Wired to CycleBatcher's wake callback by WsprRecorder.run:
+        every cycle that commits spots calls us, so the pump fires
+        within milliseconds instead of waiting out a PUMP_INTERVAL_SEC
+        polling tick.  No-op if the wake event hasn't been created
+        yet (uploader not started or feature flag off).
         """
         wake = getattr(self, "_wake", None)
         if wake is not None:
             wake.set()
-
-    @staticmethod
-    def _pid_file_path() -> str:
-        return "/run/wsprdaemon/wd-upload-hs.pid"
 
     def stop(self, timeout: float = 5.0) -> None:
         self._stop.set()
@@ -346,11 +312,6 @@ class WsprUploaderHs:
             pass
         if self._thread is not None:
             self._thread.join(timeout=timeout)
-        # Best-effort pid file cleanup.
-        try:
-            os.unlink(self._pid_file_path())
-        except OSError:
-            pass
         if self._verifier is not None:
             try:
                 self._verifier.stop(timeout=timeout)
