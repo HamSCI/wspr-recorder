@@ -215,16 +215,24 @@ def query_server(
     rejects unknown users, breaking anonymous access.
     """
     clean_url, user, password = _split_userinfo(url)
+    # ``now('UTC')`` instead of bare ``now()`` so the window boundary
+    # is wall-clock-UTC regardless of the ClickHouse server's local
+    # timezone setting.  Observed 2026-05-17: wd30 shipped with
+    # ``timezone() = America/Chicago``, which caused ``now()`` to
+    # return Chicago-local DateTimes whose epoch comparison against
+    # UTC-stored ``time`` values pulled in ~5 hours of extra rows.
+    # ``now('UTC')`` is TZ-aware and produces the correct epoch on
+    # any server config.
     sql = (
         "SELECT 'wsprnet' AS src, count() AS n, max(time) AS t "
         "FROM wspr.rx "
         f"WHERE rx_sign='{reporter}' "
-        f"AND time>=now()-INTERVAL {int(window_min)} MINUTE "
+        f"AND time>=now('UTC')-INTERVAL {int(window_min)} MINUTE "
         "UNION ALL "
         "SELECT 'wsprdaemon' AS src, count() AS n, max(time) AS t "
         "FROM wsprdaemon.spots "
         f"WHERE rx_sign='{reporter}' "
-        f"AND time>=now()-INTERVAL {int(window_min)} MINUTE "
+        f"AND time>=now('UTC')-INTERVAL {int(window_min)} MINUTE "
         "FORMAT TabSeparated"
     )
     qs = urllib.parse.urlencode({"query": sql})
