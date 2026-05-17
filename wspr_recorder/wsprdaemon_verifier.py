@@ -35,13 +35,18 @@ counts; three servers fanned out in parallel finish in
 
 Output (one line per server + one canonical pass-complete line):
 
-    wsprdaemon-verifier[AC0G/B4]: wd10 ok rtt=567ms wsprnet=175 wsprdaemon=179 max=2026-05-17T12:28:00
-    wsprdaemon-verifier[AC0G/B4]: wd20 empty rtt=132ms wsprnet=0 wsprdaemon=0 max=2026-05-14T13:16:00
-    wsprdaemon-verifier[AC0G/B4]: wd30 timeout rtt=5005ms
-    wsprdaemon-verifier[AC0G/B4]: pass complete verified=179 dropped_old=0
-                                   wsprdaemon_set_size=179 wsprnet_set_size=175
-                                   servers_ok=1/3 (totals verified=179
+    wsprdaemon-verifier[AC0G/B4]: wd10 ok rtt=174ms wsprnet=118 wsprdaemon=121 max=2026-05-17 15:00:00
+    wsprdaemon-verifier[AC0G/B4]: wd20 ok rtt=189ms wsprnet=118 wsprdaemon=86  max_wn=2026-05-17 15:00:00 max_wd=2026-05-17 14:48:00
+    wsprdaemon-verifier[AC0G/B4]: wd30 timeout rtt=5050ms
+    wsprdaemon-verifier[AC0G/B4]: pass complete verified=121 dropped_old=0
+                                   wsprdaemon_set_size=121 wsprnet_set_size=118
+                                   servers_ok=2/3 (totals verified=121
                                    dropped_old=0)
+
+The ``max_wn`` / ``max_wd`` split surfaces when a server's two
+ingest paths drift apart — see wd20 above, where its wspr.rx mirror
+is current but its wsprdaemon.spots table is 12 min behind.  When
+both maxes agree the line collapses to a single ``max=...``.
 
 The ``[<rx_sign>]`` tag matters on multi-receiver hosts where two
 ``wspr-recorder@<id>.service`` instances run concurrently — without it,
@@ -87,7 +92,12 @@ DEFAULT_URLS = (
     "http://wd30.wsprdaemon.org",
 )
 DEFAULT_INTERVAL_SEC = 300
-DEFAULT_WINDOW_MIN   = 15
+DEFAULT_WINDOW_MIN   = 30    # 15 was too tight against wd20's
+                             # observed ~22 min reporter-specific
+                             # wsprdaemon.spots lag (2026-05-17).
+                             # 30 covers the lag with headroom while
+                             # staying well under the 60-min wsprnet
+                             # window the WsprnetVerifier uses.
 DEFAULT_TIMEOUT_SEC  = 5     # per-server HTTP timeout; 3 parallel
                              # queries finish in ~max(per-host RTT),
                              # capped at this value for unreachables
@@ -105,12 +115,20 @@ class ServerResult:
     Both counts come from the same UNION ALL query against the same
     ClickHouse instance, so they share an rtt and represent the same
     moment in the server's view.
+
+    ``wsprnet_max`` and ``wsprdaemon_max`` are tracked separately
+    because the two tables can ingest at different rates on the same
+    server — observed on B4-100 2026-05-17: wd20's wspr.rx mirror was
+    current to 15:00:00Z while its wsprdaemon.spots table for the
+    same rx_sign was 12 min behind at 14:48:00Z.  Reporting a single
+    ``max`` would hide that asymmetry.
     """
     url: str
-    status: str            # ok | empty | http_error | tcp_error | timeout | parse_error
-    wsprnet_count: int     # rows in wspr.rx for our rx_sign in the window
-    wsprdaemon_count: int  # rows in wsprdaemon.spots for our rx_sign in the window
-    max_time: str          # ISO time of the most recent row across both tables
+    status: str             # ok | empty | http_error | tcp_error | timeout | parse_error
+    wsprnet_count: int      # rows in wspr.rx for our rx_sign in the window
+    wsprdaemon_count: int   # rows in wsprdaemon.spots for our rx_sign in the window
+    wsprnet_max: str        # ISO time of the most recent wspr.rx row
+    wsprdaemon_max: str     # ISO time of the most recent wsprdaemon.spots row
     rtt_ms: int
 
     @property
@@ -119,6 +137,23 @@ class ServerResult:
         host = urllib.parse.urlparse(self.url).hostname or self.url
         # wd10.wsprdaemon.org → wd10
         return host.split(".", 1)[0]
+
+    @property
+    def max_display(self) -> str:
+        """Render either a single ``max=`` (when both tables agree) or
+        a split ``max_wn= max_wd=`` pair (when they diverge).  The
+        threshold for "agree" is exact-string equality of the
+        ClickHouse-returned timestamps — the underlying values have
+        minute resolution, and any divergence at all is operationally
+        worth showing.
+        """
+        if self.wsprnet_max == self.wsprdaemon_max:
+            return f"max={self.wsprnet_max}" if self.wsprnet_max else ""
+        # Show both when they differ.  An empty side means the table
+        # is empty for our reporter in the window (max() over no rows
+        # returns the 1970 epoch in ClickHouse — keep the literal so
+        # the operator can tell empty-table from never-updated).
+        return f"max_wn={self.wsprnet_max} max_wd={self.wsprdaemon_max}"
 
 
 def query_server(
@@ -170,28 +205,27 @@ def query_server(
             except ValueError:
                 continue
         if "wsprnet" not in rows or "wsprdaemon" not in rows:
-            return ServerResult(url, "parse_error", 0, 0, "", rtt_ms)
+            return ServerResult(url, "parse_error", 0, 0, "", "", rtt_ms)
 
         wsprnet_count, wsprnet_max = rows["wsprnet"]
         wsprdaemon_count, wsprdaemon_max = rows["wsprdaemon"]
-        # Report the freshest max across the two tables — useful for
-        # operator triage when one table is stale and the other isn't.
-        max_time = max(wsprnet_max, wsprdaemon_max)
 
         if wsprnet_count == 0 and wsprdaemon_count == 0:
             # ClickHouse fills max() with epoch zero on empty sets.  The
-            # max_time string still tells the operator how stale the
-            # tables are (e.g. "1970-01-01" = no data ever, vs.
-            # "2026-05-14" = stale replica).
+            # max strings still tell the operator how stale each table
+            # is (e.g. "1970-01-01" = no data ever for our reporter,
+            # vs. "2026-05-14" = stale replica that used to have us).
             return ServerResult(
-                url, "empty", 0, 0, max_time, rtt_ms,
+                url, "empty", 0, 0,
+                wsprnet_max, wsprdaemon_max, rtt_ms,
             )
         return ServerResult(
-            url, "ok", wsprnet_count, wsprdaemon_count, max_time, rtt_ms,
+            url, "ok", wsprnet_count, wsprdaemon_count,
+            wsprnet_max, wsprdaemon_max, rtt_ms,
         )
     except urllib.error.HTTPError:
         return ServerResult(
-            url, "http_error", 0, 0, "",
+            url, "http_error", 0, 0, "", "",
             int((time.monotonic() - t0) * 1000),
         )
     except (urllib.error.URLError, TimeoutError) as exc:
@@ -205,12 +239,12 @@ def query_server(
         if "timed out" in str(reason or exc).lower():
             status = "timeout"
         return ServerResult(
-            url, status, 0, 0, "",
+            url, status, 0, 0, "", "",
             int((time.monotonic() - t0) * 1000),
         )
     except Exception:  # noqa: BLE001 — defensive; never crash the pass
         return ServerResult(
-            url, "tcp_error", 0, 0, "",
+            url, "tcp_error", 0, 0, "", "",
             int((time.monotonic() - t0) * 1000),
         )
 
@@ -320,22 +354,26 @@ class WsprdaemonVerifier:
         results.sort(key=lambda r: r.url)
 
         # Per-server line.  Each carries the short name + status + rtt
-        # + both counts + max_time so an operator can spot which server
-        # is drifting (and on which table) at a glance.
+        # + both counts + max-time(s) so an operator can spot which
+        # server is drifting (and on which table) at a glance.  The
+        # max_display property collapses to ``max=...`` when both
+        # tables agree and expands to ``max_wn=... max_wd=...`` when
+        # they diverge (e.g. wd20 keeps wspr.rx current but lags
+        # wsprdaemon.spots).
         for r in results:
             if r.status == "ok":
                 logger.info(
                     "wsprdaemon-verifier[%s]: %s ok rtt=%dms "
-                    "wsprnet=%d wsprdaemon=%d max=%s",
+                    "wsprnet=%d wsprdaemon=%d %s",
                     self._reporter, r.short_name, r.rtt_ms,
-                    r.wsprnet_count, r.wsprdaemon_count, r.max_time,
+                    r.wsprnet_count, r.wsprdaemon_count, r.max_display,
                 )
             elif r.status == "empty":
                 # Distinguish "server is fine, no data for us yet" from
-                # "server is stale by days": include max_time when the
-                # server returned an answer, omit it when the server
-                # never replied.
-                max_part = f" max={r.max_time}" if r.max_time else ""
+                # "server is stale by days": include max display when
+                # the server returned an answer, omit it when the
+                # server never replied.
+                max_part = f" {r.max_display}" if r.max_display else ""
                 logger.warning(
                     "wsprdaemon-verifier[%s]: %s empty rtt=%dms "
                     "wsprnet=0 wsprdaemon=0%s",
