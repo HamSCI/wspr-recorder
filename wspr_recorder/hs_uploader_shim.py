@@ -612,7 +612,37 @@ class WsprUploaderHs:
                 "wsprnet.org pipeline"
             )
             return None
-        transport = WsprNet()
+        # WSPRNET_BATCH_SIZE lets the operator opt into smaller POSTs
+        # so the audit can identify which individual spots wsprnet
+        # rejected.  Default = 999 (legacy behavior).  Set to 1 for
+        # per-spot tracking — costs ~30-50× more HTTP requests per
+        # cycle but lets ``smd verifier report --rejected`` name the
+        # rejected spots instead of just counting them.
+        try:
+            batch_size = int(
+                os.environ.get("WSPRNET_BATCH_SIZE", "999").strip() or "999"
+            )
+        except ValueError:
+            logger.warning(
+                "wspr-uploader-hs: WSPRNET_BATCH_SIZE not an int "
+                "(env=%r); using default 999",
+                os.environ.get("WSPRNET_BATCH_SIZE"),
+            )
+            batch_size = 999
+        # WsprNet clamps to its hard MAX_SPOTS_PER_UPLOAD (999) but
+        # we mirror the bound here so the log line reads honestly.
+        if batch_size < 1:
+            batch_size = 1
+        if batch_size > 999:
+            batch_size = 999
+        transport = WsprNet(max_spots_per_upload=batch_size)
+        if batch_size != 999:
+            logger.info(
+                "wspr-uploader-hs: wsprnet batch size capped at %d "
+                "(per-spot diagnostic mode)" if batch_size == 1 else
+                "wspr-uploader-hs: wsprnet batch size capped at %d",
+                batch_size,
+            )
         pipeline = Pipeline(
             name=f"wsprnet-{self._instance_name}",
             source=source,
@@ -620,7 +650,10 @@ class WsprUploaderHs:
             watermark=watermark,
             identity=identity,
             retry=RetryPolicy.exponential(base=2.0, cap_sec=900.0),
-            batch_limit=900,  # below WsprNet's hard 999/POST cap
+            # Orchestrator-side per-pump cap.  Never exceed the
+            # transport's POST cap (the per-batch chunker handles
+            # smaller, but a higher orchestrator cap is pointless).
+            batch_limit=max(1, min(900, batch_size)),
         )
         return (pipeline, transport)
 
