@@ -876,10 +876,18 @@ class CycleBatcher:
             # on hosts that don't have the env flag set.
             return
         elapsed_ms = int((time.monotonic() - wall_start) * 1000)
+        # Include rx_source so smd watch wspr can disambiguate which
+        # receiver produced each cycle commit on multi-source hosts.
+        # Single-source deployments default rx_source to the radiod_id
+        # which still appears here; empty string only happens in tests
+        # / direct CycleBatcher use that bypassed the per-source
+        # plumbing — keep an "?" placeholder so the log format stays
+        # parseable.
+        rx_label = batch.rx_source or batch.radiod_id or "?"
         logger.info(
-            "cycle UTC %s:%s → %d spots in wspr.spots, "
+            "cycle UTC %s:%s rx=%s → %d spots in wspr.spots, "
             "%d noise rows in wspr.noise (%d bands, sqlite write %d ms)",
-            hhmm[:2], hhmm[2:], n, n_noise,
+            hhmm[:2], hhmm[2:], rx_label, n, n_noise,
             len(batch.bands) or len(batch.noise), elapsed_ms,
         )
         # Wake the in-process uploader.  No-op if no callback is
