@@ -31,21 +31,31 @@ class _RecordingSink:
     """Stand-in for SpotSink that records every submit_batches call.
 
     Captures the THREAD that invoked the call so we can verify the
-    batcher honors its single-writer-thread guarantee."""
+    batcher honors its single-writer-thread guarantee.  ``rx_source``
+    is captured per-call alongside radiod_id so multi-source tests
+    can assert each source's spots get tagged correctly (phase 3b).
+    """
 
     def __init__(self):
         self.enabled = True
-        self.calls = []                        # [(items, radiod_id, thread_name)]
+        # [(items, radiod_id, rx_source, thread_name)]
+        self.calls = []
         self._lock = threading.Lock()
 
-    def submit_batches(self, items, *, radiod_id):
+    def submit_batches(self, items, *, radiod_id, rx_source=""):
         materialized = [(b, list(s)) for b, s in items]
         with self._lock:
             self.calls.append(
-                (materialized, radiod_id, threading.current_thread().name),
+                (materialized, radiod_id, rx_source,
+                 threading.current_thread().name),
             )
         total = sum(len(s) for _b, s in materialized)
         return total
+
+    def submit_noise_batches(self, items, *, cycle_key, radiod_id, rx_source=""):
+        # The cycle batcher only calls this when there's noise; tests
+        # don't exercise the value, so just count rows.
+        return sum(1 for _ in items)
 
 
 class TestCycleBatcherFlush(unittest.TestCase):
@@ -60,7 +70,7 @@ class TestCycleBatcherFlush(unittest.TestCase):
                   radiod_id="rx-A")
             time.sleep(0.6)
             self.assertEqual(len(sink.calls), 1)
-            items, radiod_id, _ = sink.calls[0]
+            items, radiod_id, _, _ = sink.calls[0]
             self.assertEqual(radiod_id, "rx-A")
             self.assertEqual(items, [("20", [sink.calls[0][0][0][1][0]])])
         finally:
@@ -80,7 +90,7 @@ class TestCycleBatcherFlush(unittest.TestCase):
                                 _make_spot("C3")], radiod_id="rx-A")
             time.sleep(0.7)
             self.assertEqual(len(sink.calls), 1)
-            items, _, _ = sink.calls[0]
+            items, _, _, _ = sink.calls[0]
             by_band = {band: len(spots) for band, spots in items}
             self.assertEqual(by_band, {"20": 2, "40": 1, "30": 3})
         finally:
@@ -126,7 +136,7 @@ class TestCycleBatcherFlush(unittest.TestCase):
                   radiod_id="rx")
             time.sleep(0.4)
             self.assertEqual(len(sink.calls), 1)
-            _, _, writer_thread_name = sink.calls[0]
+            _, _, _, writer_thread_name = sink.calls[0]
             self.assertNotEqual(writer_thread_name, caller_thread)
             self.assertEqual(writer_thread_name, "cycle-batcher")
         finally:
@@ -153,7 +163,9 @@ class TestCycleBatcherDisabledSink(unittest.TestCase):
         Writer), the batcher should not log noise per cycle."""
         class _DisabledSink:
             enabled = False
-            def submit_batches(self, items, *, radiod_id):
+            def submit_batches(self, items, *, radiod_id, rx_source=""):
+                return 0
+            def submit_noise_batches(self, items, *, cycle_key, radiod_id, rx_source=""):
                 return 0
         b = CycleBatcher(_DisabledSink(), deadline_sec=0.1)
         try:
@@ -338,3 +350,46 @@ class TestFtSettleHelpers(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestCycleBatcherMultiSource(unittest.TestCase):
+    """Phase 3b: same cycle from two sources flushes as two separate
+    batches, each tagged with its own rx_source.  Single-source
+    callers (rx_source omitted or "") still produce one batch per
+    cycle exactly as before."""
+
+    def test_two_sources_one_cycle_two_calls(self):
+        sink = _RecordingSink()
+        b = CycleBatcher(sink, deadline_sec=0.2)
+        try:
+            cycle = ("260512", "2030")
+            b.add(cycle, "20", [_make_spot("A1")],
+                  radiod_id="rx-A", rx_source="radiod:host-a.local")
+            b.add(cycle, "20", [_make_spot("B1")],
+                  radiod_id="rx-B", rx_source="radiod:host-b.local")
+            time.sleep(0.6)
+            # Two distinct rx_source values → two separate
+            # submit_batches calls, each with the right tag.
+            self.assertEqual(len(sink.calls), 2)
+            rx_sources = sorted(c[2] for c in sink.calls)
+            self.assertEqual(
+                rx_sources,
+                ["radiod:host-a.local", "radiod:host-b.local"],
+            )
+        finally:
+            b.stop()
+
+    def test_single_source_default_rx_source_empty(self):
+        """Existing single-source code paths omit rx_source — the
+        batch's rx_source defaults to "" so spot_to_row falls back to
+        radiod_id when rendering rows."""
+        sink = _RecordingSink()
+        b = CycleBatcher(sink, deadline_sec=0.2)
+        try:
+            b.add(("260512", "2030"), "20", [_make_spot()],
+                  radiod_id="rx")  # rx_source omitted
+            time.sleep(0.6)
+            self.assertEqual(len(sink.calls), 1)
+            self.assertEqual(sink.calls[0][2], "")
+        finally:
+            b.stop()

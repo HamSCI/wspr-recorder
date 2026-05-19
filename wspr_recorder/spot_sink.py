@@ -207,6 +207,7 @@ def spot_to_row(
     rx_grid: str,
     host_id: Optional[str] = None,
     decoder_depth: int = 3,
+    rx_source: str = "",
 ) -> dict:
     """Convert one RawSpot → JSON-serializable row dict.
 
@@ -245,11 +246,18 @@ def spot_to_row(
 
     callsign = _strip_resolved_brackets(spot.call)
 
+    # ``rx_source`` defaults to ``radiod_id`` so single-source rows
+    # remain self-disambiguating without the producer having to know
+    # whether multi-source is configured.  Phase 5's wsprnet-dedup
+    # GROUP BY runs on (cycle_iso, callsign, frequency_hz, rx_source)
+    # and picks the max(snr_db).
+    rx_source_eff = rx_source or radiod_id
     return {
         "time":            ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "band":            band,
         "mode":            mode,
         "radiod_id":       radiod_id,
+        "rx_source":       rx_source_eff,
         "host_id":         host_id,
         "frequency_hz":    int(round(spot.freq * 1_000_000)),
         "callsign":        callsign,
@@ -294,6 +302,7 @@ def noise_to_row(
     rx_call: str,
     rx_grid: str,
     host_id: Optional[str] = None,
+    rx_source: str = "",
 ) -> dict:
     """Convert a per-(band, cycle) NoiseMeasurement → row dict for
     sink.db's wspr.noise table.
@@ -317,10 +326,12 @@ def noise_to_row(
             date, hhmm, band,
         )
         ts = datetime.now(timezone.utc).replace(microsecond=0)
+    rx_source_eff = rx_source or radiod_id
     return {
         "time":            ts.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "band":            band,
         "radiod_id":       radiod_id,
+        "rx_source":       rx_source_eff,
         "host_id":         host_id,
         "rx_call":         rx_call,
         "rx_grid":         rx_grid,
@@ -459,6 +470,7 @@ class SpotSink:
         items: Iterable[Tuple[str, Iterable[RawSpot]]],
         *,
         radiod_id: str,
+        rx_source: str = "",
     ) -> int:
         """Write a whole cycle's spots across multiple bands in ONE
         transaction.  Same semantics as `submit_batch` but groups
@@ -467,7 +479,13 @@ class SpotSink:
         atomic observation) and lets the upload side query per-cycle
         without race against partial commits.
 
-        Failures still don't propagate; rows_dropped accounts them."""
+        Failures still don't propagate; rows_dropped accounts them.
+
+        ``rx_source`` stamps every emitted row's ``rx_source`` field —
+        defaults to empty so single-source callers (legacy tests, the
+        wsprdaemon-client compatibility shim) keep working with
+        spot_to_row defaulting rx_source to radiod_id.
+        """
         if not self.enabled or self._writer is None:
             return 0
         rows = []
@@ -482,6 +500,7 @@ class SpotSink:
                         rx_grid=self.rx_grid,
                         host_id=self.host_id,
                         decoder_depth=self.decoder_depth,
+                        rx_source=rx_source,
                     ))
                 except Exception as exc:
                     logger.warning(
@@ -512,6 +531,7 @@ class SpotSink:
         *,
         cycle_key: Tuple[str, str],
         radiod_id: str,
+        rx_source: str = "",
     ) -> int:
         """Write a cycle's per-band noise measurements to wspr.noise.
 
@@ -553,6 +573,7 @@ class SpotSink:
                     band=band, cycle_key=cycle_key, radiod_id=radiod_id,
                     rx_call=self.rx_call, rx_grid=self.rx_grid,
                     host_id=self.host_id,
+                    rx_source=rx_source,
                 ))
             except Exception as exc:
                 logger.warning(
@@ -613,7 +634,8 @@ class _CycleBatch:
     own.  Tracked by (date, time) cycle key matching wsprd output.
     """
 
-    __slots__ = ("cycle_key", "deadline", "bands", "noise", "radiod_id")
+    __slots__ = ("cycle_key", "deadline", "bands", "noise", "radiod_id",
+                 "rx_source")
 
     def __init__(self, cycle_key: Tuple[str, str], deadline: float):
         self.cycle_key = cycle_key
@@ -621,6 +643,11 @@ class _CycleBatch:
         self.bands: dict = {}      # band_name -> List[RawSpot]
         self.noise: dict = {}      # band_name -> NoiseMeasurement
         self.radiod_id: str = ""
+        # Source identifier — single-source batches default to the
+        # radiod_id; multi-source uses the SourceConfig.key so the
+        # writer thread can flush each source's spots independently
+        # (Phase 5's wsprnet dedup keys on this).
+        self.rx_source: str = ""
 
     def add(self, band: str, spots: Iterable[RawSpot]) -> None:
         self.bands.setdefault(band, []).extend(spots)
@@ -685,7 +712,12 @@ class CycleBatcher:
         self._ft_settle_sec = max(0.0, float(ft_settle_sec))
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
-        self._batches: dict = {}   # (date, hhmm) -> _CycleBatch
+        # Keyed by (cycle_key, rx_source) so multi-source spots for
+        # the same cycle flush independently — each source's writer
+        # thread sees its own batch and stamps the rows with its own
+        # rx_source.  Single-source callers passing rx_source="" still
+        # get a stable key (the empty string is hashable).
+        self._batches: dict = {}   # ((date, hhmm), rx_source) -> _CycleBatch
         self._stop = threading.Event()
         # Wake callback — invoked after every flush that committed
         # spots so an in-process uploader can pump immediately
@@ -725,27 +757,36 @@ class CycleBatcher:
         spots: Iterable[RawSpot],
         *,
         radiod_id: str,
+        rx_source: str = "",
     ) -> None:
-        """Enqueue spots for `cycle_key`.  Called from band threads.
+        """Enqueue spots for `cycle_key` under ``rx_source``.
 
         Cheap: just appends to a dict under a mutex.  No DB activity
         here.  The writer thread picks the batch up at the deadline.
         Empty `spots` is a no-op (don't create a batch for it —
         otherwise a band with zero decodes would keep us from ever
         flushing the cycle).
+
+        Single-source callers pass ``rx_source=""`` (or omit) — the
+        empty key keeps the legacy single-batch-per-cycle behaviour.
+        Multi-source callers pass each radiod's SourceConfig.key so
+        each source's spots flush as its own batch with rx_source
+        stamped per-row.
         """
         spots = list(spots)
         if not spots:
             return
+        key = (cycle_key, rx_source)
         with self._cond:
-            batch = self._batches.get(cycle_key)
+            batch = self._batches.get(key)
             if batch is None:
                 batch = _CycleBatch(
                     cycle_key=cycle_key,
                     deadline=time.monotonic() + self._deadline_sec,
                 )
                 batch.radiod_id = radiod_id
-                self._batches[cycle_key] = batch
+                batch.rx_source = rx_source
+                self._batches[key] = batch
             batch.add(band, spots)
             self._cond.notify()
 
@@ -756,22 +797,27 @@ class CycleBatcher:
         noise: NoiseMeasurement,
         *,
         radiod_id: str,
+        rx_source: str = "",
     ) -> None:
-        """Enqueue per-band noise for `cycle_key`.  Same shape as add()
-        but for the noise channel — a band can report noise even with
-        zero spots, so we create the batch even if `add()` hasn't
-        been called yet (deadline starts ticking, the cycle will flush
-        and emit a noise-only batch to wspr.noise).
+        """Enqueue per-band noise for ``(cycle_key, rx_source)``.
+
+        Same shape as add() but for the noise channel — a band can
+        report noise even with zero spots, so we create the batch
+        even if add() hasn't been called yet (deadline starts ticking,
+        the cycle will flush and emit a noise-only batch to
+        wspr.noise).
         """
+        key = (cycle_key, rx_source)
         with self._cond:
-            batch = self._batches.get(cycle_key)
+            batch = self._batches.get(key)
             if batch is None:
                 batch = _CycleBatch(
                     cycle_key=cycle_key,
                     deadline=time.monotonic() + self._deadline_sec,
                 )
                 batch.radiod_id = radiod_id
-                self._batches[cycle_key] = batch
+                batch.rx_source = rx_source
+                self._batches[key] = batch
             batch.add_noise(band, noise)
             self._cond.notify()
 
@@ -812,6 +858,7 @@ class CycleBatcher:
         n = self._sink.submit_batches(
             batch.items(),
             radiod_id=batch.radiod_id,
+            rx_source=batch.rx_source,
         )
         # Noise has its own cadence (one row per band per cycle, even
         # when spots=0), so always try to flush it whenever the batch
@@ -822,6 +869,7 @@ class CycleBatcher:
                 batch.noise_items(),
                 cycle_key=batch.cycle_key,
                 radiod_id=batch.radiod_id,
+                rx_source=batch.rx_source,
             )
         if n == 0 and n_noise == 0 and not self._sink.enabled:
             # Disabled sink — silent.  Avoids a log line per cycle

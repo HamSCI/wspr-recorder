@@ -162,6 +162,7 @@ class WsprRecorder:
             on_period_complete=self._on_period_complete,
             executor=self.executor,
             sync_strategy=sync_strategy,
+            rx_source=source_key,
         )
         self.band_recorders[(source_key, ssrc)] = recorder
 
@@ -465,6 +466,7 @@ class WsprRecorder:
             self.cycle_batcher.add(
                 cycle_key, request.band_name, spots,
                 radiod_id=radiod_id,
+                rx_source=request.rx_source,
             )
             logger.debug(
                 "%s %s: %d spots → cycle batcher (key=%s)",
@@ -531,6 +533,7 @@ class WsprRecorder:
         self.cycle_batcher.add_noise(
             cycle_key, request.band_name, measurement,
             radiod_id=radiod_id,
+            rx_source=request.rx_source,
         )
         logger.debug(
             "%s: noise rms=%.1f dBm fft=%.1f dBm → cycle batcher (key=%s)",

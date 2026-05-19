@@ -369,3 +369,67 @@ class TestSpotSinkSubmitBatch(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class TestRxSourceField(unittest.TestCase):
+    """Phase 3b: every spot/noise row must carry an ``rx_source`` field
+    that disambiguates which configured source produced it.  When the
+    caller doesn't specify rx_source, it defaults to the row's
+    ``radiod_id`` so single-source deployments remain self-consistent
+    (the dedup query in phase 5 doesn't have to special-case missing
+    values)."""
+
+    def test_spot_to_row_default_rx_source_matches_radiod_id(self):
+        from wspr_recorder.spot_sink import spot_to_row
+        from wspr_recorder.decoder import RawSpot
+        spot = RawSpot(
+            date="260519", time="1620", snr=-10, dt=0.0,
+            freq=14.097, call="W1AW", grid="FN31", power=23,
+        )
+        row = spot_to_row(
+            spot, band="20",
+            radiod_id="B4-100-rx888mk2-status.local",
+            rx_call="AC0G/B4", rx_grid="EM38ww",
+        )
+        # No rx_source passed → falls back to radiod_id.
+        self.assertEqual(row["rx_source"], "B4-100-rx888mk2-status.local")
+        # And both fields are present in the canonical row shape.
+        self.assertIn("radiod_id", row)
+        self.assertIn("rx_source", row)
+
+    def test_spot_to_row_explicit_rx_source_used_verbatim(self):
+        from wspr_recorder.spot_sink import spot_to_row
+        from wspr_recorder.decoder import RawSpot
+        spot = RawSpot(
+            date="260519", time="1620", snr=-10, dt=0.0,
+            freq=14.097, call="W1AW", grid="FN31", power=23,
+        )
+        row = spot_to_row(
+            spot, band="20",
+            radiod_id="local",
+            rx_call="AC0G/B4", rx_grid="EM38ww",
+            rx_source="radiod:bee1-status.local",
+        )
+        self.assertEqual(row["rx_source"], "radiod:bee1-status.local")
+        # radiod_id stays untouched; rx_source is independent.
+        self.assertEqual(row["radiod_id"], "local")
+
+    def test_noise_to_row_rx_source_default_and_explicit(self):
+        from wspr_recorder.spot_sink import noise_to_row, NoiseMeasurement
+        noise = NoiseMeasurement(
+            rms_noise_dbm=-120.0,
+            fft_noise_dbm=-130.0,
+            overload_count=0,
+        )
+        row_default = noise_to_row(
+            noise, band="20", cycle_key=("260519", "1620"),
+            radiod_id="rxA", rx_call="AC0G/B4", rx_grid="EM38ww",
+        )
+        self.assertEqual(row_default["rx_source"], "rxA")
+
+        row_explicit = noise_to_row(
+            noise, band="20", cycle_key=("260519", "1620"),
+            radiod_id="rxA", rx_call="AC0G/B4", rx_grid="EM38ww",
+            rx_source="radiod:bee2-status.local",
+        )
+        self.assertEqual(row_explicit["rx_source"], "radiod:bee2-status.local")

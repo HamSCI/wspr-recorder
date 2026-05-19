@@ -36,7 +36,14 @@ class GapEvent:
 
 @dataclass
 class DecodeRequest:
-    """A request to write a WAV file and decode for a completed period."""
+    """A request to write a WAV file and decode for a completed period.
+
+    ``rx_source`` is the operator-facing source identifier carried
+    through to the spot row's ``rx_source`` column (e.g.,
+    ``"radiod:bee1-status.local"``).  Empty string when the recorder
+    doesn't yet know its source — preserved for backward compat with
+    tests that construct DecodeRequest directly.
+    """
     frequency_hz: int
     band_name: str
     modes: List[DecodeMode]       # e.g., [W2, F2] for shared 120s
@@ -46,6 +53,7 @@ class DecodeRequest:
     start_wallclock: datetime
     start_rtp_timestamp: int
     end_rtp_timestamp: int
+    rx_source: str = ""
 
 
 PeriodCompleteCallback = Callable[[DecodeRequest], None]
@@ -128,6 +136,11 @@ class BandRecorder:
         sync_strategy: Optional[SyncStrategy] = None,
         # Legacy callback — used if on_period_complete is not provided
         on_minute_complete: Optional[MinuteCompleteCallback] = None,
+        # Operator-facing source identifier stamped into every emitted
+        # DecodeRequest as ``rx_source``.  Empty string for tests /
+        # legacy single-source contexts where the value isn't yet
+        # threaded through.
+        rx_source: str = "",
     ):
         self.ssrc = ssrc
         self.frequency_hz = frequency_hz
@@ -137,6 +150,7 @@ class BandRecorder:
         self.on_minute_complete = on_minute_complete
         self.executor = executor
         self.sync_strategy = sync_strategy or FallbackSyncStrategy(sample_rate)
+        self.rx_source = rx_source
 
         self._decode_modes = decode_modes or [DecodeMode.W2]
         self.stats = BandRecorderStats()
@@ -321,6 +335,7 @@ class BandRecorder:
                 start_wallclock=start_wc,
                 start_rtp_timestamp=start_rtp,
                 end_rtp_timestamp=end_rtp,
+                rx_source=self.rx_source,
             )
 
             self.stats.samples_written += len(samples)
