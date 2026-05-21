@@ -1107,34 +1107,36 @@ class WsprRecorder:
             # cycle-commit log line when the slower bands finally
             # reported.
             from .decode_mode import DECODE_MODE_PERIODS
-            bands_by_source: dict = {}
-            for src in self.config.sources:
-                band_periods: dict = {}
-                for band_cfg in src.bands:
+            # Build the {band_name: [periods]} map once from the
+            # shared Config.bands list; every source tunes the same
+            # bands so they share this map keyed under each source.
+            band_periods: dict = {}
+            for band_cfg in self.config.bands:
+                try:
+                    bname = freq_to_band_name(band_cfg.frequency)
+                except Exception:
+                    continue
+                periods: list = []
+                for mode_str in band_cfg.modes:
                     try:
-                        bname = freq_to_band_name(band_cfg.frequency)
-                    except Exception:
+                        m = DecodeMode(mode_str)
+                    except ValueError:
                         continue
-                    periods = []
-                    for mode_str in band_cfg.modes:
-                        try:
-                            m = DecodeMode(mode_str)
-                        except ValueError:
-                            continue
-                        p = DECODE_MODE_PERIODS.get(m)
-                        if p and p not in periods:
-                            periods.append(p)
-                    if periods:
-                        band_periods[bname] = periods
-                if band_periods:
-                    bands_by_source[src.key] = band_periods
-            if bands_by_source:
+                    p = DECODE_MODE_PERIODS.get(m)
+                    if p and p not in periods:
+                        periods.append(p)
+                if periods:
+                    band_periods[bname] = periods
+            if band_periods:
+                bands_by_source = {
+                    src.key: band_periods for src in self.config.sources
+                }
                 self.cycle_batcher.set_bands_by_source(bands_by_source)
                 logger.info(
                     "cycle batcher: band-period pre-registration "
-                    "enabled for %d source(s), %d total bands",
+                    "enabled for %d source(s), %d bands per source",
                     len(bands_by_source),
-                    sum(len(b) for b in bands_by_source.values()),
+                    len(band_periods),
                 )
         
         # Spawn one ReceiverManager per configured source.  Each runs
