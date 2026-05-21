@@ -629,6 +629,113 @@ class ReceiverManager:
             )
         return ok
 
+    # ── Task #45 follow-up: surface radiod-side failures clearly ─────────
+
+    def diagnose_radiod_side(self) -> Optional[str]:
+        """Diagnose why connect()/provisioning is failing.
+
+        When ``full_reset`` fails repeatedly, the problem is almost
+        always on the radiod side — radiod hung, radiod's USB front-end
+        (RX888 etc.) stopped delivering data and crashed, radiod is in
+        a systemd restart loop, etc.  ``ensure_channel`` just times out
+        with "Channel SSRC X not verified within 5.0s", which doesn't
+        tell the operator anything actionable.
+
+        This helper checks the local radiod systemd unit corresponding
+        to this source's status_address and returns a human-readable
+        multi-line diagnosis pulling in the unit's ActiveState and the
+        last few journal lines.  Returns ``None`` if the unit can't be
+        identified locally — caller should treat that as "remote
+        source, check the host".
+
+        Example output::
+
+            radiod@B4-100-rx888mk2.service: activating (auto-restart)
+            recent radiod log:
+              No rx888 data for 5 seconds, quitting
+              libusb_handle_events_timeout_completed() timed out
+              radiod: ...usbi_mutex_lock: Assertion `pthread_mutex_lock(mutex) == 0' failed.
+              radiod@B4-100-rx888mk2.service: Main process exited, code=killed, status=6/ABRT
+            likely cause: RX888 USB front-end dropped data; radiod
+              restart loop will continue until the USB device is
+              recovered (replug / power-cycle the SDR)
+        """
+        unit = self._radiod_unit_name()
+        if not unit:
+            return None
+        try:
+            active = subprocess.run(
+                ["systemctl", "is-active", unit],
+                capture_output=True, text=True, timeout=5.0,
+            )
+            state = (active.stdout or "").strip()
+        except (subprocess.TimeoutExpired, OSError):
+            return None
+        if not state or state in ("not-found", "inactive"):
+            # No local unit by that name — source is remote (bee1 etc.)
+            # or the operator runs radiod differently.
+            return None
+        lines = [f"{unit}: {state}"]
+        # Pull the last few journal lines for context.  Use -n5 so the
+        # diagnosis stays compact in the wspr-recorder log.
+        try:
+            jr = subprocess.run(
+                ["journalctl", "-u", unit, "-n", "5",
+                 "--no-pager", "-o", "cat"],
+                capture_output=True, text=True, timeout=5.0,
+            )
+            tail = [ln for ln in (jr.stdout or "").splitlines() if ln.strip()]
+            if tail:
+                lines.append("recent radiod log:")
+                for ln in tail:
+                    lines.append(f"  {ln}")
+        except (subprocess.TimeoutExpired, OSError):
+            pass
+        # Quick pattern-match on the journal tail for the common
+        # failure modes so the operator gets an actionable hint
+        # instead of having to interpret libusb / pthread errors.
+        hint = self._likely_radiod_cause(lines)
+        if hint:
+            lines.append(f"likely cause: {hint}")
+        return "\n".join(lines)
+
+    def _radiod_unit_name(self) -> Optional[str]:
+        """Map ``status_address`` to the local radiod systemd unit.
+
+        ``B4-100-rx888mk2-status.local`` → ``radiod@B4-100-rx888mk2.service``
+        ``bee1-status.local`` → ``radiod@bee1.service`` (but that unit
+        only exists on the bee1 host, not here — caller will detect
+        the "inactive / not-found" state and skip the diagnosis).
+        """
+        addr = (self._status_address or "").strip()
+        if not addr:
+            return None
+        for suffix in ("-status.local", ".local"):
+            if addr.endswith(suffix):
+                addr = addr[: -len(suffix)]
+                break
+        if not addr:
+            return None
+        return f"radiod@{addr}.service"
+
+    def _likely_radiod_cause(self, diag_lines: list) -> Optional[str]:
+        """Pattern-match the journal tail for known failure modes."""
+        text = "\n".join(diag_lines).lower()
+        if "no rx888 data" in text or "libusb" in text:
+            return ("RX888 USB front-end stopped delivering data; "
+                    "radiod restart loop continues until the device "
+                    "is recovered (replug / power-cycle the SDR, or "
+                    "check `dmesg -T | tail` for USB errors)")
+        if "auto-restart" in text or "activating" in text:
+            return ("radiod is in a systemd restart loop — "
+                    "`journalctl -u radiod@... -f` will show the "
+                    "crash that triggers each restart")
+        if "failed" in text:
+            return ("radiod is in failed state — "
+                    "`systemctl status radiod@... && "
+                    "journalctl -u radiod@... -n 50` for details")
+        return None
+
     def shutdown(self) -> None:
         self.stop_streams()
         if self._control is not None:

@@ -802,12 +802,15 @@ class WsprRecorder:
                             ok = rm.full_reset()
                             if ok and rm.state.channels:
                                 degraded_count[src_key] = 0
+                            else:
+                                self._surface_radiod_diagnosis(rm)
                         except Exception:
                             logger.exception(
                                 "Channel health (%s): full_reset "
                                 "raised on zero-channel recovery",
                                 src_key,
                             )
+                            self._surface_radiod_diagnosis(rm)
                         continue
                     if active == total:
                         # Recovered (or never failed).  Reset ladder.
@@ -836,6 +839,8 @@ class WsprRecorder:
                                 # full check interval before judging
                                 # health again.
                                 degraded_count[src_key] = 0
+                            else:
+                                self._surface_radiod_diagnosis(rm)
                         else:
                             # Cheap recovery: re-provision stale channels.
                             rm.reprovision_stale()
@@ -850,7 +855,51 @@ class WsprRecorder:
                 break
             except Exception as e:
                 logger.error(f"Health check error: {e}")
-    
+
+    def _surface_radiod_diagnosis(self, rm: ReceiverManager) -> None:
+        """When reset/reconnect fails, log the radiod-side diagnosis.
+
+        Without this the operator sees only "Channel SSRC X not
+        verified within 5.0s" — opaque.  ``rm.diagnose_radiod_side()``
+        queries the local radiod systemd unit + journal for the
+        actual crash reason (e.g. ``No rx888 data for 5 seconds,
+        quitting`` + libusb assertion) and we emit it at WARN so it's
+        visible by default and reads as a single coherent block:
+
+            WARN: radiod-side problem detected for radiod:B4-100-rx888mk2-status.local
+            WARN:   radiod@B4-100-rx888mk2.service: activating (auto-restart)
+            WARN:   recent radiod log:
+            WARN:     No rx888 data for 5 seconds, quitting
+            WARN:     libusb_handle_events_timeout_completed() timed out
+            WARN:     radiod: ...usbi_mutex_lock: Assertion failed.
+            WARN:   likely cause: RX888 USB front-end stopped delivering data; ...
+
+        ``None`` return = remote source (no local unit) — log a hint
+        to check that host.
+        """
+        try:
+            diag = rm.diagnose_radiod_side()
+        except Exception:
+            logger.exception(
+                "diagnose_radiod_side raised for %s", rm.source_key,
+            )
+            return
+        if diag is None:
+            logger.warning(
+                "radiod-side problem detected for %s (no LOCAL "
+                "systemd unit matches; this source is REMOTE — "
+                "check radiod / network on the host that serves "
+                "%s)",
+                rm.source_key, rm._status_address,
+            )
+            return
+        # Log each line as its own WARN so the journal renders them
+        # as a clean block instead of one mega-line.
+        header = f"radiod-side problem detected for {rm.source_key}"
+        logger.warning(header)
+        for line in diag.split("\n"):
+            logger.warning("  %s", line)
+
     def _get_status_dict(self) -> Dict:
         """Build status dictionary (used by both file and IPC)."""
         status = {
