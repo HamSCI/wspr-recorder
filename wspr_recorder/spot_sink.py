@@ -1223,6 +1223,23 @@ class CycleBatcher:
                 radiod_id=batch.radiod_id,
                 rx_source=batch.rx_source,
             )
+        # Force the underlying hamsci_sink Writer to flush its
+        # in-memory buffer to pending_uploads NOW.  Default Writer
+        # behavior buffers up to batch_rows (1000) and only flushes on
+        # SIZE or the AGE trigger (30 s) which is itself only checked
+        # on the *next* insert().  WSPR cycles are 2 min apart with
+        # ~50 rows each, so without an explicit flush the age trigger
+        # effectively becomes 2-min granular: cycle N's rows sit in
+        # buffer until cycle N+1's first insert kicks them out.  That
+        # caused cycle N's rows to land in pending_uploads ~2 min late
+        # — AFTER the cross-rx-sync wake fired and the pump ran with
+        # only the first rx's contribution visible — so each cycle's
+        # spots were split across two wsprnet POSTs (visible in
+        # `smd watch wspr` as the recurring two-cycles-per-POST
+        # artifact).  Flushing here makes the cross-rx-sync wake
+        # event causally correct: by the time it fires, every rx's
+        # spots are durable in pending_uploads.
+        self._sink.flush()
         if n == 0 and n_noise == 0 and not self._sink.enabled:
             # Disabled sink — silent.  Avoids a log line per cycle
             # on hosts that don't have the env flag set.
