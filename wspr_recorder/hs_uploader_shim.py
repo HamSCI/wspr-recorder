@@ -59,11 +59,23 @@ from typing import Optional
 logger = logging.getLogger(__name__)
 
 
-# Pump cadence.  WSPR is 2-minute decode cycles; wd-post writes new
-# files after each cycle, so polling every 60 s catches every cycle
-# with ≤ 30 s of latency.  Lower would just waste cycles on empty
-# spool dirs.  Matches the legacy wd-upload-wsprdaemon's loop sleep.
-PUMP_INTERVAL_SEC = 60.0
+# Pump cadence.  Wake-driven (cross-rx sync wake_callback fires the
+# pump the instant ALL rx commit a cycle); polling is now a long
+# safety-net for the rare wake-loss case.  Pre-2026-05-21 default was
+# 60 s polling — but that fired the pump BETWEEN rx commits when one
+# rx was slow (e.g., a remote receiver's audio packets arriving with
+# higher RTT than the local rx888mk2), splitting a single cycle into
+# two POSTs.  v3's design waits for "all decoders idle" before
+# uploading; our wake_callback is the equivalent event, so trust it
+# and let polling only catch the truly-stuck case.
+#
+# ``WSPR_PUMP_INTERVAL_SEC`` env var overrides; default 300 s = 5 min
+# polling backstop.  Cross-rx wake fires within ~2.5 min of cycle
+# start, so wake almost always wins.
+import os as _os
+PUMP_INTERVAL_SEC = float(
+    _os.environ.get("WSPR_PUMP_INTERVAL_SEC", "300").strip() or "300"
+)
 
 # Default sigmond sink location (matches storage_migrate.SINK_DB_PATH).
 DEFAULT_SINK_DB = "/var/lib/sigmond/sink.db"
