@@ -73,3 +73,8 @@ venv    = "/opt/wspr-recorder/venv"
 [[deps.apt]]
 name = "wsjtx"
 note = "provides jt9 for FST4W decoding"
+
+[[deps.apt]]
+name = "whiptail"
+optional = true
+note = "drives scripts/config-wizard.sh; configurator falls back to stdin prompts if absent"

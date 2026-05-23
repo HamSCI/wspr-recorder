@@ -17,6 +17,8 @@ from __future__ import annotations
 
 import os
 import re
+import shutil
+import subprocess
 import sys
 from pathlib import Path
 from typing import Optional
@@ -30,6 +32,68 @@ except ModuleNotFoundError:
 DEFAULT_CONFIG_PATH = Path(
     os.environ.get("WSPR_RECORDER_CONFIG", "/etc/wspr-recorder/config.toml")
 )
+
+
+# ---------------------------------------------------------------------------
+# whiptail wizard dispatch (mirrors psk-recorder/scripts/config-wizard.sh)
+# ---------------------------------------------------------------------------
+
+def _wizard_script() -> Optional[Path]:
+    """Locate scripts/config-wizard.sh.  Returns None if not found."""
+    candidates = [
+        Path(__file__).resolve().parent.parent / "scripts" / "config-wizard.sh",
+        Path("/opt/git/sigmond/wspr-recorder/scripts/config-wizard.sh"),
+        Path("/usr/local/share/wspr-recorder/config-wizard.sh"),
+    ]
+    for p in candidates:
+        if p.is_file() and os.access(p, os.X_OK):
+            return p
+    return None
+
+
+def _wizard_available(args) -> bool:
+    """True when the whiptail wizard should be used.
+
+    Falls back to the legacy `input()` flow when stdout isn't a TTY, the
+    operator passed --non-interactive, whiptail isn't on PATH, or the
+    wizard script can't be located.
+    """
+    if getattr(args, "non_interactive", False):
+        return False
+    if not sys.stdout.isatty():
+        return False
+    if shutil.which("whiptail") is None:
+        return False
+    return _wizard_script() is not None
+
+
+def _exec_wizard(args, target: Path) -> Optional[dict]:
+    """Run the whiptail wizard.  Returns a dict of fields to apply,
+    an empty dict on operator-chosen cancel / $EDITOR escape (no apply
+    needed), or None on real error (caller falls back to legacy flow).
+    """
+    script = _wizard_script()
+    if script is None:
+        return None
+    env = {**os.environ, "WSPR_RECORDER_CONFIG": str(target)}
+    try:
+        proc = subprocess.run([str(script)], env=env,
+                              capture_output=True, text=True, check=False)
+    except OSError as e:
+        _err(f"failed to exec wizard: {e}")
+        return None
+    if proc.stderr:
+        sys.stderr.write(proc.stderr)
+    if proc.returncode != 0:
+        return None
+    fields: dict = {}
+    for line in proc.stdout.splitlines():
+        line = line.strip()
+        if not line or "=" not in line:
+            continue
+        k, v = line.split("=", 1)
+        fields[k.strip().lower()] = v.strip()
+    return fields
 
 
 def _find_template() -> Optional[Path]:
@@ -66,6 +130,18 @@ def cmd_config_init(args) -> int:
 
     target.parent.mkdir(parents=True, exist_ok=True)
     target.write_text(body)
+    # If the whiptail wizard is usable, give the operator a richer pass
+    # over the freshly-written config (e.g. pick a radiod from the LAN
+    # menu).  The legacy stdin prompt in _collect_init_values seeded a
+    # sensible default; the wizard lets them refine it.
+    if _wizard_available(args):
+        fields = _exec_wizard(args, target)
+        if fields and "status_address" in fields:
+            body = target.read_text()
+            body = _replace_radiod_field(body, "status_address",
+                                          fields["status_address"])
+            target.write_text(body)
+            values["radiod_status"] = fields["status_address"]
     _ok(f"wrote {target}")
     _info(f"radiod status_address: {values['radiod_status']}")
     if values.get("station_note"):
@@ -97,6 +173,29 @@ def cmd_config_edit(args) -> int:
     if getattr(args, "non_interactive", False):
         _info(f"radiod.status_address = {cur_status}")
         return 0
+
+    # Prefer the whiptail wizard when usable; it shows a menu populated
+    # from sigmond's environment cache so the operator picks a real LAN
+    # radiod with arrow keys instead of typing a hostname from memory.
+    if _wizard_available(args):
+        fields = _exec_wizard(args, target)
+        if fields is None:
+            # Wizard returned a real error — fall back to legacy prompt.
+            pass
+        elif "status_address" not in fields:
+            # Operator cancelled or used the $EDITOR escape.
+            _info("no changes via wizard")
+            return 0
+        else:
+            new_status = fields["status_address"]
+            body = target.read_text()
+            body = _replace_radiod_field(body, "status_address", new_status)
+            if body == target.read_text():
+                _info("no changes")
+                return 0
+            target.write_text(body)
+            _ok(f"updated {target}")
+            return 0
 
     new_status = _prompt(
         "Radiod status address (mDNS, e.g. bee1-status.local)",
