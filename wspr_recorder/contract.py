@@ -1,4 +1,4 @@
-"""HamSCI Client Contract v0.4 inventory and validate JSON builders."""
+"""HamSCI Client Contract v0.7 inventory and validate JSON builders."""
 
 from __future__ import annotations
 
@@ -11,7 +11,7 @@ from typing import Any
 from .config import Config, _derive_radiod_id
 from .version import GIT_INFO
 
-CONTRACT_VERSION = "0.6"
+CONTRACT_VERSION = "0.7"
 KA9Q_PYTHON_MIN_VERSION = "3.8.0"
 
 
@@ -92,6 +92,18 @@ def build_inventory(config: Config, config_path: Path) -> dict:
         "uses_timing_calibration": config.timing.authority in ("fusion", "auto"),
         "provides_timing_calibration": False,
         "chain_delay_ns_applied": _chain_delay_ns(instance_id),
+        # CONTRACT v0.7 §18 — runtime-state field paired with the
+        # capability boolean above.  null = §18 RTP-default mode (the
+        # only mode wspr-recorder currently runs in; no §18 subscriber
+        # path wired yet).  When a §18 subscriber lands, this will
+        # populate with {source, tier, sigma_ns, snapshot_age_s,
+        # radiod_id} from the AuthoritySnapshot the subscriber last
+        # fetched.  WSPR is slot-quantized to two-minute boundaries
+        # so timing-authority gating is not urgent for spot quality;
+        # the field is reported now to satisfy the v0.7 inventory
+        # shape and to give sigmond's adapter something concrete to
+        # display.
+        "timing_authority_applied": None,
     }
 
     # The process log goes to the systemd journal

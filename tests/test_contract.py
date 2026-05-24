@@ -73,7 +73,18 @@ class InventoryV04Tests(unittest.TestCase):
         self.assertEqual(self.data["client"], "wspr-recorder")
 
     def test_contract_version(self):
-        self.assertEqual(self.data["contract_version"], "0.6")
+        self.assertEqual(self.data["contract_version"], "0.7")
+
+    def test_timing_authority_applied_explicit_null(self):
+        """CONTRACT v0.7 §3/§18 — runtime-state field for the §18
+        subscription. wspr-recorder runs in RTP-default mode today
+        (no §18 subscriber wired), so the field must be present and
+        explicitly None — not missing — so sigmond's adapter can
+        distinguish "v0.7-aware and in default mode" from "old client
+        that doesn't know about the field." """
+        inst = self.data["instances"][0]
+        self.assertIn("timing_authority_applied", inst)
+        self.assertIsNone(inst["timing_authority_applied"])
 
     def test_has_config_path(self):
         self.assertIn("config_path", self.data)
