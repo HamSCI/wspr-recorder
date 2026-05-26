@@ -264,22 +264,14 @@ def _derive_radiod_id(status_address: str) -> str:
 
 
 def resolve_radiod_status(config: "Config") -> None:
-    """Apply RADIOD_<ID>_STATUS override from coordination.env.
+    """No-op kept for back-compat with internal callers.
 
-    Contract v0.4 §2: sigmond may override the radiod mDNS status name at
-    runtime without editing the native config. The id is derived from the
-    configured `status_address` so the override is keyed off the same
-    string that inventory --json surfaces.
+    Phase 6 cutover (RADIOD-IDENTIFICATION.md §3.1) removed the
+    RADIOD_<ID>_STATUS env override.  The TOML `[radiod] status`
+    field is the only source of truth for the mDNS multicast name;
+    operators who used the env override should edit the TOML.
     """
-    radiod_id = _derive_radiod_id(config.radiod.status_address)
-    env_key = f"RADIOD_{radiod_id.upper().replace('-', '_')}_STATUS"
-    override = os.environ.get(env_key, "").strip()
-    if override:
-        logger.info(
-            "Applying %s=%s (was %s)",
-            env_key, override, config.radiod.status_address,
-        )
-        config.radiod.status_address = override
+    return None
 
 
 @dataclass
@@ -552,20 +544,16 @@ def load_config(config_path: str) -> Config:
     # when no [[source]] entries are present.
     if "radiod" in data:
         rad = data["radiod"]
-        # RADIOD-IDENTIFICATION.md §3.1 — `status` is the new canonical
-        # field name for the mDNS multicast.  Accept legacy
-        # `status_address` during the Phase 3 deprecation window with
-        # a DeprecationWarning.  When both are present, `status` wins.
+        # RADIOD-IDENTIFICATION.md §3.1 — `status` is the only accepted
+        # field name for the mDNS multicast (Phase 6 cutover removed
+        # legacy `status_address` acceptance).
         status_value = rad.get("status")
-        if status_value is None and "status_address" in rad:
-            warnings.warn(
-                "[radiod] status_address is deprecated; rename to "
-                "[radiod] status per RADIOD-IDENTIFICATION.md §3.1",
-                DeprecationWarning, stacklevel=2,
-            )
-            status_value = rad["status_address"]
         if status_value is None:
-            status_value = config.radiod.status_address  # fall back to default
+            raise ValueError(
+                "[radiod] block has no `status` field.  Run "
+                "`sudo smd radiod migrate --yes` if this config still "
+                "uses the legacy `status_address` field."
+            )
         config.radiod = RadiodConfig(
             status_address=status_value,
             port=rad.get("port", config.radiod.port),
@@ -580,11 +568,14 @@ def load_config(config_path: str) -> Config:
     # (explicit beats implicit).
     if "source" in data:
         for src_entry in data["source"]:
+            # RADIOD-IDENTIFICATION.md §3.1 — Phase 6 cutover: the
+            # canonical field is `status`, matching the singleton
+            # [radiod] block and the rest of the suite.
             try:
-                addr = src_entry["status_address"]
+                addr = src_entry["status"]
             except KeyError:
                 logger.warning(
-                    "Skipping [[source]] entry without status_address: %s",
+                    "Skipping [[source]] entry without `status` field: %s",
                     src_entry,
                 )
                 continue

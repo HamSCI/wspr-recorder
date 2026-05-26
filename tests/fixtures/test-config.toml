@@ -10,7 +10,7 @@ ipc_socket = "/tmp/wspr-recorder-test/control.sock"
 authority = "auto"
 
 [radiod]
-status_address = "test-hf-status.local"
+status = "test-hf-status.local"
 destination = "239.1.2.3"
 port = 5004
 

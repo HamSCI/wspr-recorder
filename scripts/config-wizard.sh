@@ -86,7 +86,7 @@ except ModuleNotFoundError:
     import tomli as tomllib  # noqa
 with open(sys.argv[1], "rb") as f:
     data = tomllib.load(f)
-print((data.get("radiod") or {}).get("status_address", ""))
+print((data.get("radiod") or {}).get("status", ""))
 PY
 )
 fi

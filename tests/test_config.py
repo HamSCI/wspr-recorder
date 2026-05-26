@@ -252,7 +252,7 @@ class TestSourceConfig:
 output_dir = "/tmp/test"
 
 [radiod]
-status_address = "B4-100-rx888mk2-status.local"
+status = "B4-100-rx888mk2-status.local"
 
 [[band]]
 frequency = "14095600"
@@ -277,12 +277,12 @@ output_dir = "/tmp/test"
 
 [[source]]
 key = "radiod:B4-100-rx888mk2-status.local"
-status_address = "B4-100-rx888mk2-status.local"
+status = "B4-100-rx888mk2-status.local"
 label = "AC0G/B4 Dipole"
 
 [[source]]
 key = "radiod:bee1-status.local"
-status_address = "bee1-status.local"
+status = "bee1-status.local"
 label = "AC0G @EM38ww B1 T3FD"
 
 [[band]]
@@ -299,14 +299,14 @@ modes = ["W2"]
         finally:
             os.unlink(path)
 
-    def test_source_key_defaulted_from_status_address(self):
+    def test_source_key_defaulted_from_status(self):
         """Operator can omit ``key`` — defaults to ``radiod:<addr>``."""
         path = self._write_toml("""
 [recorder]
 output_dir = "/tmp/test"
 
 [[source]]
-status_address = "bee1-status.local"
+status = "bee1-status.local"
 
 [[band]]
 frequency = "14095600"
@@ -325,11 +325,11 @@ frequency = "14095600"
 output_dir = "/tmp/test"
 
 [radiod]
-status_address = "legacy.local"
+status = "legacy.local"
 
 [[source]]
 key = "radiod:bee1-status.local"
-status_address = "bee1-status.local"
+status = "bee1-status.local"
 
 [[band]]
 frequency = "14095600"
@@ -343,20 +343,20 @@ frequency = "14095600"
         finally:
             os.unlink(path)
 
-    def test_source_without_status_address_skipped(self):
-        """An entry missing status_address → logged + skipped.  Loader
-        falls back to whatever sources remain (and the back-compat
-        synthesiser if all entries are bad)."""
+    def test_source_without_status_skipped(self):
+        """An entry missing the `status` field → logged + skipped.
+        Loader falls back to whatever sources remain (and the
+        back-compat synthesiser if all entries are bad)."""
         path = self._write_toml("""
 [recorder]
 output_dir = "/tmp/test"
 
 [radiod]
-status_address = "fallback.local"
+status = "fallback.local"
 
 [[source]]
 key = "radiod:no-addr"
-# status_address missing — entry will be dropped
+# status field missing — entry will be dropped
 
 [[band]]
 frequency = "14095600"
@@ -377,11 +377,11 @@ output_dir = "/tmp/test"
 
 [[source]]
 key = "radiod:bee1-status.local"
-status_address = "bee1-status.local"
+status = "bee1-status.local"
 
 [[source]]
 key = "radiod:bee1-status.local"
-status_address = "bee1-status.local"
+status = "bee1-status.local"
 
 [[band]]
 frequency = "14095600"
@@ -395,13 +395,13 @@ frequency = "14095600"
     def test_no_sources_at_all_rejected(self):
         """No [radiod] AND no [[source]] should fail validation."""
         # Need to defeat the RadiodConfig default of "hf.local" — pass
-        # an explicit empty status_address.
+        # an explicit empty status.
         path = self._write_toml("""
 [recorder]
 output_dir = "/tmp/test"
 
 [radiod]
-status_address = ""
+status = ""
 
 [[band]]
 frequency = "14095600"
@@ -498,17 +498,12 @@ class TestExtractReporterId:
             assert extract_reporter_id(path) is None
 
 
-class TestRadiodSchemaPhase3:
-    """RADIOD-IDENTIFICATION.md §3.1 — new `[radiod] status` field acceptance.
+class TestRadiodSchema:
+    """RADIOD-IDENTIFICATION.md §3.1 — Phase 6 cutover: `[radiod]
+    status` is the only accepted field name for the mDNS multicast
+    control/status name."""
 
-    Phase 3 adds `[radiod] status` as the canonical field for
-    declaring the mDNS multicast control/status name.  Legacy
-    `status_address` still works during the deprecation window
-    with a DeprecationWarning."""
-
-    def test_status_field_loads_clean(self):
-        """No DeprecationWarning when only the new `status` field is set."""
-        import warnings
+    def test_status_field_loads(self):
         from wspr_recorder.config import load_config
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.toml"
@@ -520,18 +515,12 @@ class TestRadiodSchemaPhase3:
                 'frequency = "14095600"\n'
                 'modes = ["W2"]\n'
             )
-            with warnings.catch_warnings(record=True) as w:
-                warnings.simplefilter("always")
-                config = load_config(str(path))
+            config = load_config(str(path))
             assert config.radiod.status_address == "bee1-status.local"
-            assert not any(
-                issubclass(warning.category, DeprecationWarning)
-                and "status_address" in str(warning.message)
-                for warning in w)
 
-    def test_legacy_status_address_warns(self):
-        """Legacy `status_address` still parses but emits DeprecationWarning."""
-        import warnings
+    def test_legacy_status_address_rejected(self):
+        """Phase 6: a config still using `status_address` is rejected
+        with a hint pointing operators at the migration tool."""
         from wspr_recorder.config import load_config
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "config.toml"
@@ -539,40 +528,7 @@ class TestRadiodSchemaPhase3:
                 '[radiod]\n'
                 'status_address = "legacy.local"\n'
                 '[[band]]\n'
-                'name = "20m"\n'
                 'frequency = "14095600"\n'
-                'modes = ["W2"]\n'
             )
-            with warnings.catch_warnings(record=True) as w:
-                warnings.simplefilter("always")
-                config = load_config(str(path))
-            assert config.radiod.status_address == "legacy.local"
-            assert any(
-                issubclass(warning.category, DeprecationWarning)
-                and "status_address is deprecated" in str(warning.message)
-                for warning in w)
-
-    def test_status_wins_when_both_present(self):
-        """If both fields are set, `status` wins; no warning fires."""
-        import warnings
-        from wspr_recorder.config import load_config
-        with tempfile.TemporaryDirectory() as tmp:
-            path = Path(tmp) / "config.toml"
-            path.write_text(
-                '[radiod]\n'
-                'status = "new.local"\n'
-                'status_address = "old.local"\n'
-                '[[band]]\n'
-                'name = "20m"\n'
-                'frequency = "14095600"\n'
-                'modes = ["W2"]\n'
-            )
-            with warnings.catch_warnings(record=True) as w:
-                warnings.simplefilter("always")
-                config = load_config(str(path))
-            assert config.radiod.status_address == "new.local"
-            # `status` won, no deprecation fired
-            assert not any(
-                issubclass(warning.category, DeprecationWarning)
-                and "status_address" in str(warning.message)
-                for warning in w)
+            with pytest.raises(ValueError, match="status"):
+                load_config(str(path))

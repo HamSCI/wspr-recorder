@@ -231,10 +231,10 @@ def cmd_config_edit(args) -> int:
         _err(f"failed to read {target}: {e}")
         return 1
 
-    cur_status = (current.get("radiod") or {}).get("status_address", "")
+    cur_status = (current.get("radiod") or {}).get("status", "")
 
     if getattr(args, "non_interactive", False):
-        _info(f"radiod.status_address = {cur_status}")
+        _info(f"radiod.status = {cur_status}")
         return 0
 
     # Prefer the whiptail wizard when usable; it shows a menu populated
@@ -252,7 +252,7 @@ def cmd_config_edit(args) -> int:
         else:
             new_status = fields["status_address"]
             body = target.read_text()
-            body = _replace_radiod_field(body, "status_address", new_status)
+            body = _replace_radiod_field(body, "status", new_status)
             if body == target.read_text():
                 _info("no changes")
                 return 0
@@ -266,7 +266,7 @@ def cmd_config_edit(args) -> int:
     )
 
     body = target.read_text()
-    body = _replace_radiod_field(body, "status_address", new_status)
+    body = _replace_radiod_field(body, "status", new_status)
 
     if body == target.read_text():
         _info("no changes")

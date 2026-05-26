@@ -127,7 +127,7 @@ class ExecWizardTests(unittest.TestCase):
 
 class EditDispatchTests(unittest.TestCase):
     def test_edit_uses_wizard_when_available(self):
-        body = '[radiod]\nstatus_address = "old.local"\n'
+        body = '[radiod]\nstatus = "old.local"\n'
         with tempfile.TemporaryDirectory() as d:
             target = Path(d) / "cfg.toml"
             target.write_text(body)
@@ -138,11 +138,11 @@ class EditDispatchTests(unittest.TestCase):
                                     return_value={"status_address": "new.local"}):
                 rc = configurator.cmd_config_edit(args)
             self.assertEqual(rc, 0)
-            self.assertIn('status_address = "new.local"', target.read_text())
+            self.assertIn('status = "new.local"', target.read_text())
 
     def test_edit_falls_back_when_wizard_returns_none(self):
         # Real wizard error should drop through to legacy prompt.
-        body = '[radiod]\nstatus_address = "old.local"\n'
+        body = '[radiod]\nstatus = "old.local"\n'
         with tempfile.TemporaryDirectory() as d:
             target = Path(d) / "cfg.toml"
             target.write_text(body)
@@ -155,10 +155,10 @@ class EditDispatchTests(unittest.TestCase):
                                     return_value="fallback.local"):
                 rc = configurator.cmd_config_edit(args)
             self.assertEqual(rc, 0)
-            self.assertIn('status_address = "fallback.local"', target.read_text())
+            self.assertIn('status = "fallback.local"', target.read_text())
 
     def test_edit_wizard_cancel_writes_nothing(self):
-        body = '[radiod]\nstatus_address = "old.local"\n'
+        body = '[radiod]\nstatus = "old.local"\n'
         with tempfile.TemporaryDirectory() as d:
             target = Path(d) / "cfg.toml"
             target.write_text(body)

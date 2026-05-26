@@ -34,7 +34,7 @@ _MIN_TOML = """
 output_dir = "/tmp/wspr-recorder-test"
 sample_format = "float32"
 [radiod]
-status_address = "test.local"
+status = "test.local"
 [[band]]
 frequency = "14095600"
 modes = ["W2"]

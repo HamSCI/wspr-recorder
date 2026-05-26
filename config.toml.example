@@ -88,15 +88,9 @@ authority = "auto"
 # the operator runs the configurator.
 status = "<configure-via-config-init>"
 
-# Legacy field name accepted during the Phase 3 deprecation window
-# (RADIOD-IDENTIFICATION.md §6).  Greenfield installs should use
-# `status` above; existing deployments can keep this until they
-# re-run the configurator.
-# status_address = "bee3-status.local"
-
 # RTP multicast destination is not configured here — radiod advertises
 # per-channel multicast groups via its status stream (discovered through
-# status_address), and ka9q-python's MultiStream joins them on demand.
+# `status`), and ka9q-python's MultiStream joins them on demand.
 
 # RTP port (all channels share this port, demuxed by SSRC)
 port = 5004
