@@ -154,6 +154,21 @@ def main(argv: list[str] | None = None) -> None:
     sub_edit.add_argument("--non-interactive", action="store_true")
     _add_common(sub_edit)
 
+    # CLIENT-CONTRACT §14 JSON-roundtrip surface.  Sigmond's in-TUI
+    # Textual config wizard requires `show --json` + `apply --json -`;
+    # without them sigmond falls back to the whiptail-driven config-edit
+    # path.  See configurator.cmd_config_show / cmd_config_apply.
+    sub_show = cfg_sub.add_parser("show")
+    sub_show.add_argument("--json", action="store_true", default=True)
+    sub_show.add_argument("--defaults", action="store_true")
+    _add_common(sub_show)
+
+    sub_apply = cfg_sub.add_parser("apply")
+    sub_apply.add_argument("--json", action="store_true", default=True)
+    sub_apply.add_argument("input", nargs="?", default="-",
+                           help="JSON payload path or `-` for stdin (default)")
+    _add_common(sub_apply)
+
     args = parser.parse_args(argv)
 
     if args.log_level and not quiet:
@@ -184,7 +199,11 @@ def _handle_config(args) -> None:
         sys.exit(configurator.cmd_config_init(args))
     if sub == "edit":
         sys.exit(configurator.cmd_config_edit(args))
-    print("usage: wspr-recorder config {init|edit} [--non-interactive]")
+    if sub == "show":
+        sys.exit(configurator.cmd_config_show(args))
+    if sub == "apply":
+        sys.exit(configurator.cmd_config_apply(args))
+    print("usage: wspr-recorder config {init|edit|show|apply}")
     sys.exit(2)
 
 
