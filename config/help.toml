@@ -1,0 +1,138 @@
+# wspr-recorder operator-help sidecar.
+#
+# Same per-key schema as psk/mag/hfdl: title / help / example /
+# validator_hint / required.  Plus the wizard-only flag
+# `hidden = true` (sigmond commit bd40cff, 2026-05-29) to keep
+# tier-1 invariants off the operator wizard's surface; the on-disk
+# TOML value is preserved either way, so emergency override remains
+# available via `smd config edit wspr-recorder`.
+#
+# Three-tier audit applied 2026-05-29:
+#   * tier 1 — install-canonical or WSPR-protocol constants; hidden.
+#   * tier 2 — host-level operator knobs; surfaced with help bodies.
+#   * tier 3 — per-instance differentiators; `[instance].reporter_id`
+#              is wizard-locked by sigmond directly (matches the
+#              filename stem per MULTI-INSTANCE-ARCHITECTURE §5).
+
+# --- Recorder --------------------------------------------------------
+
+# Tier 1 — install-canonical paths and wsprd compatibility constants.
+# /dev/shm/wspr-recorder/ is the canonical spool (RAM-backed for
+# zero disk I/O); /run/wspr-recorder/control.sock is FHS-canonical
+# for the IPC socket; status_file is an internal filename; and
+# sample_format must be int16 for wsprd compatibility (float32 is a
+# developer dev option, never used by operators in production).
+[recorder.output_dir]
+hidden = true
+
+[recorder.ipc_socket]
+hidden = true
+
+[recorder.status_file]
+hidden = true
+
+[recorder.sample_format]
+hidden = true
+
+# Tier 2 — operator knobs (retention / spool-bound TTLs).
+
+[recorder.max_file_age_minutes]
+title          = "Max WAV file age (minutes)"
+help           = """Automatic-cleanup TTL on the WAV spool in
+/dev/shm/wspr-recorder/<band>/.  Wsprdaemon processes each cycle's
+WAVs within ~2 minutes, so 35 is the canonical safe default:
+shorter risks deleting unprocessed files, longer wastes RAM (the
+spool is RAM-backed via /dev/shm)."""
+example        = "35"
+validator_hint = "positive integer (minutes)"
+required       = false
+
+[recorder.max_files_per_band]
+title          = "Max WAV files per band (disk-protection cap)"
+help           = """Hard cap on retained WAV files per band directory.
+Protects /dev/shm from filling if wsprdaemon stops processing.
+Once the cap is hit, the OLDEST file is deleted to make room for
+the newest.  At 1 file/minute (WSPR cycle), 35 ≈ 35 minutes of
+buffering before drops — matches the max_file_age_minutes default."""
+example        = "35"
+validator_hint = "positive integer (file count)"
+required       = false
+
+# --- Radiod (ka9q-radio binding) ------------------------------------
+
+[radiod.status]
+title          = "ka9q-radio mDNS status host"
+help           = """The mDNS hostname of the radiod instance this
+recorder consumes RTP from -- e.g. "bee1-status.local" when radiod
+runs on the local box, or "<other-host>-status.local" for a remote
+radiod.
+
+Always an mDNS .local name; NEVER an IP address (RTP discovery
+depends on mDNS).  Use `smd diag radiod` to list discovered hosts."""
+example        = "bee1-status.local"
+validator_hint = "must end with .local"
+required       = true
+
+# Tier 1 — radiod control port is the ka9q-radio protocol constant
+# (5004); operators should never need to change this.
+[radiod.port]
+hidden = true
+
+# --- Channel defaults -----------------------------------------------
+#
+# Tier 1 — WSPR protocol / radiod-internal constants.  Sample rate
+# (12 kHz), USB mode, float internal encoding, AGC off, 1300-1700 Hz
+# audio passband are all WSPR-mode requirements; changing them
+# breaks decoding.
+
+[channel_defaults.sample_rate]
+hidden = true
+
+[channel_defaults.mode]
+hidden = true
+
+[channel_defaults.encoding]
+hidden = true
+
+[channel_defaults.agc]
+hidden = true
+
+[channel_defaults.low]
+hidden = true
+
+[channel_defaults.high]
+hidden = true
+
+# Tier 2 — antenna / RX-chain tuning knob.
+[channel_defaults.gain]
+title          = "Channel gain (dB)"
+help           = """Per-channel manual gain applied by radiod (AGC
+is off for WSPR — consistent levels matter more than instantaneous
+response).  Adjust to match your RX/antenna chain so wsprdaemon
+sees reasonable signal levels.
+
+0.0 dB is the typical starting point; raise if you're under-leveled,
+lower if you're saturating."""
+example        = "0.0"
+validator_hint = "float (dB)"
+required       = false
+
+# --- Timing ---------------------------------------------------------
+#
+# Tier 1 — the RX888+GPSDO canonical setup pins authority = "rtp".
+# The inline comment in config.toml explains why: the auto-detected
+# default (ClockSyncStrategy) has ~160 ms/min delivery-latency drift
+# that breaks decoding after ~30 minutes.  Operators should NEVER
+# change this on a GPSDO-disciplined receiver.
+[timing.authority]
+hidden = true
+
+# --- Processing (advanced) ------------------------------------------
+#
+# Tier 1 — radiod_lifetime_frames defaults to 0 (infinite — no
+# LIFETIME tag, no keep-alive) per a 20-line docstring in
+# wspr_recorder/config.py documenting the keepalive-vs-expiry wedge
+# under load.  Non-zero is a calculated trade-off, not an operator
+# knob; keep it off the wizard surface.
+[processing.radiod_lifetime_frames]
+hidden = true
