@@ -7,6 +7,7 @@ Records WSPR audio from ka9q-radio RTP streams to WAV files.
 
 import argparse
 import asyncio
+import contextlib
 import json
 import logging
 import os
@@ -139,8 +140,23 @@ class WsprRecorder:
             _allowed_cpus = len(os.sched_getaffinity(0))
         except AttributeError:                       # non-Linux
             _allowed_cpus = os.cpu_count() or 4
+        # Cap the decoder pool well below the available CPU count.
+        # Each in-flight DecodeRequest holds its float32 ring slice in
+        # memory (5.76 MB W2 / 14.4 MB F5 / 43.2 MB F15 / 86.4 MB F30
+        # per band) until _on_period_complete returns — i.e., until
+        # wav_writer.write_period + _run_decoders_for + the spread/jt9
+        # subprocess wave have all finished.  With max_workers=12 on a
+        # 14-core box, the F30 boundary (where every mode fires at once
+        # across all bands) held ~12 slices in parallel and peaked the
+        # cgroup at 3 GB on B4-100 2026-05-29.  Four workers is enough
+        # for the wsprd CPU profile (~20 s per band on x86), drops the
+        # in-flight slice budget to ≤4 × largest_slice, and pulls the
+        # peak well under 2 GB.  Operators can override via the
+        # WSPR_DECODE_WORKERS env var if they need higher throughput
+        # on a CPU-rich host with looser memory limits.
+        _decode_workers = int(os.environ.get("WSPR_DECODE_WORKERS") or 4)
         self.executor = ThreadPoolExecutor(
-            max_workers=max(2, _allowed_cpus),
+            max_workers=max(2, _decode_workers),
             thread_name_prefix="wav_decoder",
         )
         
@@ -261,21 +277,69 @@ class WsprRecorder:
         BandRecorder).  When pipeline-v2 DB-direct decode is enabled,
         also runs wsprd / jt9 on the WAV and pushes the resulting
         spots into the canonical hamsci_sink sink (`wspr.spots`).
+
+        For F15 / F30 the slice is **deferred** in band_recorder.py
+        (``request.samples is None``, ``request.extract`` set) and is
+        materialized here only AFTER acquiring a host-wide decode slot
+        (see ``host_slot.py``).  That keeps multi-receiver fleets from
+        piling N × 86 MB of slices into the executor queue at the
+        top-of-hour F30 boundary.
         """
         if not self.wav_writer:
             return
+        from .host_slot import host_wide_slot, slot_for_period
+        slot_info = slot_for_period(request.period_seconds)
+        slot_ctx = (
+            host_wide_slot(*slot_info)
+            if slot_info is not None
+            else contextlib.nullcontext()
+        )
         try:
-            wav_path = self.wav_writer.write_period(
-                request,
-                max_files_per_band=self.config.recorder.max_files_per_band,
-            )
-            if wav_path is None:
-                return  # WAV write failed; nothing to decode
+            with slot_ctx:
+                # Materialize the slice now if it was deferred.  Doing
+                # this AFTER acquiring the slot is the whole point —
+                # only ONE process per slot holds the 86 MB float32
+                # copy at a time across the host.
+                if request.samples is None and request.extract is not None:
+                    samples, gaps, start_wc, start_rtp = request.extract()
+                    request.samples = samples
+                    request.gaps = gaps
+                    request.start_wallclock = start_wc
+                    request.start_rtp_timestamp = start_rtp
+                    request.end_rtp_timestamp = (
+                        start_rtp + len(samples)
+                    ) & 0xFFFFFFFF
+                    # extract is one-shot — drop the closure ref so the
+                    # captured ring buffer doesn't get held longer than
+                    # needed by the GC.
+                    request.extract = None
+                    logger.info(
+                        f"{request.band_name}: deferred slice "
+                        f"materialized ({len(samples)} samples) "
+                        f"after host-wide slot acquired"
+                    )
 
-            if self.spot_sink is None or not self.spot_sink.enabled:
-                return  # legacy path — `wd-decode@*` bash chain handles decode
+                wav_path = self.wav_writer.write_period(
+                    request,
+                    max_files_per_band=self.config.recorder.max_files_per_band,
+                )
+                if wav_path is None:
+                    return  # WAV write failed; nothing to decode
 
-            self._run_decoders_for(request, wav_path)
+                # Slice is on disk now (as int16 WAV); the in-memory
+                # float32 copy is dead weight.  Drop it BEFORE
+                # _run_decoders_for so the wsprd/jt9 subprocess fork
+                # wave doesn't carry it along.  On B4-100 this drops a
+                # sustained 200-500 MB off the cgroup peak during the
+                # F5+F15+F30 wave at the top of the hour —
+                # _run_decoders_for reads the WAV path, never
+                # request.samples.
+                request.samples = None  # type: ignore[assignment]
+
+                if self.spot_sink is None or not self.spot_sink.enabled:
+                    return  # legacy path — `wd-decode@*` bash chain handles decode
+
+                self._run_decoders_for(request, wav_path)
         finally:
             # Release the per-period 5.76 MB (W2/F2) or 14.4 MB (F5/F15/F30)
             # NumPy slice copy + decoder-subprocess C buffers back to the OS.

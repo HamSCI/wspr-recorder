@@ -11,7 +11,7 @@ Per-band recording logic:
 import logging
 import numpy as np
 from dataclasses import dataclass, field
-from typing import Optional, Callable, List
+from typing import Optional, Callable, List, Tuple
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
 
@@ -34,6 +34,19 @@ class GapEvent:
     timestamp_utc: str
 
 
+# Ring headroom on top of the longest decode period.  Was 120 s
+# (original wsprdaemon-client default — fine when only one band's
+# F30 decoded at a time on one host).  Bumped to 600 s to cover the
+# worst-case top-of-hour serial wave when F30 + F15 are host-wide
+# slot-bounded across a multi-receiver fleet (see host_slot.py):
+#   12 instances × 2 F30 bands / 2 host slots × ~30 s/decode ≈ 6 min
+# Plus margin for jt9 stragglers, tar build, and the F30 ring's own
+# "still being filled" boundary — 600 s sits comfortably above the
+# 6 min worst case.  Cost is ~24 MB extra per F30 ring (480 s × 12
+# kHz × 4 bytes), per band, per instance — modest given 86 MB rings.
+RING_HEADROOM_SECONDS = 600
+
+
 @dataclass
 class DecodeRequest:
     """A request to write a WAV file and decode for a completed period.
@@ -43,17 +56,33 @@ class DecodeRequest:
     ``"radiod:bee1-status.local"``).  Empty string when the recorder
     doesn't yet know its source — preserved for backward compat with
     tests that construct DecodeRequest directly.
+
+    For F15 / F30 the slice is **deferred**: ``samples`` is ``None`` at
+    submit time and ``extract`` is a closure the worker invokes after
+    acquiring the host-wide decode slot (see ``host_slot.py``).  This
+    keeps the heavy 43 MB (F15) / 86 MB (F30) float32 copy from being
+    allocated while waiting in the executor queue, which is the only
+    way to bound peak memory across a multi-receiver fleet.
+
+    For W2 / F2 / F5 the slice is materialized eagerly (current
+    behavior) — those slices are small enough (5.76 MB W2, 14.4 MB F5)
+    that the deferred path's complexity isn't worth the savings.
     """
     frequency_hz: int
     band_name: str
     modes: List[DecodeMode]       # e.g., [W2, F2] for shared 120s
     period_seconds: int           # 120, 300, 900, or 1800
-    samples: np.ndarray           # float32, copied from ring
+    samples: Optional[np.ndarray] # float32, copied from ring; None if extract is set
     gaps: List[GapEvent]
-    start_wallclock: datetime
+    start_wallclock: Optional[datetime]
     start_rtp_timestamp: int
     end_rtp_timestamp: int
     rx_source: str = ""
+    # When set, the worker calls this AFTER acquiring its host-wide
+    # decode slot to materialize the slice.  Returns
+    # (samples, gaps, start_wallclock, start_rtp_timestamp); the worker
+    # then writes those fields back onto the request before continuing.
+    extract: Optional[Callable[[], Tuple[np.ndarray, List[GapEvent], datetime, int]]] = None
 
 
 PeriodCompleteCallback = Callable[[DecodeRequest], None]
@@ -169,7 +198,7 @@ class BandRecorder:
         # tick after F5 fires at minute 5) remains fully in the ring,
         # with margin against late callbacks or future refactors.
         from .ring_buffer import RingBuffer
-        capacity = max_period_seconds(self._decode_modes) + 120
+        capacity = max_period_seconds(self._decode_modes) + RING_HEADROOM_SECONDS
         self._ring = RingBuffer(
             capacity_seconds=capacity,
             sample_rate=sample_rate,
@@ -322,30 +351,59 @@ class BandRecorder:
                 )
                 continue
 
-            samples, gaps, start_wc, start_rtp = self._ring.extract_slice(num_minutes)
-            end_rtp = (start_rtp + len(samples)) & 0xFFFFFFFF
-
-            request = DecodeRequest(
-                frequency_hz=self.frequency_hz,
-                band_name=self.band_name,
-                modes=modes,
-                period_seconds=period_sec,
-                samples=samples,
-                gaps=gaps,
-                start_wallclock=start_wc,
-                start_rtp_timestamp=start_rtp,
-                end_rtp_timestamp=end_rtp,
-                rx_source=self.rx_source,
-            )
-
-            self.stats.samples_written += len(samples)
-            self.stats.periods_emitted += 1
-
-            logger.info(
-                f"{self.band_name}: Period {period_sec}s complete "
-                f"({[m.value for m in modes]}), {len(samples)} samples, "
-                f"{len(gaps)} gaps"
-            )
+            # F15 / F30 slice is HEAVY (43 MB / 86 MB float32).  Defer
+            # the actual extract_slice copy until the worker thread has
+            # acquired the host-wide decode slot — see host_slot.py.
+            # This keeps multi-receiver fleets from holding N × 86 MB
+            # of slices in the executor queue waiting for the slot.
+            # W2/F2/F5 stay eager: their slices are small (≤14 MB) and
+            # extract_slice in the callback thread is the simplest path.
+            if period_sec >= 900:
+                _ring_ref = self._ring
+                _num_min = num_minutes
+                def _extract(_ring=_ring_ref, _n=_num_min):
+                    return _ring.extract_slice(_n)
+                request = DecodeRequest(
+                    frequency_hz=self.frequency_hz,
+                    band_name=self.band_name,
+                    modes=modes,
+                    period_seconds=period_sec,
+                    samples=None,                  # deferred
+                    gaps=[],                       # filled by extract
+                    start_wallclock=None,          # filled by extract
+                    start_rtp_timestamp=0,         # filled by extract
+                    end_rtp_timestamp=0,           # filled by extract
+                    rx_source=self.rx_source,
+                    extract=_extract,
+                )
+                self.stats.periods_emitted += 1
+                logger.info(
+                    f"{self.band_name}: Period {period_sec}s complete "
+                    f"({[m.value for m in modes]}), slice deferred until "
+                    f"host-wide decode slot acquired"
+                )
+            else:
+                samples, gaps, start_wc, start_rtp = self._ring.extract_slice(num_minutes)
+                end_rtp = (start_rtp + len(samples)) & 0xFFFFFFFF
+                request = DecodeRequest(
+                    frequency_hz=self.frequency_hz,
+                    band_name=self.band_name,
+                    modes=modes,
+                    period_seconds=period_sec,
+                    samples=samples,
+                    gaps=gaps,
+                    start_wallclock=start_wc,
+                    start_rtp_timestamp=start_rtp,
+                    end_rtp_timestamp=end_rtp,
+                    rx_source=self.rx_source,
+                )
+                self.stats.samples_written += len(samples)
+                self.stats.periods_emitted += 1
+                logger.info(
+                    f"{self.band_name}: Period {period_sec}s complete "
+                    f"({[m.value for m in modes]}), {len(samples)} samples, "
+                    f"{len(gaps)} gaps"
+                )
 
             if self.on_period_complete:
                 if self.executor:
@@ -405,7 +463,7 @@ class BandRecorder:
         self.sync_strategy.reset()
 
         from .ring_buffer import RingBuffer
-        capacity = max_period_seconds(self._decode_modes) + 120
+        capacity = max_period_seconds(self._decode_modes) + RING_HEADROOM_SECONDS
         self._ring = RingBuffer(
             capacity_seconds=capacity,
             sample_rate=self.sample_rate,
