@@ -280,7 +280,14 @@ class TestMultiPeriodCallbacks:
         f30_hits = [r for r in results if DecodeMode.F30 in r.modes]
         assert len(f30_hits) == 1
         assert f30_hits[0].period_seconds == 1800
-        assert len(f30_hits[0].samples) == 30 * rate * 60
+        # F30's 86 MB slice is DEFERRED: the request carries samples=None
+        # plus an extract() closure the worker invokes only after it has
+        # the host-wide decode slot (band_recorder.py / host_slot.py).
+        # The materialized slice must still be the full 30 minutes.
+        assert f30_hits[0].samples is None
+        assert callable(f30_hits[0].extract)
+        samples, _gaps, _swc, _srtp = f30_hits[0].extract()
+        assert len(samples) == 30 * rate * 60
 
 
 class TestGapInRing:

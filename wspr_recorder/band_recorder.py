@@ -170,6 +170,30 @@ class BandRecorder:
         # legacy single-source contexts where the value isn't yet
         # threaded through.
         rx_source: str = "",
+        # Wall-clock WAV-boundary skew monitor (wsprdaemon-v3 loss-of-sync
+        # detector).  When True, each minute boundary checks that we
+        # reached ``_samples_per_minute`` samples within
+        # ``sync_skew_threshold_sec`` of the grid-predicted UTC minute
+        # boundary; a larger skew means samples were lost or the sample
+        # clock drifted, so the band has fallen out of phase with the
+        # WSPR cycle (strong signal, but un-decodable) and we re-sync.
+        # OFF by default so the synthetic-clock unit tests (which feed
+        # grid timestamps far from real ``now()``) don't trip; the
+        # production recorder turns it on.  ``now_fn`` is injectable so
+        # tests can drive the monitor with a controlled clock.
+        resync_on_skew: bool = False,
+        sync_skew_threshold_sec: float = 0.75,
+        # Re-sync only after this many CONSECUTIVE boundaries exceed the
+        # skew threshold.  A transient CPU spike (e.g. the top-of-hour
+        # F30 wave) can delay the receiver-thread callback and inflate a
+        # single boundary's measured skew even though the audio is
+        # correctly RTP-timestamped and fine; a genuine sample-clock /
+        # lost-cycle fault skews EVERY boundary (and grows).  Requiring
+        # consecutive strikes keeps a lone late callback from discarding
+        # a good cycle, at the cost of one extra minute of detection
+        # latency.  A lone strike emits its WAV normally.
+        sync_resync_after: int = 2,
+        now_fn: Optional[Callable[[], datetime]] = None,
     ):
         self.ssrc = ssrc
         self.frequency_hz = frequency_hz
@@ -180,6 +204,22 @@ class BandRecorder:
         self.executor = executor
         self.sync_strategy = sync_strategy or FallbackSyncStrategy(sample_rate)
         self.rx_source = rx_source
+
+        self._resync_on_skew = resync_on_skew
+        self._sync_skew_threshold = float(sync_skew_threshold_sec)
+        self._sync_resync_after = max(1, int(sync_resync_after))
+        self._now_fn = now_fn or (lambda: datetime.now(timezone.utc))
+        # Set by _on_minute_boundary when the skew check trips; consumed
+        # by _add_samples, which performs the actual reset() (so the ring
+        # isn't recreated out from under the in-progress write loop).
+        self._resync_requested = False
+        # Consecutive over-threshold boundaries; reset to 0 by any
+        # in-tolerance boundary.  A re-sync fires at _sync_resync_after.
+        self._skew_strikes = 0
+        # Observability: cumulative skew-triggered re-syncs (survives
+        # reset()) and the most recent boundary skew in seconds.
+        self._skew_resyncs = 0
+        self._last_skew_sec = 0.0
 
         self._decode_modes = decode_modes or [DecodeMode.W2]
         self.stats = BandRecorderStats()
@@ -313,6 +353,15 @@ class BandRecorder:
             remaining = remaining[chunk_size:]
             if self._ring.current_minute_sample_count >= self._samples_per_minute:
                 self._on_minute_boundary()
+                # The skew monitor asked for a re-sync: drop the rest of
+                # this batch and reset.  The next packets re-anchor on the
+                # next clean minute boundary via the sync strategy, which
+                # is exactly the wsprdaemon-v3 "wait for the next :59→:00
+                # transition and start there" recovery.
+                if self._resync_requested:
+                    self._resync_requested = False
+                    self.reset()
+                    return
 
     def _on_minute_boundary(self) -> None:
         """Called when samples_per_minute samples have been written."""
@@ -328,6 +377,53 @@ class BandRecorder:
         minute_rtp = (
             (self._first_rtp_timestamp + self._minute_count * self._samples_per_minute) & 0xFFFFFFFF
         )
+
+        # ── Wall-clock boundary skew check (wsprdaemon-v3 loss-of-sync) ──
+        # We just counted a full minute's worth of samples
+        # (``_samples_per_minute`` = 720k @ 12 kHz).  In a real-time,
+        # cycle-aligned stream that 720,000th sample lands at the top of a
+        # UTC minute, so ``now`` should be within a few hundred ms of the
+        # grid-predicted boundary ``minute_wallclock``.  A larger skew
+        # means we accumulated the minute's samples over the WRONG amount
+        # of real time — samples were lost or the sample clock drifted —
+        # so this band is no longer phase-locked to the WSPR cycle.  The
+        # audio still has strong signal (so a noise/zero-spots check would
+        # miss it), but wsprd can't decode a window that doesn't start on
+        # the cycle boundary.  Discard and re-sync on the next clean
+        # :59→:00 transition (reset() clears the anchor; the sync strategy
+        # re-anchors on the next boundary — done in _add_samples so we
+        # don't recreate the ring mid-write).
+        if self._resync_on_skew and self._synced:
+            skew = (self._now_fn() - minute_wallclock).total_seconds()
+            self._last_skew_sec = skew
+            if abs(skew) > self._sync_skew_threshold:
+                self._skew_strikes += 1
+                logger.warning(
+                    "%s: WAV boundary skew %.3fs exceeds %.3fs threshold "
+                    "(reached %d samples %s the predicted UTC minute) "
+                    "[strike %d/%d]",
+                    self.band_name, skew, self._sync_skew_threshold,
+                    self._samples_per_minute,
+                    "after" if skew >= 0 else "before",
+                    self._skew_strikes, self._sync_resync_after,
+                )
+                if self._skew_strikes >= self._sync_resync_after:
+                    # Sustained skew — sample loss / sample-clock drift has
+                    # desynced this band from the WSPR cycle.  Discard and
+                    # re-sync on the next clean :59→:00 boundary.
+                    self._skew_resyncs += 1
+                    self._skew_strikes = 0
+                    logger.warning(
+                        "%s: sustained boundary skew — re-syncing this "
+                        "band from the next minute boundary [resync #%d]",
+                        self.band_name, self._skew_resyncs,
+                    )
+                    self._resync_requested = True
+                    return
+                # Lone strike: could be a transient callback delay, and
+                # the audio may be fine — emit this minute normally.
+            else:
+                self._skew_strikes = 0
 
         # Close the minute in the ring buffer
         self._ring.close_minute(minute_wallclock, minute_rtp)
@@ -428,6 +524,9 @@ class BandRecorder:
         stats["sync_tier"] = getattr(self.sync_strategy, 'tier', None)
         stats["decode_modes"] = [m.value for m in self._decode_modes]
         stats["minute_count"] = self._minute_count
+        # Loss-of-sync monitor observability.
+        stats["skew_resyncs"] = self._skew_resyncs
+        stats["last_skew_sec"] = round(self._last_skew_sec, 3)
         return stats
 
     def reset(self) -> None:
@@ -453,6 +552,8 @@ class BandRecorder:
         """
         self._initialized = False
         self._synced = False
+        self._resync_requested = False
+        self._skew_strikes = 0
         self._minute_count = 0
         self._first_wallclock = None
         self._first_rtp_timestamp = None

@@ -15,7 +15,6 @@ import signal
 import sys
 import time
 import tracemalloc
-from concurrent.futures import ThreadPoolExecutor
 from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
@@ -125,40 +124,49 @@ class WsprRecorder:
 
         # Thread pool for WAV writes + per-period decoder dispatch
         # (wsprd / jt9 subprocesses are spawned from inside this pool
-        # by `_on_period_complete` → `_run_decoders_for`).  Size = the
-        # number of CPUs available to *this* process, as already
-        # constrained by systemd's CPUAffinity/AllowedCPUs drop-in.
-        # On B4-100 that's 12 cores (radiod owns 0-1, this service
-        # gets 2-13); on a smaller host it's whatever the operator
-        # configured via `smd diag cpu-affinity`.  Matching the pool
-        # to the affinity set fires every enabled band's wsprd in
-        # parallel at cycle boundary (instead of queueing them four
-        # at a time as the old size-4 pool did) without bumping into
-        # the radiod-reserved cores.  `len(os.sched_getaffinity(0))`
-        # is Linux-only; fall back to os.cpu_count() elsewhere.
-        try:
-            _allowed_cpus = len(os.sched_getaffinity(0))
-        except AttributeError:                       # non-Linux
-            _allowed_cpus = os.cpu_count() or 4
-        # Cap the decoder pool well below the available CPU count.
-        # Each in-flight DecodeRequest holds its float32 ring slice in
-        # memory (5.76 MB W2 / 14.4 MB F5 / 43.2 MB F15 / 86.4 MB F30
-        # per band) until _on_period_complete returns — i.e., until
-        # wav_writer.write_period + _run_decoders_for + the spread/jt9
-        # subprocess wave have all finished.  With max_workers=12 on a
-        # 14-core box, the F30 boundary (where every mode fires at once
-        # across all bands) held ~12 slices in parallel and peaked the
-        # cgroup at 3 GB on B4-100 2026-05-29.  Four workers is enough
-        # for the wsprd CPU profile (~20 s per band on x86), drops the
-        # in-flight slice budget to ≤4 × largest_slice, and pulls the
-        # peak well under 2 GB.  Operators can override via the
-        # WSPR_DECODE_WORKERS env var if they need higher throughput
-        # on a CPU-rich host with looser memory limits.
-        _decode_workers = int(os.environ.get("WSPR_DECODE_WORKERS") or 4)
-        self.executor = ThreadPoolExecutor(
-            max_workers=max(2, _decode_workers),
-            thread_name_prefix="wav_decoder",
+        # by `_on_period_complete` → `_run_decoders_for`).
+        #
+        # This is a PRIORITY pool (decode_pool.py), not a plain FIFO
+        # ThreadPoolExecutor: at a cycle boundary every enabled band's
+        # decodes are submitted at once, and we want every 2-minute
+        # decode (W2/F2) to run BEFORE any F5/F15/F30 — a W2 that
+        # doesn't finish inside its ~110 s window is effectively lost.
+        # The pool orders jobs by ``DecodeRequest.period_seconds``
+        # (shortest first) and reserves workers so the slow, heavy
+        # F15/F30 wave can't occupy every thread and starve the short
+        # decodes.  Worker count + long-decode concurrency come from
+        # CPU affinity and the WSPR_DECODE_WORKERS / WSPR_DECODE_LONG_SLOTS
+        # env vars; per-job memory stays bounded by the deferred-slice +
+        # host-wide-slot machinery (band_recorder.py / host_slot.py), so
+        # the worker count drives CPU use, not peak RSS.
+        from .decode_pool import build_decode_pool
+        self.executor = build_decode_pool()
+
+        # Wall-clock WAV-boundary skew monitor (wsprdaemon-v3 loss-of-sync
+        # detector).  Each band checks at every minute boundary that it
+        # reached 720k samples within WSPR_SYNC_SKEW_SEC of the predicted
+        # UTC minute; a larger skew means lost samples / sample-clock
+        # drift desynced it from the WSPR cycle (strong signal, zero
+        # decodes — the failure that silenced B4-100 for ~3 h on
+        # 2026-05-30), so the band discards and re-syncs on the next
+        # boundary instead of emitting mis-aligned WAVs forever.  On by
+        # default; set WSPR_SYNC_MONITOR=0 to disable.
+        self._resync_on_skew = (
+            os.environ.get("WSPR_SYNC_MONITOR", "1").strip().lower()
+            not in ("0", "false", "no", "off", "")
         )
+        try:
+            self._sync_skew_threshold = float(
+                os.environ.get("WSPR_SYNC_SKEW_SEC") or 0.75
+            )
+        except ValueError:
+            self._sync_skew_threshold = 0.75
+        try:
+            self._sync_resync_after = max(
+                1, int(os.environ.get("WSPR_SYNC_RESYNC_AFTER") or 2)
+            )
+        except ValueError:
+            self._sync_resync_after = 2
         
         # State
         self._running = False
@@ -200,6 +208,9 @@ class WsprRecorder:
             executor=self.executor,
             sync_strategy=sync_strategy,
             rx_source=source_key,
+            resync_on_skew=self._resync_on_skew,
+            sync_skew_threshold_sec=self._sync_skew_threshold,
+            sync_resync_after=self._sync_resync_after,
         )
         self.band_recorders[(source_key, ssrc)] = recorder
 
@@ -767,11 +778,14 @@ class WsprRecorder:
     def _executor_backlog(self) -> int:
         """Number of submitted tasks not yet picked up by a worker.
 
-        `ThreadPoolExecutor` has no public accessor; `_work_queue.qsize()`
-        is the standard workaround used throughout stdlib discussions.
-        Returns 0 if introspection fails.
+        The priority decode pool exposes ``pending()``; fall back to a
+        ThreadPoolExecutor's ``_work_queue.qsize()`` for any context
+        still using one.  Returns 0 if introspection fails.
         """
         try:
+            pending = getattr(self.executor, "pending", None)
+            if callable(pending):
+                return pending()
             return self.executor._work_queue.qsize()
         except Exception:
             return 0
