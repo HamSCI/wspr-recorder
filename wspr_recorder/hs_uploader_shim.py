@@ -80,6 +80,11 @@ PUMP_INTERVAL_SEC = float(
 # Default sigmond sink location (matches storage_migrate.SINK_DB_PATH).
 DEFAULT_SINK_DB = "/var/lib/sigmond/sink.db"
 
+# wsprnet async upload API (W1GJM) — now the DEFAULT.  Override with
+# WSPRNET_API_BASE: another base URL to point elsewhere, or
+# "legacy"/"off"/"" to fall back to the blocking meptspots.php POST.
+WSPRNET_ASYNC_API_DEFAULT = "https://wsprnet.org/api/upload/v1"
+
 
 class WsprUploaderHs:
     """Pump wspr spools → wsprdaemon.org + wsprnet.org via hs-uploader.
@@ -917,11 +922,17 @@ class WsprUploaderHs:
             batch_size = 1
         if batch_size > 999:
             batch_size = 999
-        # Optional async upload API (W1GJM).  WSPRNET_API_BASE, e.g.
-        # https://wsprnet.org/api/upload/v1 — when set, the transport
-        # submits to <base>/upload (immediate nonce) and polls
-        # <base>/status/<nonce>.  Unset → legacy meptspots.php POST.
-        wsprnet_api_base = (os.environ.get("WSPRNET_API_BASE") or "").strip() or None
+        # wsprnet async upload API (W1GJM) — DEFAULT.  Submits to
+        # <base>/upload (immediate nonce) and polls <base>/status/<nonce>.
+        # WSPRNET_API_BASE overrides: a different base URL, or
+        # "legacy"/"off"/"" for the blocking meptspots.php POST.
+        _api = os.environ.get("WSPRNET_API_BASE")
+        if _api is None:
+            wsprnet_api_base = WSPRNET_ASYNC_API_DEFAULT
+        elif _api.strip().lower() in ("", "legacy", "off", "0", "none"):
+            wsprnet_api_base = None
+        else:
+            wsprnet_api_base = _api.strip()
         transport = WsprNet(
             max_spots_per_upload=batch_size,
             api_base_url=wsprnet_api_base,
@@ -930,11 +941,11 @@ class WsprUploaderHs:
             # default "WD_hs-uploader/0.1" (shown truncated as WD_hs-uplo).
             version=self._version,
         )
-        if wsprnet_api_base:
-            logger.info(
-                "wspr-uploader-hs: wsprnet async upload API enabled (%s)",
-                wsprnet_api_base,
-            )
+        logger.info(
+            "wspr-uploader-hs: wsprnet upload via %s",
+            f"async API ({wsprnet_api_base})" if wsprnet_api_base
+            else "legacy meptspots.php",
+        )
         if batch_size != 999:
             logger.info(
                 "wspr-uploader-hs: wsprnet batch size capped at %d "
