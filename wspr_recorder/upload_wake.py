@@ -36,6 +36,13 @@ logger = logging.getLogger(__name__)
 
 _DEFAULT_SOCK = "/var/lib/sigmond/upload-wake.sock"
 
+# Diagnostic: when WSPR_WAKE_DEBUG is set, log each datagram sent (producer
+# side) and received (uploader side) so a non-delivering cross-process wake
+# can be isolated to send vs. receive vs. pump.  Off by default (silent).
+_DEBUG = os.environ.get("WSPR_WAKE_DEBUG", "").strip().lower() in (
+    "1", "true", "yes", "on",
+)
+
 
 def wake_path() -> str:
     """Resolve the shared wake-socket path (same dir as the sink)."""
@@ -59,11 +66,14 @@ def notify(path: Optional[str] = None) -> None:
         s = socket.socket(socket.AF_UNIX, socket.SOCK_DGRAM)
         try:
             s.sendto(b"w", p)
+            if _DEBUG:
+                logger.info("upload-wake: notify sent -> %s", p)
         finally:
             s.close()
-    except OSError:
+    except OSError as exc:
         # No listener bound / socket absent / perms — backstop covers it.
-        pass
+        if _DEBUG:
+            logger.info("upload-wake: notify to %s failed: %s", p, exc)
 
 
 class WakeListener:
@@ -125,6 +135,8 @@ class WakeListener:
                 if self._stop:
                     break
                 continue
+            if _DEBUG:
+                logger.info("upload-wake: wake received")
             try:
                 self._on_wake()
             except Exception:
