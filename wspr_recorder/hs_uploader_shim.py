@@ -155,6 +155,15 @@ class WsprUploaderHs:
         self._total_wsprnet_accepted = 0
         self._pump_count = 0
         self._work_count = 0
+        # PSK (FT8/FT4) counts now ride in the per-cycle wsprdaemon tar.
+        # These ACCUMULATE across pumps and are reset only when a wspr
+        # cycle line is emitted (a psk-only pump keeps accumulating).
+        self._psk_ft8_pending = 0
+        self._psk_ft4_pending = 0
+        # Per-pump scratch: the wsprdaemon tar byte size shipped this
+        # pump, and the wspr cycle datetime captured from the records.
+        self._pump_tar_bytes = 0
+        self._pump_wspr_cycle = None
 
     # ----- lifecycle -----
 
@@ -305,21 +314,10 @@ class WsprUploaderHs:
             pipelines.append(wsprd_pipe[0])
             self._transports.append(wsprd_pipe[1])
 
-        # --- pipeline 2b: PSK rows (FT8/FT4) → wsprdaemon-tar ---
-        # Gated by PSK_VIA_WSPRDAEMON_TAR=1.  When enabled, reads
-        # psk.spots from the local sink and ships via the same tar
-        # transport — server-side ingestion picks the rows up under
-        # ft8/ft4 peer subdirs and the gw1-elected pskreporter_forwarder
-        # re-posts to PSKReporter on behalf of any row tagged
-        # forward_to_pskreporter=True.  See psk-recorder's
-        # PSK_DELIVERY_MODE for how that flag is set per-row.
-        if os.environ.get("PSK_VIA_WSPRDAEMON_TAR", "0").strip() == "1":
-            psk_pipe = self._build_psk_tar_pipeline(
-                identity=identity, watermark=watermark,
-            )
-            if psk_pipe is not None:
-                pipelines.append(psk_pipe[0])
-                self._transports.append(psk_pipe[1])
+        # PSK now rides in the per-cycle wsprdaemon tar via
+        # WsprCycleSource(include_psk=True); no separate psk pipeline.
+        # The _build_psk_tar_pipeline method is left defined (dead but
+        # harmless) in case the separate path is ever needed again.
 
         # --- pipeline 3: wsprnet.org via HTTP MEPT ---
         wsprnet_pipe = self._build_wsprnet_pipeline(
@@ -491,37 +489,54 @@ class WsprUploaderHs:
                 self._pump_wsprdaemon_records = 0
                 self._pump_wsprnet_records = 0
                 self._pump_wsprnet_accepted = 0
+                # Per-pump scratch (NOT the psk accumulators — those
+                # span pumps until a cycle line is emitted).
+                self._pump_tar_bytes = 0
+                self._pump_wspr_cycle = None
                 if self._uploader is not None and self._uploader.pump():
                     self._work_count += 1
                     self._total_wsprdaemon_records += self._pump_wsprdaemon_records
                     self._total_wsprnet_records += self._pump_wsprnet_records
                     self._total_wsprnet_accepted += self._pump_wsprnet_accepted
-                    # wsprnet acceptance disclosure: server may add fewer
-                    # spots than we POSTed (duplicates from prior batches,
-                    # MAX_SPOTS truncation, malformed lines).  Show both
-                    # the posted count AND the actually-added count when
-                    # they differ — otherwise the log line stays compact.
-                    if self._pump_wsprnet_records != self._pump_wsprnet_accepted:
-                        wsprnet_field = (
-                            f"wsprnet=posted:{self._pump_wsprnet_records}"
-                            f"/added:{self._pump_wsprnet_accepted}"
+                    # Only emit a per-cycle line when a WSPR cycle
+                    # actually shipped this pump (wsprdaemon and/or
+                    # wsprnet had rows).  A psk-only pump (which should
+                    # no longer happen now that psk rides in the cycle
+                    # tar) does NOT log and does NOT reset the psk
+                    # accumulators — they keep accruing for the cycle
+                    # that does ship.
+                    if (self._pump_wsprdaemon_records > 0
+                            or self._pump_wsprnet_records > 0):
+                        # wsprnet acceptance disclosure: server may add
+                        # fewer spots than we POSTed (duplicates, MAX_SPOTS
+                        # truncation, malformed lines).  Show posted AND
+                        # added when they differ; else stay compact.
+                        if self._pump_wsprnet_records != self._pump_wsprnet_accepted:
+                            wsprnet_field = (
+                                f"wsprnet=posted:{self._pump_wsprnet_records}"
+                                f"/added:{self._pump_wsprnet_accepted}"
+                            )
+                        else:
+                            wsprnet_field = f"wsprnet={self._pump_wsprnet_records}"
+                        cycle_str = (
+                            self._pump_wspr_cycle.strftime("%H:%M")
+                            if self._pump_wspr_cycle else "?"
                         )
-                        total_wsprnet_field = (
-                            f"wsprnet=posted:{self._total_wsprnet_records}"
-                            f"/added:{self._total_wsprnet_accepted}"
+                        tar_human = _human_bytes(self._pump_tar_bytes)
+                        logger.info(
+                            "wspr-uploader-hs: cycle=%s shipped "
+                            "wsprdaemon=%d %s ft8=%d ft4=%d tar=%s",
+                            cycle_str,
+                            self._pump_wsprdaemon_records,
+                            wsprnet_field,
+                            self._psk_ft8_pending,
+                            self._psk_ft4_pending,
+                            tar_human,
                         )
-                    else:
-                        wsprnet_field = f"wsprnet={self._pump_wsprnet_records}"
-                        total_wsprnet_field = f"wsprnet={self._total_wsprnet_records}"
-                    logger.info(
-                        "wspr-uploader-hs: shipped wsprdaemon=%d %s "
-                        "(total wsprdaemon=%d %s, work=%d)",
-                        self._pump_wsprdaemon_records,
-                        wsprnet_field,
-                        self._total_wsprdaemon_records,
-                        total_wsprnet_field,
-                        self._work_count,
-                    )
+                        # Reset psk accumulators now that the cycle they
+                        # belonged to has been disclosed.
+                        self._psk_ft8_pending = 0
+                        self._psk_ft4_pending = 0
             except Exception:
                 logger.exception(
                     "wspr-uploader-hs: unhandled error in pump loop",
@@ -539,9 +554,34 @@ class WsprUploaderHs:
         if outcome.kind not in ("acked", "partial_ack"):
             return
         if pipeline.name.startswith("wsprdaemon-tar"):
-            self._pump_wsprdaemon_records += len(batch.records)
+            # The per-cycle tar now carries BOTH wspr.spots/noise rows
+            # and psk.spots (FT8/FT4) rows.  Count wspr rows toward the
+            # wsprdaemon tally and psk rows toward the ft8/ft4 tallies.
+            for r in batch.records:
+                tbl = getattr(r, "table", "wspr.spots") or "wspr.spots"
+                if tbl == "psk.spots":
+                    cols = getattr(r, "columns", None) or {}
+                    mode = (cols.get("mode") or "").lower()
+                    if mode == "ft8":
+                        self._psk_ft8_pending += 1
+                    elif mode == "ft4":
+                        self._psk_ft4_pending += 1
+                    # other psk modes (msk144, …) are not broken out
+                else:
+                    # wspr.spots / wspr.noise
+                    self._pump_wsprdaemon_records += 1
+                    if self._pump_wspr_cycle is None:
+                        rt = getattr(r, "time", None)
+                        if rt is not None:
+                            self._pump_wspr_cycle = rt
+            # Tar wire size (0 when the transport didn't carry it).
+            self._pump_tar_bytes += getattr(outcome, "n_bytes", 0)
         elif pipeline.name.startswith("wsprnet"):
             self._pump_wsprnet_records += len(batch.records)
+            if self._pump_wspr_cycle is None and batch.records:
+                rt = getattr(batch.records[0], "time", None)
+                if rt is not None:
+                    self._pump_wspr_cycle = rt
             # Parse "N/M added" from outcome.reason if present.
             import re
             m = re.match(r"(\d+)/(\d+) added", outcome.reason or "")
@@ -693,6 +733,10 @@ class WsprUploaderHs:
             db_path=self._sink_db,
             expected_reporters=self._merge_reporters,
             backstop_sec=self._merge_backstop_sec,
+            # PSK (FT8/FT4) rides in the per-cycle wsprdaemon tar — the
+            # source pulls this cycle's psk.spots rows into the same
+            # batch, so there's no separate psk-tar pipeline.
+            include_psk=True,
         )
         receiver = os.environ.get("WD_RECEIVER_NAME", "") or self._instance_name
         fallback_ftp = self._build_wsprdaemon_ftp_fallback(
@@ -1105,6 +1149,18 @@ class WsprUploaderHs:
             retention=FileTreeSource.DELETE_ON_ACK,
             source_id=f"wsprnet-spool:{self._instance_name}",
         )
+
+
+def _human_bytes(n: int) -> str:
+    """Format a byte count as a compact ``{kb:.1f}kB`` string (bytes/1024).
+
+    Used in the per-cycle ``tar=`` field of the uploader's journal line.
+    """
+    try:
+        kb = float(n) / 1024.0
+    except (TypeError, ValueError):
+        kb = 0.0
+    return f"{kb:.1f}kB"
 
 
 def _server_host(server_spec: str) -> str:
