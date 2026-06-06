@@ -428,6 +428,32 @@ class ReceiverManager:
             if lifetime_arg is not None:
                 self._lifetime_entries.append((multi, info.ssrc))
 
+            # Reprovision ring-buffer leak fix (root-caused 2026-06-06):
+            # re-provisioning a stale band lands a fresh SSRC + a fresh sink
+            # (which holds this band's multi-MB decoder ring), but the OLD
+            # MultiStream slot for the band lingered in _slots forever, its
+            # on_samples closure keeping the superseded ring alive.  Over
+            # bee1's flaky radiod (continuous reprovision) this leaked
+            # ~1.3 GB/h and tripped the global OOM killer.  Release every
+            # prior slot on this frequency (match by freq so we also catch a
+            # slot the MultiStream health monitor re-keyed), and reconcile our
+            # own bookkeeping + the status-listener registration for them.
+            for _multi in self._multi_by_group.values():
+                for _old_ssrc in _multi.prune_frequency(
+                    float(freq_hz), keep_ssrc=info.ssrc
+                ):
+                    self.state.channels.pop(_old_ssrc, None)
+                    if self._status_listener is not None:
+                        try:
+                            self._status_listener.unregister_channel(_old_ssrc)
+                        except Exception:
+                            logger.debug(
+                                "unregister_channel(%s) failed", _old_ssrc
+                            )
+                    self._lifetime_entries = [
+                        e for e in self._lifetime_entries if e[1] != _old_ssrc
+                    ]
+
             logger.info(
                 f"Created: {band_name} ({freq_hz} Hz) -> "
                 f"SSRC {info.ssrc} @ {info.multicast_address}:{info.port}"
