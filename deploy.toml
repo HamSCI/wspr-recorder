@@ -61,6 +61,16 @@ dst   = "/dev/shm/wspr-recorder"
 owner = "wsprrec:wsprrec"
 mode  = "0755"
 
+# hs-uploader's watermark store — the unit declares it in ReadWritePaths=, so
+# it must exist before start or systemd fails namespacing (226/NAMESPACE).
+# Shared across uploader clients (wspr-recorder, mag-recorder), hence the
+# sigmond group + setgid rather than a single service user.
+[[install.steps]]
+kind  = "mkdir"
+dst   = "/var/lib/hs-uploader"
+owner = "root:sigmond"
+mode  = "2775"
+
 [systemd]
 # Per-instance decoders (one per radiod), expanded from configured instances.
 templated_units = ["wspr-recorder@.service"]
