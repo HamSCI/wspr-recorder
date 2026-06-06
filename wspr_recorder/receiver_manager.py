@@ -21,6 +21,7 @@ Channel auto-recovery on stream drops is handled inside MultiStream.
 """
 
 import logging
+import os
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -301,6 +302,17 @@ class ReceiverManager:
         # (MultiStream, ssrc) pairs for LIFETIME keep-alive — populated
         # at provisioning, consumed by an async loop in __main__.
         self._lifetime_entries: List[Tuple[MultiStream, int]] = []
+        # Space out ensure_channel calls (2026-06-06): firing all bands in a
+        # tight burst perturbs radiod into reverting freshly-created channels
+        # to its global defaults (Task #46 race).  That fails verification
+        # whenever radiod's default samprate != the requested rate — e.g.
+        # bee1's radiod defaults to 24 kHz while we request 12 kHz, so its
+        # reverted channels read back wrong and time out (bee2's default is
+        # 12 kHz, which coincidentally masks the same race).  A small per-
+        # channel gap lets radiod settle each before the next.  0 disables.
+        self._provision_spacing_sec = float(
+            os.environ.get("WSPR_PROVISION_SPACING_SEC", "0.3")
+        )
 
     def connect(self) -> bool:
         """Provision all channels and register them with MultiStream(s)."""
@@ -458,6 +470,13 @@ class ReceiverManager:
                 f"Created: {band_name} ({freq_hz} Hz) -> "
                 f"SSRC {info.ssrc} @ {info.multicast_address}:{info.port}"
             )
+            # Gap before the next channel in a provisioning burst so radiod
+            # isn't perturbed into reverting this one to defaults (see
+            # _provision_spacing_sec).  Runs in a worker thread (connect via
+            # to_thread, reprovision via run_in_executor), so this blocking
+            # sleep never touches the event loop.
+            if self._provision_spacing_sec > 0:
+                time.sleep(self._provision_spacing_sec)
             return True
         except Exception as e:
             logger.error(f"Failed to provision {band_name} ({freq_hz} Hz): {e}")

@@ -1291,6 +1291,25 @@ class WsprRecorder:
         except Exception:
             logger.debug("sd_notify %r failed (not under systemd?)", message)
 
+    async def _startup_timeout_feeder(self) -> None:
+        """Keep systemd's TimeoutStartSec from firing during a long startup.
+
+        connect()/start_streams run in worker threads (event loop stays
+        free), but on a flaky radiod connect() can take minutes — per-channel
+        5 s verify timeouts plus the provisioning spacing.  READY=1 is only
+        sent after they finish, so without this systemd's TimeoutStartSec
+        (3 min) would SIGTERM us mid-connect and loop forever.
+        ``EXTEND_TIMEOUT_USEC`` resets that start timer.  The caller cancels
+        this task once startup completes, before READY=1 hands off to
+        _watchdog_loop.
+        """
+        try:
+            while True:
+                self._sd_notify(b"EXTEND_TIMEOUT_USEC=120000000")  # +120 s
+                await asyncio.sleep(45)
+        except asyncio.CancelledError:
+            pass
+
     async def _watchdog_loop(self) -> None:
         """Pet the systemd watchdog (WATCHDOG=1) while running.
 
@@ -1494,6 +1513,10 @@ class WsprRecorder:
             # of ~1 min.  The chrony gate inside connect() is
             # process-latched (see receiver_manager) so all 3 rx
             # share the single 10-60 s chrony wait, not 3× it.
+            # Extend systemd's start timeout while the (now spaced, possibly
+            # slow on a flaky radiod) provisioning runs; cancelled once
+            # MultiStreams are up, before READY=1.
+            startup_feeder = asyncio.create_task(self._startup_timeout_feeder())
             logger.info("Connecting to radiod (parallel across %d source(s))...",
                         len(self.receiver_managers))
             keys = list(self.receiver_managers.keys())
@@ -1517,6 +1540,7 @@ class WsprRecorder:
                     "All %d source(s) failed to connect — aborting startup",
                     len(self.receiver_managers),
                 )
+                startup_feeder.cancel()
                 return
 
             # Start shared-socket MultiStreams (begins sample delivery)
@@ -1530,6 +1554,10 @@ class WsprRecorder:
                 ],
                 return_exceptions=True,
             )
+
+            # Startup provisioning finished — stop extending the start
+            # timeout; _watchdog_loop (created below) takes over after READY=1.
+            startup_feeder.cancel()
 
             # Start IPC server
             await self._setup_ipc_server()
