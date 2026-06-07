@@ -13,6 +13,15 @@ license          = "MIT"
 init = ["/usr/local/bin/wspr-recorder", "config", "init"]
 edit = ["/usr/local/bin/wspr-recorder", "config", "edit"]
 
+# Greenfield per-instance env defaults sigmond seeds into
+# /etc/wspr-recorder/env/<reporter_id>.env when it creates an instance.
+# A sigmond-managed host has NO legacy `wd-decode@*` bash chain, so the
+# recorder must decode in-process -> SQLite sink; without this it captures
+# WAVs but never decodes (no spots). Off-by-default in the client itself so
+# legacy wsprdaemon hosts (with the bash chain) don't double-decode.
+[contract.instance_env]
+WD_DECODE_VIA_DB = "1"
+
 [build]
 steps = [
     "python3 -m venv /opt/git/sigmond/wspr-recorder/venv",
