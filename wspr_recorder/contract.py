@@ -8,7 +8,7 @@ from importlib.metadata import version as pkg_version
 from pathlib import Path
 from typing import Any
 
-from .config import Config, _derive_radiod_id
+from .config import Config, _derive_radiod_id, placeholder_status_addresses
 from .version import GIT_INFO
 
 CONTRACT_VERSION = "0.8"
@@ -170,6 +170,17 @@ def _collect_issues(config: Config) -> list[dict]:
             "severity": "fail",
             "instance": instance_id,
             "message": "radiod.status_address is empty",
+        })
+
+    for _ph_addr in placeholder_status_addresses(config):
+        issues.append({
+            "severity": "fail",
+            "instance": instance_id,
+            "message": (
+                "radiod.status_address is the unconfigured placeholder "
+                f"{_ph_addr!r} — run `wspr-recorder config init` to set the "
+                "real radiod mDNS status name"
+            ),
         })
 
     # §12.2 SSRC uniqueness across (freq, preset, sample_rate, encoding).

@@ -23,7 +23,8 @@ import numpy as np
 
 from .config import (
     Config, extract_reporter_id, freq_to_band_name, load_config,
-    resolve_config_path,
+    resolve_config_path, placeholder_status_addresses,
+    RADIOD_STATUS_PLACEHOLDER,
 )
 from .receiver_manager import ReceiverManager, ChannelState, ChannelSink
 from .band_recorder import BandRecorder, GapEvent, DecodeRequest
@@ -1786,6 +1787,26 @@ Examples:
     except ValueError as e:
         logger.error(f"Invalid configuration: {e}")
         return 1
+
+    # Fail FAST (not crash-loop) when the radiod address is the unconfigured
+    # sentinel.  sigmond seeds new recorder configs with
+    # RADIOD_STATUS_PLACEHOLDER, which can never resolve; without this guard
+    # the Type=notify daemon aborts in connect(), systemd Restart=always
+    # respawns it, and it hammers ~10 restarts before StartLimit lockout
+    # (observed at greenfield bring-up).  Exit EX_CONFIG (78) — listed in the
+    # unit's RestartPreventExitStatus — so systemd stops cleanly with a clear
+    # message.  A real-but-currently-unreachable radiod is NOT caught here
+    # (that stays transient -> keep retrying, which is correct for boot order).
+    _placeholders = placeholder_status_addresses(config)
+    if _placeholders:
+        logger.error(
+            "radiod status address is unconfigured (placeholder %r). Run "
+            "`wspr-recorder config init` (or `sudo smd bringup`) to set the "
+            "real radiod mDNS status name, then start the service. Exiting "
+            "without restart (EX_CONFIG 78).",
+            RADIOD_STATUS_PLACEHOLDER,
+        )
+        return 78
 
     # Per-instance config carries reporter_id in its [instance] block;
     # legacy shared config has None, and we deliberately do NOT fall

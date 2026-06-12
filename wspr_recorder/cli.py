@@ -316,7 +316,10 @@ def _handle_daemon(args) -> None:
     if getattr(args, "memprofile", False):
         legacy_argv += ["--memprofile"]
     sys.argv = legacy_argv
-    legacy.main()
+    # Propagate the daemon's exit code (0 normal, 1 fatal, 78 EX_CONFIG
+    # for the unconfigured-radiod placeholder).  Without sys.exit() the
+    # subcommand path swallowed it and always exited 0.
+    sys.exit(legacy.main())
 
 
 if __name__ == "__main__":

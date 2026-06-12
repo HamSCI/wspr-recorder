@@ -505,6 +505,28 @@ class Config:
         return BandConfig(frequency=freq_hz)
 
 
+# Unconfigured-radiod sentinel.  sigmond bring-up seeds a freshly-created
+# recorder config with this placeholder in place of the radiod mDNS status
+# name (mirrors sigmond.harmonize._RADIOD_STATUS_PLACEHOLDER).  It can never
+# resolve, so a daemon started against it would crash-loop forever — callers
+# use placeholder_status_addresses() to fail fast / flag it in `validate`.
+RADIOD_STATUS_PLACEHOLDER = "<configure-via-config-init>"
+
+
+def placeholder_status_addresses(config: "Config") -> list:
+    """Status addresses still carrying the unconfigured RADIOD_STATUS_PLACEHOLDER.
+
+    Returns the offending address strings (empty list when configured).  Checks
+    each [[source]] when present, else the legacy [radiod] status_address.
+    Deliberately NOT part of Config.validate() so load_config() does not treat
+    it as a hard ValueError — the daemon handles it with a fail-fast,
+    non-restart exit instead.
+    """
+    srcs = getattr(config, "sources", None) or []
+    candidates = [s.status_address for s in srcs] if srcs else [config.radiod.status_address]
+    return [a for a in candidates if (a or "").strip() == RADIOD_STATUS_PLACEHOLDER]
+
+
 def load_config(config_path: str) -> Config:
     """
     Load configuration from TOML file.

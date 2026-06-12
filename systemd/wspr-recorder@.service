@@ -56,6 +56,10 @@ ExecStart=/opt/git/sigmond/wspr-recorder/venv/bin/python3 -m wspr_recorder.cli d
 TimeoutStartSec=180
 
 Restart=always
+# EX_CONFIG (78): the daemon hit the unconfigured radiod placeholder and exited
+# fast (see __main__ placeholder guard). Do NOT crash-loop a config that can
+# never succeed — stop cleanly until an operator runs `config init`.
+RestartPreventExitStatus=78
 RestartSec=5
 
 # Logs go to the systemd journal (sigmond standard) — query with
