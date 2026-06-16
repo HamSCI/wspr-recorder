@@ -120,14 +120,16 @@ class RtpSyncStrategy(SyncStrategy):
         self,
         sample_rate: int = 12000,
         authority_reader: Optional["_AuthorityReaderProtocol"] = None,
+        channel_info=None,
     ):
         super().__init__(sample_rate)
         self.authority_reader = authority_reader
-        # ka9q ChannelInfo for RTP→UTC derivation (set via
-        # set_channel_info at provisioning / stream-restore). When
-        # present, correlation uses rtp_to_wallclock instead of the
+        # ka9q ChannelInfo for RTP→UTC derivation. May be supplied at
+        # construction (TimingService.create_sync_strategy passes it) or
+        # set later via set_channel_info at provisioning / stream-restore.
+        # When present, correlation uses rtp_to_wallclock instead of the
         # client wall clock — see _acquire_reference_utc.
-        self._channel_info = None
+        self._channel_info = channel_info
         # Correlation state
         self._correlated = False
         self._correlation_source: Optional[str] = None  # "rtp_to_wallclock[+authority]" | "authority" | "wall_clock"
