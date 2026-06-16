@@ -225,45 +225,42 @@ class TestPipelineWiring(unittest.TestCase):
         finally:
             u.stop(timeout=2.0)
 
-    def test_psk_tar_pipeline_selects_multi_rx_columns(self):
-        """``PSK_VIA_WSPRDAEMON_TAR=1`` wires the psk-tar pipeline,
-        and its SqliteSource MUST project ``rx_source`` +
-        ``frequency_bucket_hz`` so the per-rx receiver tag and the
-        cross-rx dedup bucket reach wsprdaemon-server in the JSONL
-        payload.  Phase D Cut 4 of the multi-source psk-recorder
-        rollout — psk-recorder stamps these fields on every spot
-        (Phase A / Cut 2) but the wsprdaemon-tar pipeline has to opt
-        in to ship them."""
-        # The gate is read from os.environ inside the shim, not from
-        # the WsprUploaderHs config dict — patch it for this test.
-        with patch.dict(
-            os.environ,
-            {"PSK_VIA_WSPRDAEMON_TAR": "1"},
-            clear=False,
-        ):
-            u = self._start()
+    def test_psk_rides_in_wsprdaemon_cycle_tar_not_a_separate_pipeline(self):
+        """PSK (FT8/FT4) ships inside the per-cycle wsprdaemon tar via
+        ``WsprCycleSource(include_psk=True)`` — there is NO separate
+        psk-tar pipeline (the ``_build_psk_tar_pipeline`` method is left
+        defined but dead; see hs_uploader_shim.py).  The multi-rx tags
+        that Phase D Cut 4 pins (``rx_source`` + ``frequency_bucket_hz``,
+        stamped on every psk spot by psk-recorder in Phase A / Cut 2)
+        reach wsprdaemon-server because WsprCycleSource ships each
+        psk.spots row's WHOLE ``payload_json`` — no column allow-list to
+        forget.  (That passthrough is covered directly in hs-uploader's
+        own WsprCycleSource suite.)"""
+        u = self._start()
         try:
-            psk_pipe = next(
+            names = [p.name for p in u._uploader.pipelines]
+            # No standalone psk-tar pipeline is constructed.
+            self.assertFalse(
+                any(n.startswith("psk-tar") for n in names),
+                "PSK now rides in the wsprdaemon-tar; there should be no "
+                "separate psk-tar pipeline",
+            )
+            # The wsprdaemon-tar pipeline's source opts PSK in.
+            wsprd_pipe = next(
                 (p for p in u._uploader.pipelines
-                 if p.name.startswith("psk-tar")),
+                 if p.name.startswith("wsprdaemon-tar")),
                 None,
             )
             self.assertIsNotNone(
-                psk_pipe,
-                "psk-tar pipeline should be constructed when "
-                "PSK_VIA_WSPRDAEMON_TAR=1",
+                wsprd_pipe,
+                "wsprdaemon-tar pipeline should be constructed with a "
+                "complete env",
             )
-            cols = psk_pipe.source.select_columns
-            # The existing baseline columns must still be present so
-            # this test catches an accidental projection regression.
-            for required in (
-                "time", "mode", "frequency",
-                "tx_call", "grid", "forward_to_pskreporter",
-            ):
-                self.assertIn(required, cols)
-            # Cut 4 additions — what this test is really pinning.
-            self.assertIn("rx_source", cols)
-            self.assertIn("frequency_bucket_hz", cols)
+            self.assertTrue(
+                getattr(wsprd_pipe.source, "include_psk", False),
+                "WsprCycleSource must be built with include_psk=True so "
+                "psk.spots ride in the per-cycle tar",
+            )
         finally:
             u.stop(timeout=2.0)
 
