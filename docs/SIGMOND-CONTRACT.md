@@ -1,6 +1,6 @@
 # Sigmond client contract conformance
 
-wspr-recorder implements the [HamSCI client contract][contract] (v0.4),
+wspr-recorder implements the [HamSCI client contract][contract] (v0.8),
 maintained in the sigmond repository at
 [`docs/CLIENT-CONTRACT.md`][contract]. v0.4 adoption landed as a
 greenfield retrofit in [`c0f804a`][c0f804a] (PR #1, 2026-04-13).
@@ -93,7 +93,7 @@ subcommand is routed to the daemon entry point, so
 {
   "client": "wspr-recorder",
   "version": "0.1.0",
-  "contract_version": "0.4",
+  "contract_version": "0.8",
   "config_path": "/etc/wspr-recorder/config.toml",
   "git": {"sha": "...", "short": "...", "ref": "main", "dirty": false},
   "log_paths": {
@@ -161,7 +161,7 @@ wspr-recorder writes nothing under that path itself. Full unit at
 ## §5 — Deploy manifest
 
 [`deploy.toml`](../deploy.toml) at the repo root declares
-`contract_version = "0.4"`, the venv build, the binary symlinks
+`contract_version = "0.8"`, the venv build, the binary symlinks
 (`wspr-recorder`, `wspr-ctl` to `/usr/local/bin/`), the systemd unit,
 the rendered config, and external deps (`ka9q-python` and `numpy` from
 PyPI, `wsjtx` from apt for `jt9`). Sigmond uses this to install/upgrade
@@ -266,7 +266,7 @@ therefore a one-step operation.
 Resolution code:
 [wspr_recorder/cli.py:31-47](../wspr_recorder/cli.py#L31-L47).
 
-## §12 — Validate hardening (v0.4)
+## §12 — Validate hardening (v0.8)
 
 Status of each of the six §12 items in wspr-recorder:
 

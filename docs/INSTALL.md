@@ -84,7 +84,7 @@ The script is idempotent (re-running upgrades in place, including
 2. **Pattern A check** — verifies `wsprrec` can read
    `<repo>/wspr_recorder/__init__.py`. Fails loudly if the repo lives
    under a mode-700 home directory. Canonical location:
-   `/opt/git/sigmond/wspr-recorder`. Contract v0.4 §12.5.
+   `/opt/git/sigmond/wspr-recorder`. Contract v0.8 §12.5.
 3. **Venv** — creates `/opt/wspr-recorder/venv` (or upgrades in
    place). Python ≥ 3.9.
 4. **Editable install** — `pip install` of the repo into the venv,
@@ -201,7 +201,7 @@ maintain two config files) and enable two template instances. The
 systemd unit template uses `%i` as the instance name and sources
 `/etc/wspr-recorder/env/%i.env` if present.
 
-## Pattern A (contract v0.4 §12.5)
+## Pattern A (contract v0.8 §12.5)
 
 The service user (`wsprrec`) must be able to traverse the repo path.
 Homedirs with mode 0700 break this even if individual files are

@@ -50,7 +50,7 @@ def _log_dir(config: Config) -> str:
 
 
 def build_inventory(config: Config, config_path: Path) -> dict:
-    """Build the inventory --json payload per contract v0.4."""
+    """Build the inventory --json payload per contract v0.8."""
     try:
         version = pkg_version("wspr-recorder")
     except Exception:
@@ -140,7 +140,7 @@ def build_inventory(config: Config, config_path: Path) -> dict:
 
 
 def build_validate(config: Config, config_path: Path) -> dict:
-    """Build the validate --json payload per contract v0.4.
+    """Build the validate --json payload per contract v0.8.
 
     §12.3: report the absolute path of the loaded config.
     """

@@ -132,7 +132,7 @@ these come from the unit's `EnvironmentFile`s
 |---|---|
 | `WSPR_RECORDER_CONFIG` | Default config path (`/etc/wspr-recorder/config.toml`). |
 | `WSPR_RECORDER_LOG_LEVEL` | Log level (`DEBUG`/`INFO`/`WARNING`/`ERROR`/`CRITICAL`). |
-| `CLIENT_LOG_LEVEL` | Sigmond-supplied log level. Used if `WSPR_RECORDER_LOG_LEVEL` is unset. Contract v0.4 §11. |
+| `CLIENT_LOG_LEVEL` | Sigmond-supplied log level. Used if `WSPR_RECORDER_LOG_LEVEL` is unset. Contract v0.8 §11. |
 | `WSPR_RECORDER_LOG_DIR` | Log directory (default `/var/log/wspr-recorder`). Surfaces in `inventory --json`. |
 | `RADIOD_<ID>_STATUS` | mDNS status name for that radiod. Overrides config. |
 | `RADIOD_<ID>_CHAIN_DELAY_NS` | Chain-delay correction; surfaced in inventory only. |

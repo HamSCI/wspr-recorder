@@ -342,8 +342,9 @@ audit consumers (`smd verifier`, `smd watch wspr`).
   declares the capability boolean; `authority_reader.py` exists and the sync path
   can read `/run/hf-timestd/authority.json` for the RTP→UTC offset, but
   `timing_authority_applied` is always `null` and `provides_timing_calibration`
-  is `false`. Full §18 gating is not wired (and is low-value given minute
-  quantization). Subscriber obligations are the contract's, not restated here.
+  is `false`. Full §18 gating is intentionally not wired — WSPR/FST4W products are
+  2-minute-window-quantized, so RTP-default timing is sufficient (deliberate design
+  decision, sigmond #36). Subscriber obligations are the contract's, not restated here.
 - `WSP-I-003` `[DOC]` ✅ The §8 radiod-scoped chain delay
   (`RADIOD_<ID>_CHAIN_DELAY_NS`) is **surfaced, not applied** (minute-quantized
   WSPR). The §7 multicast destination is ka9q-python-derived;
@@ -419,11 +420,13 @@ reported 0 (tmpfs, ephemeral).
 
 ## 12. Risks & open questions
 
-- `WSP-F-090` `[NEW]` 🟡 **§18 read-but-not-applied:** the authority is read for
-  startup correlation but `timing_authority_applied` is always `null` and
-  `provides_timing_calibration=false`. SHALL be either wired into the recording
-  pipeline or explicitly documented as a permanent "minute-quantized, no gating"
-  decision. *(candidate #18 Clients issue.)*
+- `WSP-F-090` `[NEW]` ✅ **§18 timing authority read-and-stamped for provenance,
+  intentionally NOT applied to gate timing:** the authority is read (startup
+  correlation) and stamped into each record for provenance, but
+  `timing_authority_applied` is always `null` and `provides_timing_calibration=false`.
+  wspr-recorder's products are WSPR/FST4W 2-minute-window-quantized, so RTP-default
+  timing is sufficient and §18 gating is deliberately not wired. This is a recorded
+  design decision (sigmond #36), not an open gap.
 - `WSP-F-091` `[NEW]` 🟡 **Frozen-boundary regression class:** the `channel_info`
   attr-name mismatch that silently disabled the RTP-referenced timing watchdogs
   (resolved 2026-06-16) had no regression test. A test SHALL assert the

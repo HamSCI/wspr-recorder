@@ -1,8 +1,8 @@
 """wspr-recorder CLI entry point.
 
 Subcommands:
-    inventory   — contract v0.4 JSON inventory
-    validate    — contract v0.4 config validation (incl. §12.2 SSRC check)
+    inventory   — contract v0.8 JSON inventory
+    validate    — contract v0.8 config validation (incl. §12.2 SSRC check)
     version     — version + git block
     daemon      — long-running recorder
 
@@ -37,7 +37,7 @@ def _resolve_log_level() -> int:
 
 
 def _install_sighup_handler() -> None:
-    """Re-read log level from env on SIGHUP (contract v0.4 §11)."""
+    """Re-read log level from env on SIGHUP (contract v0.8 §11)."""
     def _on_sighup(signum, frame):
         level = _resolve_log_level()
         logging.getLogger().setLevel(level)

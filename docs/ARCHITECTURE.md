@@ -75,7 +75,7 @@ wspr_recorder/
                        # sd_notify, decode dispatch, uploader wiring
   cli.py               # argparse: inventory/validate/version/daemon + legacy
   config.py            # TOML loader, BandConfig, Config.validate()
-  contract.py          # inventory/validate JSON (sigmond contract v0.4)
+  contract.py          # inventory/validate JSON (sigmond contract v0.8)
   configurator.py      # config rendering helper
   version.py           # GIT_INFO (sha, ref, dirty)
   receiver_manager.py  # ensure_channel loop, ChannelSink, MultiStream wiring

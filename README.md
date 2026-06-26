@@ -37,7 +37,7 @@ wspr-recorder daemon (one per radiod)
 One `wspr-recorder@<radiod_id>.service` instance per radiod. The
 instance id is derived from `status_address` by stripping
 `-status.local` / `.local`. Contract follows HamSCI sigmond
-[client contract v0.4][contract]. The unit is `Type=notify` with
+[client contract v0.8][contract]. The unit is `Type=notify` with
 `WatchdogSec` — the daemon sends `READY=1` on startup and pets the
 watchdog while running.
 
@@ -87,7 +87,7 @@ pytest tests/
 - [docs/CONFIG.md](docs/CONFIG.md) — TOML schema + environment-variable reference
 - [docs/OPERATIONS.md](docs/OPERATIONS.md) — running it: logs, `wspr-ctl`, common failures
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — internals for contributors
-- [docs/SIGMOND-CONTRACT.md](docs/SIGMOND-CONTRACT.md) — how wspr-recorder satisfies contract v0.4
+- [docs/SIGMOND-CONTRACT.md](docs/SIGMOND-CONTRACT.md) — how wspr-recorder satisfies contract v0.8
 - [docs/PHASE-2-COORDINATION.md](docs/PHASE-2-COORDINATION.md) — historical: the DB-direct decode decision record
 - [CLAUDE.md](CLAUDE.md) — development briefing
 

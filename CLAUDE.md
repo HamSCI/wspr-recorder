@@ -176,9 +176,9 @@ The +120 s headroom above the longest period exists so that the W2 cycle that st
 
 ## Client contract (v0.7)
 
-wspr-recorder implements the HamSCI client contract at version 0.7
+wspr-recorder implements the HamSCI client contract at version 0.8
 (authoritative source: `/opt/git/sigmond/sigmond/docs/CLIENT-CONTRACT.md`).
-`wspr_recorder/contract.py` carries `CONTRACT_VERSION = "0.7"`.
+`wspr_recorder/contract.py` carries `CONTRACT_VERSION = "0.8"`.
 
 Sections implemented:
 
