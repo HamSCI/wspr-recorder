@@ -189,7 +189,14 @@ class WsprUploaderHs:
             SIGMOND_SQLITE_PATH        sink db path (default /var/lib/sigmond/sink.db)
         """
         e = env if env is not None else os.environ
-        call = (e.get("WD_RECEIVER_CALL") or "").strip()
+        # WD_RECEIVER_CALL stays authoritative when set; the site-wide
+        # STATION_REPORTER_ID (coordination.toml [station] reporter_id,
+        # HamSCI/sigmond#38) is the fallback so one identity covers all
+        # upload paths by default.
+        call = (
+            (e.get("WD_RECEIVER_CALL") or "").strip()
+            or (e.get("STATION_REPORTER_ID") or "").strip()
+        )
         grid = (e.get("WD_RECEIVER_GRID") or "").strip()
         if not call or not grid:
             raise ValueError(
