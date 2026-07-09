@@ -196,6 +196,21 @@ def _resolve_encoding(enc_str: str) -> int:
     return mapping.get(enc_str.lower(), 4)
 
 
+def _band_producible(freq_hz: int, input_samprate_hz: Optional[int]) -> bool:
+    """True if radiod can produce a channel at ``freq_hz``.
+
+    A frequency above the ADC Nyquist (input_samprate / 2) cannot be produced by
+    the front end — e.g. 8m (40.68 MHz) / 6m (50.29 MHz) when an RX888 runs at
+    64.8 Msps (Nyquist 32.4 MHz) instead of 129.6 Msps.  Provisioning such a band
+    yields a channel that never delivers samples and thrashes the ensure_channel
+    retry loop, so we skip it.  Fail-open: an unknown/zero sample rate returns
+    True so nothing is skipped when the front-end rate can't be determined.
+    """
+    if not input_samprate_hz:
+        return True
+    return freq_hz <= input_samprate_hz // 2
+
+
 @dataclass
 class ChannelSink:
     """Callback bundle registered with a MultiStream for one channel."""
@@ -302,6 +317,7 @@ class ReceiverManager:
         # (MultiStream, ssrc) pairs for LIFETIME keep-alive — populated
         # at provisioning, consumed by an async loop in __main__.
         self._lifetime_entries: List[Tuple[MultiStream, int]] = []
+        self._input_samprate_hz: Optional[int] = None   # radiod front-end ADC rate; None until first channel is polled
         # Space out ensure_channel calls (2026-06-06): firing all bands in a
         # tight burst perturbs radiod into reverting freshly-created channels
         # to its global defaults (Task #46 race).  That fails verification
@@ -373,9 +389,42 @@ class ReceiverManager:
             self.state.connected = False
             return False
 
+    def _read_frontend_samprate(self, ssrc: int) -> Optional[int]:
+        """Read radiod's front-end ADC sample rate (Hz) from a channel's status.
+
+        Every channel's status packet carries the shared ``FrontendStatus``; a
+        ``poll_status`` does not change channel state.  Returns None on any
+        failure so the Nyquist guard fails open (skips nothing when unsure).
+        """
+        try:
+            st = self._control.poll_status(ssrc)
+            rate = getattr(getattr(st, "frontend", None), "input_samprate", None)
+            if rate and int(rate) > 1_000_000:
+                logger.info(
+                    "radiod front-end sample rate = %d Hz (Nyquist %d Hz)",
+                    int(rate), int(rate) // 2,
+                )
+                return int(rate)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("could not read front-end samprate from ssrc %s: %s", ssrc, exc)
+        return None
+
     def _provision(self, freq_hz: int) -> bool:
         assert self._control is not None
         band_name = freq_to_band_name(freq_hz)
+
+        # Skip bands the radiod front end can't produce (freq above the ADC Nyquist, e.g. 8m/6m at 64.8 Msps).
+        # Fail-open: until the front-end rate is known (populated after the first channel below), nothing is skipped.
+        if not _band_producible(freq_hz, self._input_samprate_hz):
+            logger.warning(
+                "Skipping band %s (%.3f MHz): above the radiod ADC Nyquist (%d Hz; front-end samprate %d Hz). "
+                "radiod cannot produce this stream at the current RX888 sample rate — raise samprate "
+                "(e.g. 129600000) in the radiod config to decode this band.",
+                band_name, freq_hz / 1e6,
+                (self._input_samprate_hz or 0) // 2, self._input_samprate_hz or 0,
+            )
+            return False
+
         defaults = self.config.channel_defaults
         encoding_int = _resolve_encoding(defaults.encoding)
 
@@ -408,6 +457,11 @@ class ReceiverManager:
                 created_at=time.time(),
             )
             self.state.channels[info.ssrc] = state
+
+            # Learn radiod's front-end ADC rate from the first live channel so subsequent
+            # bands above Nyquist (8m/6m at 64.8 Msps) are skipped rather than thrashed.
+            if self._input_samprate_hz is None:
+                self._input_samprate_hz = self._read_frontend_samprate(info.ssrc)
 
             # Register this channel's ChannelInfo so the listener mutates its
             # anchor in place; the same object is handed to RtpSyncStrategy.
