@@ -44,6 +44,24 @@ logger = logging.getLogger(__name__)
 _RMS_NL_ADJUST = -74.31   # cal_rms_offset + 10*log10(1/cal_ne_bw)
 _FFT_NL_ADJUST = -187.7   # cal_c2_correction
 
+# Per-band KA9Q/RX888 noise calibration (dB, added to the computed noise).  The base RMS/FFT calibration above was
+# derived on a KiwiSDR; applied to an RX888/ka9q-radio chain it over-reads the noise floor by a band-dependent
+# ~5-10 dB.  These offsets were measured at AI6VN against a co-located calibrated KiwiSDR treated as ground truth
+# (corrected RX888 then tracks the Kiwi within +/-0.3 dB RMS / +/-0.1 dB C2, and is condition-independent), and are
+# ported from wsprdaemon 3.4.0 (KA9Q_RMS_CAL_OFFSET / KA9Q_C2_CAL_OFFSET in decoding.sh).  Keyed on the wsprdaemon
+# band label.  2200/630 use the 160m value (impaired RX888 RF amp at LF); 8m and 6m use the 10m value (out of a
+# HF KiwiSDR's range, so measured against 10m).
+_RMS_CAL_OFFSET = {
+    "2200": -10.1, "630": -10.1, "160": -10.1, "80": -8.5, "80eu": -8.4,
+    "60": -8.8, "60eu": -8.9, "40": -8.7, "30": -8.3, "22": -7.5, "20": -7.2,
+    "17": -6.3, "15": -5.5, "12": -5.4, "10": -6.3, "8": -6.3, "6": -6.3,
+}
+_C2_CAL_OFFSET = {
+    "2200": -7.5, "630": -7.5, "160": -7.5, "80": -5.9, "80eu": -5.8,
+    "60": -6.1, "60eu": -6.0, "40": -6.0, "30": -5.5, "22": -4.8, "20": -4.6,
+    "17": -3.6, "15": -2.8, "12": -2.6, "10": -3.7, "8": -3.7, "6": -3.7,
+}
+
 # Time windows (seconds into the 120-second WSPR cycle).
 _NOISE_PRE_START_SEC, _NOISE_PRE_LEN_SEC = 0.25, 0.5
 _NOISE_POST_START_SEC, _NOISE_POST_LEN_SEC = 113.0, 5.0
@@ -161,14 +179,26 @@ def compute_noise(
     sample_rate: int,
     c2_path: Optional[Path],
     overload_count: int = 0,
+    band: Optional[str] = None,
 ) -> NoiseMeasurement:
     """One-shot for a decode cycle.  Either side returning None is
     tolerated — wsprdaemon.org accepts spots with a missing noise
     component; the column just shows 0.00 in the extended-format file.
+
+    ``band`` is the wsprdaemon band label (e.g. "20", "80eu", "8").  When
+    given, the per-band KA9Q/RX888 calibration offset (_RMS_CAL_OFFSET /
+    _C2_CAL_OFFSET) is added so the reported noise matches a calibrated
+    KiwiSDR instead of over-reading by a band-dependent ~5-10 dB.  Bands
+    absent from the tables (and band=None) are left uncorrected.
     """
     rms = (compute_rms_noise(samples, sample_rate)
            if samples is not None else None)
     fft = compute_fft_noise(c2_path) if c2_path is not None else None
+    if band is not None:
+        if rms is not None:
+            rms += _RMS_CAL_OFFSET.get(band, 0.0)
+        if fft is not None:
+            fft += _C2_CAL_OFFSET.get(band, 0.0)
     return NoiseMeasurement(
         rms_noise_dbm=rms if rms is not None else 0.0,
         fft_noise_dbm=fft if fft is not None else 0.0,

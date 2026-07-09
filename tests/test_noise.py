@@ -15,6 +15,8 @@ from wspr_recorder.noise import (
     compute_rms_noise,
     _RMS_NL_ADJUST,
     _FFT_NL_ADJUST,
+    _RMS_CAL_OFFSET,
+    _C2_CAL_OFFSET,
 )
 
 
@@ -123,3 +125,27 @@ def test_compute_noise_handles_just_rms(tmp_path: Path):
     out = compute_noise(samples=samples, sample_rate=sr, c2_path=None)
     assert out.fft_noise_dbm == 0.0
     assert out.rms_noise_dbm != 0.0      # something computed
+
+
+def test_compute_noise_applies_per_band_ka9q_offset():
+    """The per-band KA9Q/RX888 calibration offset (ported from wsprdaemon 3.4.0) is added
+    to the computed noise when a band label is supplied, and left off otherwise."""
+    sr = 12000
+    samples = (0.001 * np.random.default_rng(0).standard_normal(120 * sr)).astype(np.float32)
+    base = compute_noise(samples=samples, sample_rate=sr, c2_path=None).rms_noise_dbm
+    assert base != 0.0
+    for band in ("20", "8", "2200", "40", "80eu"):
+        corrected = compute_noise(
+            samples=samples, sample_rate=sr, c2_path=None, band=band
+        ).rms_noise_dbm
+        assert corrected == pytest.approx(base + _RMS_CAL_OFFSET[band], abs=1e-6)
+    # 8m and 6m inherit the 10m offset (out of a HF Kiwi's range)
+    assert _RMS_CAL_OFFSET["8"] == _RMS_CAL_OFFSET["10"] == _RMS_CAL_OFFSET["6"]
+    assert _C2_CAL_OFFSET["8"] == _C2_CAL_OFFSET["10"] == _C2_CAL_OFFSET["6"]
+    # unknown band and band=None leave the value uncorrected
+    assert compute_noise(
+        samples=samples, sample_rate=sr, c2_path=None, band="ZZ"
+    ).rms_noise_dbm == pytest.approx(base)
+    assert compute_noise(
+        samples=samples, sample_rate=sr, c2_path=None
+    ).rms_noise_dbm == pytest.approx(base)

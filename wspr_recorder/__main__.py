@@ -811,6 +811,7 @@ class WsprRecorder:
                 samples=samples,
                 sample_rate=sr,
                 c2_path=c2_candidate,
+                band=request.band_name,   # per-band KA9Q/RX888 noise calibration
             )
         except Exception as exc:                # noqa: BLE001
             logger.warning(
