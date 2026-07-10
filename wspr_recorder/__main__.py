@@ -776,6 +776,19 @@ class WsprRecorder:
             return next(iter(self.receiver_managers.values()))
         return None
 
+    def _ssrc_for_request(self, request: 'DecodeRequest') -> Optional[int]:
+        """The real radiod-assigned SSRC for this band's channel.
+
+        SSRC is a radiod-assigned handle (ka9q-python derives it via
+        ``allocate_ssrc``'s hash of freq/encoding/rate, not ``round(freq_khz)``),
+        so it must never be recomputed from frequency — use the value
+        ``ensure_channel`` returned, carried on the BandRecorder.
+        """
+        for (src_key, ssrc), rec in self.band_recorders.items():
+            if src_key == request.rx_source and rec.frequency_hz == request.frequency_hz:
+                return ssrc
+        return None
+
     def _read_cycle_overloads(self, request: 'DecodeRequest', radiod_id: str) -> int:
         """ADC overrange events during this cycle: the delta of radiod's
         cumulative AD_OVER counter since this band's previous cycle.
@@ -789,9 +802,12 @@ class WsprRecorder:
         rm = self._receiver_manager_for(radiod_id)
         if rm is None:
             return 0
-        # radiod assigns SSRC = round(freq_hz / 1000); AD_OVER is front-end wide
-        # so any live channel's status carries the same counter.
-        ssrc = round(request.frequency_hz / 1000)
+        # AD_OVER is front-end wide, so any live channel's status carries the
+        # same counter — but we must poll the channel's REAL SSRC, not a
+        # frequency-derived guess (radiod SSRCs need not track frequency).
+        ssrc = self._ssrc_for_request(request)
+        if ssrc is None:
+            return 0
         current = rm.read_frontend_ad_over(ssrc)
         if current is None:
             return 0                       # read failed — keep baseline, report 0
