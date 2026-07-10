@@ -35,7 +35,7 @@ from .decode_mode import DecodeMode
 from .decoder import DecoderRunner
 from .callsign_db import CallsignDB
 from .spot_sink import SpotSink, CycleBatcher, resolve_reporter_identity
-from .noise import compute_noise
+from .noise import compute_noise, overload_delta
 from .hs_uploader_shim import WsprUploaderHs
 
 logger = logging.getLogger(__name__)
@@ -167,6 +167,10 @@ class WsprRecorder:
         # SSRCs.  Single-source deployments still get one entry per
         # SSRC (just paired with the synthesised source_key).
         self.band_recorders: Dict[Tuple[str, int], BandRecorder] = {}
+        # Last cumulative radiod AD_OVER counter seen per (radiod_id, band),
+        # so each cycle's overload_count is the delta over that 2-min window
+        # (mirrors wsprdaemon decoding.sh's new_sdr_overloads_count).
+        self._last_ad_over: Dict[Tuple[str, str], int] = {}
         # hs-uploader pumps wspr.spots + wspr.noise → wsprdaemon.org +
         # wsprnet.org from in-process.  v3 Phase A absorbed this from
         # the standalone wd-upload-hs@.service; gated on
@@ -761,6 +765,41 @@ class WsprRecorder:
                     decoder_wav.name, exc,
                 )
 
+    def _receiver_manager_for(self, radiod_id: str):
+        """The ReceiverManager whose radiod matches ``radiod_id`` (its status
+        address), for reaching that radiod's RadiodControl.  Falls back to the
+        sole manager in single-source deployments."""
+        for rm in self.receiver_managers.values():
+            if getattr(rm, "_status_address", None) == radiod_id:
+                return rm
+        if len(self.receiver_managers) == 1:
+            return next(iter(self.receiver_managers.values()))
+        return None
+
+    def _read_cycle_overloads(self, request: 'DecodeRequest', radiod_id: str) -> int:
+        """ADC overrange events during this cycle: the delta of radiod's
+        cumulative AD_OVER counter since this band's previous cycle.
+
+        Mirrors wsprdaemon decoding.sh (``new_sdr_overloads_count``): read the
+        monotonic counter, subtract the value from the prior cycle, and report
+        the difference.  Fails open — returns 0 on the first cycle (baseline),
+        on any read failure, and on a counter reset (radiod restart), so a
+        missing reading never fabricates a spike.
+        """
+        rm = self._receiver_manager_for(radiod_id)
+        if rm is None:
+            return 0
+        # radiod assigns SSRC = round(freq_hz / 1000); AD_OVER is front-end wide
+        # so any live channel's status carries the same counter.
+        ssrc = round(request.frequency_hz / 1000)
+        current = rm.read_frontend_ad_over(ssrc)
+        if current is None:
+            return 0                       # read failed — keep baseline, report 0
+        key = (radiod_id, request.band_name)
+        last = self._last_ad_over.get(key)
+        self._last_ad_over[key] = current
+        return overload_delta(last, current)
+
     def _submit_noise_for_cycle(
         self,
         request: 'DecodeRequest',
@@ -806,12 +845,14 @@ class WsprRecorder:
                 key=lambda p: p.stat().st_mtime,
             )
             c2_candidate = c2_files[-1] if c2_files else None
+        overload_count = self._read_cycle_overloads(request, radiod_id)
         try:
             measurement = compute_noise(
                 samples=samples,
                 sample_rate=sr,
                 c2_path=c2_candidate,
                 band=request.band_name,   # per-band KA9Q/RX888 noise calibration
+                overload_count=overload_count,
             )
         except Exception as exc:                # noqa: BLE001
             logger.warning(

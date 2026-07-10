@@ -13,6 +13,7 @@ from wspr_recorder.noise import (
     compute_fft_noise,
     compute_noise,
     compute_rms_noise,
+    overload_delta,
     _RMS_NL_ADJUST,
     _FFT_NL_ADJUST,
     _RMS_CAL_OFFSET,
@@ -111,6 +112,35 @@ def test_fft_noise_short_c2_returns_none(tmp_path: Path):
 
 
 # -------- combined wrapper --------
+
+# -------- overload plumbing (radiod AD_OVER delta) --------
+
+def test_overload_delta_first_reading_is_zero():
+    # No baseline yet → 0 (don't report a huge absolute count on the first cycle).
+    assert overload_delta(None, 1_000_000) == 0
+
+
+def test_overload_delta_normal_increment():
+    # Steady state: overloads this cycle = current - last.
+    assert overload_delta(427_206, 427_280) == 74
+    assert overload_delta(427_280, 427_280) == 0     # no new overloads
+
+
+def test_overload_delta_counter_reset_returns_absolute():
+    # radiod restarted → counter fell; report the post-restart absolute, not a
+    # negative number.
+    assert overload_delta(1_000_000, 5) == 5
+
+
+def test_overload_delta_missing_current_is_zero():
+    assert overload_delta(427_206, None) == 0
+
+
+def test_compute_noise_passes_overload_count_through():
+    out = compute_noise(samples=None, sample_rate=12000, c2_path=None,
+                        overload_count=74)
+    assert out.overload_count == 74
+
 
 def test_compute_noise_neither_side_present():
     out = compute_noise(samples=None, sample_rate=12000, c2_path=None)

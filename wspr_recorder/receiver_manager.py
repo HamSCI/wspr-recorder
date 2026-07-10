@@ -409,6 +409,25 @@ class ReceiverManager:
             logger.debug("could not read front-end samprate from ssrc %s: %s", ssrc, exc)
         return None
 
+    def read_frontend_ad_over(self, ssrc: int) -> Optional[int]:
+        """Read radiod's cumulative A/D overrange counter from a channel's status.
+
+        The shared ``FrontendStatus.ad_over`` is a monotonic count of full-scale
+        (railed) ADC samples since radiod started — the same value wsprdaemon's
+        decoding.sh reads from metadump's "A/D overrange:" line.  It is front-end
+        wide (one ADC), so any live channel's status carries it; ``poll_status``
+        does not change channel state.  Returns None on any failure so the caller
+        can fall open (report 0 overloads rather than a bogus spike).
+        """
+        try:
+            st = self._control.poll_status(ssrc)
+            ad_over = getattr(getattr(st, "frontend", None), "ad_over", None)
+            if ad_over is not None:
+                return int(ad_over)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("could not read ad_over from ssrc %s: %s", ssrc, exc)
+        return None
+
     def _provision(self, freq_hz: int) -> bool:
         assert self._control is not None
         band_name = freq_to_band_name(freq_hz)

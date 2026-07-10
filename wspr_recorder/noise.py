@@ -72,7 +72,7 @@ class NoiseMeasurement:
     """One cycle's noise floor."""
     rms_noise_dbm: float    # RMS background, calibrated dBm
     fft_noise_dbm: float    # FFT bottom-30% bandpass, calibrated dBm
-    overload_count: int = 0 # ADC overloads observed in cycle (not yet plumbed)
+    overload_count: int = 0 # ADC overrange events in cycle (radiod AD_OVER delta)
 
 
 # -------- RMS-noise side (sox port) --------
@@ -204,3 +204,18 @@ def compute_noise(
         fft_noise_dbm=fft if fft is not None else 0.0,
         overload_count=overload_count,
     )
+
+
+def overload_delta(last: Optional[int], current: Optional[int]) -> int:
+    """ADC overrange events during one cycle from radiod's cumulative AD_OVER
+    counter (``last`` and ``current`` are consecutive monotonic readings).
+
+    Mirrors wsprdaemon decoding.sh's ``new_sdr_overloads_count``.  Fails open,
+    returning 0, for the first reading (no baseline yet) or a missing current;
+    on a counter reset (radiod restart → ``current < last``) returns the
+    absolute ``current`` as the best estimate rather than a negative number.
+    """
+    if current is None or last is None:
+        return 0
+    delta = current - last
+    return current if delta < 0 else delta
