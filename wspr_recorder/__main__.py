@@ -36,6 +36,7 @@ from .decoder import DecoderRunner
 from .callsign_db import CallsignDB
 from .spot_sink import SpotSink, CycleBatcher, resolve_reporter_identity
 from .noise import compute_noise, overload_delta
+from .timing_guard import DtGuardConfig, dt_guard_step
 from .hs_uploader_shim import WsprUploaderHs
 
 logger = logging.getLogger(__name__)
@@ -171,6 +172,11 @@ class WsprRecorder:
         # so each cycle's overload_count is the delta over that 2-min window
         # (mirrors wsprdaemon decoding.sh's new_sdr_overloads_count).
         self._last_ad_over: Dict[Tuple[str, str], int] = {}
+        # External-truth timing guard (timing_guard.py): per-rx strike
+        # counts for the cycle-dt re-anchor trigger.  None = disabled
+        # (WSPR_DT_GUARD_SEC=0).
+        self._dt_guard_cfg = DtGuardConfig.from_env()
+        self._dt_guard_strikes: Dict[str, int] = {}
         # hs-uploader pumps wspr.spots + wspr.noise → wsprdaemon.org +
         # wsprnet.org from in-process.  v3 Phase A absorbed this from
         # the standalone wd-upload-hs@.service; gated on
@@ -764,6 +770,75 @@ class WsprRecorder:
                     "evict: could not remove decode by-products for %s: %s",
                     decoder_wav.name, exc,
                 )
+
+    def _on_cycle_dt(self, rx_source: str, avg_dt, n_spots: int) -> None:
+        """CycleBatcher flush hook: external-truth timing guard.
+
+        The per-cycle average decoder dt measures the slot anchor's offset
+        from true UTC (transmitters are UTC-aligned) — evidence no stale or
+        self-consistent radiod mapping can fool.  Two consecutive offending
+        cycles ⇒ LOUD fault + re-anchor every band on that rx (see
+        timing_guard.py for the full rationale + the 2026-07-16 incident).
+        """
+        cfg = self._dt_guard_cfg
+        if cfg is None:
+            return
+        strikes, fire = dt_guard_step(
+            self._dt_guard_strikes.get(rx_source, 0), avg_dt, n_spots, cfg)
+        self._dt_guard_strikes[rx_source] = strikes
+        if not fire:
+            if strikes:
+                logger.warning(
+                    "dt-guard rx=%s: cycle avg dt %+.2fs (n=%d) beyond "
+                    "%.2fs [strike %d/%d]",
+                    rx_source, avg_dt, n_spots, cfg.threshold_sec,
+                    strikes, cfg.cycles)
+            return
+        logger.error(
+            "TIMING FAULT rx=%s mode=wspr: cycle avg dt %+.2fs (n=%d) "
+            "beyond %.2fs for %d consecutive cycles — slot anchors are off "
+            "true UTC (radiod mapping stepped or status feed stale); "
+            "re-anchoring EVERY band on this rx off fresh channel_info; "
+            "INVESTIGATE radiod (sample loss / output stalls)",
+            rx_source, avg_dt, n_spots, cfg.threshold_sec, cfg.cycles)
+        self._reanchor_rx(rx_source)
+
+    def _reanchor_rx(self, rx_source: str) -> None:
+        """Reset + rebind every band recorder of ``rx_source`` against its
+        CURRENT ChannelState.channel_info — the same recovery as the
+        stream-restored path (recorder.reset() re-seeds the sync strategy;
+        the fresh ChannelInfo drives re-correlation).  Costs the in-flight
+        cycle per band; decoding resumes at the next clean UTC boundary.
+        """
+        rm = self.receiver_managers.get(rx_source)
+        states_by_freq = {}
+        if rm is not None:
+            try:
+                states_by_freq = {
+                    st.frequency_hz: st
+                    for st in rm.state.channels.values()
+                }
+            except Exception:                       # noqa: BLE001
+                logger.exception(
+                    "dt-guard rx=%s: could not read channel states",
+                    rx_source)
+        n = 0
+        for (src, _ssrc), rec in list(self.band_recorders.items()):
+            if src != rx_source:
+                continue
+            st = states_by_freq.get(rec.frequency_hz)
+            try:
+                rec.reset()
+                if st is not None and st.channel_info is not None:
+                    rec.sync_strategy.set_channel_info(st.channel_info)
+                n += 1
+            except Exception:                       # noqa: BLE001
+                logger.exception(
+                    "dt-guard rx=%s: reset failed for %s",
+                    rx_source, rec.band_name)
+        logger.warning(
+            "dt-guard rx=%s: re-anchored %d band recorder(s); decoding "
+            "resumes at the next clean UTC minute boundary", rx_source, n)
 
     def _receiver_manager_for(self, radiod_id: str):
         """The ReceiverManager whose radiod matches ``radiod_id`` (its status
@@ -1593,7 +1668,8 @@ class WsprRecorder:
             # thread.  Sidesteps SQLite's thread-affinity check
             # (BandRecorder's executor runs decodes on per-band
             # worker threads, but only this thread touches the DB).
-            self.cycle_batcher = CycleBatcher(self.spot_sink)
+            self.cycle_batcher = CycleBatcher(self.spot_sink,
+                                              on_cycle_dt=self._on_cycle_dt)
             logger.info(
                 "pipeline-v2 decode pool enabled (rx_call=%r, rx_grid=%r)",
                 rx_call, rx_grid,

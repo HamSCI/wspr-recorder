@@ -752,8 +752,13 @@ class CycleBatcher:
         deadline_sec: float = 30.0,
         backstop_sec: Optional[float] = None,
         ft_settle_sec: Optional[float] = None,
+        on_cycle_dt=None,
     ):
         self._sink = sink
+        # Optional per-cycle hook (rx_label, avg_dt, n_spots) — the
+        # external-truth timing guard (timing_guard.py).  Called after the
+        # cycle log line, before the uploader wake.
+        self._on_cycle_dt = on_cycle_dt
         self._deadline_sec = float(deadline_sec)
         # Wall-clock backstop for completion-tracked batches.  The env
         # var override is for operators running on slow hardware (or
@@ -1313,6 +1318,14 @@ class CycleBatcher:
             f" dt={avg_dt:+.2f}" if avg_dt is not None else "",
             f" bands=[{bands_breakdown}]" if bands_breakdown else "",
         )
+        # External-truth timing guard hook: the cycle's avg dt IS the
+        # slot-anchor-offset evidence (see timing_guard.py) — hand it to
+        # the recorder before the uploader wake.
+        if self._on_cycle_dt is not None:
+            try:
+                self._on_cycle_dt(rx_label, avg_dt, n)
+            except Exception:
+                logger.exception("on_cycle_dt guard callback failed")
         # Wake the in-process uploader.  No-op if no callback is
         # registered.  A callback exception is logged but doesn't
         # propagate — the uploader's 60-second polling fallback
