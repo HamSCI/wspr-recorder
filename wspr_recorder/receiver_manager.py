@@ -428,6 +428,25 @@ class ReceiverManager:
             logger.debug("could not read ad_over from ssrc %s: %s", ssrc, exc)
         return None
 
+    def read_channel_filter_drops(self, ssrc: int) -> Optional[int]:
+        """Read radiod's cumulative output block-drop counter for ONE channel.
+
+        ``ChannelStatus.filter_drops`` (metadump field [77] "block drops") is
+        a monotonic count of filter/output blocks radiod dropped for this SSRC
+        because its output threads fell behind — an OUTPUT-path loss that the
+        input-side AD/RTP monitors never see (0 STEPPED, 0 A/D loss, yet the
+        decode window slips).  Per-channel, so poll the band's real SSRC.
+        Returns None on any failure (caller falls open).
+        """
+        try:
+            st = self._control.poll_status(ssrc)
+            drops = getattr(st, "filter_drops", None)
+            if drops is not None:
+                return int(drops)
+        except Exception as exc:  # noqa: BLE001
+            logger.debug("could not read filter_drops from ssrc %s: %s", ssrc, exc)
+        return None
+
     def _provision(self, freq_hz: int) -> bool:
         assert self._control is not None
         band_name = freq_to_band_name(freq_hz)

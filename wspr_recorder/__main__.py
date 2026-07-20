@@ -172,6 +172,10 @@ class WsprRecorder:
         # so each cycle's overload_count is the delta over that 2-min window
         # (mirrors wsprdaemon decoding.sh's new_sdr_overloads_count).
         self._last_ad_over: Dict[Tuple[str, str], int] = {}
+        # Last cumulative radiod output block-drop counter per (radiod_id,
+        # band), so each cycle's drop count is the delta.  Output-path frame
+        # loss (radiod CPU/cache contention) that input-side monitors miss.
+        self._last_filter_drops: Dict[Tuple[str, str], int] = {}
         # External-truth timing guard (timing_guard.py): per-rx strike
         # counts for the cycle-dt re-anchor trigger.  None = disabled
         # (WSPR_DT_GUARD_SEC=0).
@@ -891,6 +895,42 @@ class WsprRecorder:
         self._last_ad_over[key] = current
         return overload_delta(last, current)
 
+    def _read_cycle_filter_drops(self, request: 'DecodeRequest',
+                                 radiod_id: str) -> int:
+        """radiod output block-drops on THIS band's channel this cycle.
+
+        st.filter_drops (metadump [77] "block drops") increments when radiod
+        drops a filter/output block because its output threads fell behind —
+        an output-path frame loss the input-side AD/RTP monitors can't see
+        (0 STEPPED / 0 A/D loss, yet the decode window slips → dt walk).
+        Logged LOUD when >0 so drops are visible in the journal and can be
+        correlated with timing drift.  Per-channel counter (poll the band's
+        real SSRC).  Fails open (0) on baseline, read failure, or a counter
+        reset (radiod restart)."""
+        rm = self._receiver_manager_for(radiod_id)
+        if rm is None:
+            return 0
+        ssrc = self._ssrc_for_request(request)
+        if ssrc is None:
+            return 0
+        current = rm.read_channel_filter_drops(ssrc)
+        if current is None:
+            return 0
+        key = (radiod_id, request.band_name)
+        last = self._last_filter_drops.get(key)
+        self._last_filter_drops[key] = current
+        if last is None or current < last:
+            return 0                       # baseline / radiod restart reset
+        dropped = current - last
+        if dropped > 0:
+            logger.warning(
+                "radiod OUTPUT block-drops rx=%s %s: +%d this cycle "
+                "(cumulative %d) — output-path frame loss (radiod "
+                "CPU/cache contention); slips decode-window timing",
+                request.rx_source, request.band_name, dropped, current,
+            )
+        return dropped
+
     def _submit_noise_for_cycle(
         self,
         request: 'DecodeRequest',
@@ -937,6 +977,7 @@ class WsprRecorder:
             )
             c2_candidate = c2_files[-1] if c2_files else None
         overload_count = self._read_cycle_overloads(request, radiod_id)
+        self._read_cycle_filter_drops(request, radiod_id)
         try:
             measurement = compute_noise(
                 samples=samples,
