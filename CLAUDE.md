@@ -142,7 +142,7 @@ The +120 s headroom above the longest period exists so that the W2 cycle that st
 
 **Callsign Database** (`callsign_db.py`): A thin wrapper that **composes a `callhash.CallHashTable`** for all hashing, lookup, and collision handling — the same shared library `psk-recorder` and `meteor-scatter` use, so a compound call learned on any mode resolves WSPR/FST4W hashes too. The wrapper adds the wspr-only concerns the library deliberately doesn't carry: per-call grid/band metadata, the wsprnet **negative-cache filter** (passed to the library's `write_wsprd_hashtable`/`write_jt9_calls` exporters as the `exclude=` predicate), and its richer JSON persistence format (auto-saved when `ingest_spots` adds entries; rebuilt into the table on load). The table lives at `/var/lib/wspr-recorder/callhash/wspr-callhash.json`; if that directory can't be created the DB falls back to in-memory only. Resolves jt9 `-Y` numeric hashes (`<NNNNNNN>`) via `by_hash22`; wsprd's 15-bit path is seeded ahead of decode. Ambiguous (colliding) hash slots resolve to nothing rather than a guessed call (callhash collision guard). Recall WSPR-2 (wsprd) is **15-bit** and FST4W (jt9 `-Y`) is **22-bit** — same `nhash`, different width; the table keys them separately.
 
-**Decoder Runner** (`decoder.py`): Invokes wsprd (2-pass standard + spreading, merged) and jt9 with `-Y` flag. Parses `ALL_WSPR.TXT` and `fst4_decodes.dat` via line-count diffing. Runs wsprd first to discover callsigns, then jt9 can resolve type-3 hashes from the same cycle. The spreading pass is skipped (standard pass used alone) when no `wsprd.spreading` binary is present. Binaries are arch-resolved by `_resolve_decoder_binaries()` in `__main__.py` from `/opt/wsprdaemon-client/bin/decoders/`, falling back to PATH.
+**Decoder Runner** (`decoder.py`): Invokes wsprd (single standard pass) and jt9 with `-Y` flag. Parses `ALL_WSPR.TXT` and `fst4_decodes.dat` via line-count diffing. Runs wsprd first to discover callsigns, then jt9 can resolve type-3 hashes from the same cycle. The Doppler-spreading pass is retired (a distrusted vestige; making wsprd emit a spreading value like jt9 is future work). `wsprd`/`jt9` are resolved from `/usr/local/bin` (sigmond's from-source wsjtx-decoders build; the repo ships no pre-compiled binaries) by `_resolve_decoder_binaries()` in `__main__.py`.
 
 **Noise** (`noise.py`): Per-cycle noise measurement. Computes RMS noise from three time windows of the 120 s WAV plus FFT noise from wsprd's `-c` C2 output (Hanning-windowed FFT, bottom 30% of magnitudes in the passband). Produces one `NoiseMeasurement` per (band, cycle), flushed through the `SpotSink` as `wspr.noise` rows. Only W2 decodes produce the C2 file; F-modes share the cycle so one reading covers them.
 
@@ -268,9 +268,9 @@ pytest with pytest-asyncio (`asyncio_mode = "auto"`). Tests are in `tests/`, ~36
 
 ### Decoder binaries
 
-In full-pipeline mode `_resolve_decoder_binaries()` arch-resolves the
-decoders from `/opt/wsprdaemon-client/bin/decoders/` (e.g.
-`wsprd-x86-v27`, `jt9-x86-v27`), falling back to a PATH lookup. WAV
+In full-pipeline mode `_resolve_decoder_binaries()` resolves
+`wsprd`/`jt9` from `/usr/local/bin` (installed by sigmond's from-source
+wsjtx-decoders build; the repo ships no pre-compiled binaries). WAV
 format is compatible with both decoders:
 - `wsprd` (`-c`): accepts 12 kHz int16 mono WAV, writes the `.c2` file used for FFT noise.
 - `jt9` with `-Y`: accepts the same WAV, outputs numeric 22-bit hashes.

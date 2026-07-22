@@ -138,7 +138,7 @@ this branch (now `pipeline-v2/phase-2` HEAD):
    know which side you'd prefer to own it.
 
 3. **DecoderRunner's defaults assume wsprd / jt9 are in PATH.**
-   Real binaries are at `/opt/wsprdaemon-client/bin/decoders/wsprd-<arch>-v27`.
+   Real binaries are at `/usr/local/bin/wsprd` + `jt9` (sigmond from-source build).
    Added `_resolve_decoder_binaries()` that arch-detects and points
    DecoderRunner at the right files (mirrors the legacy `wd-decode`
    bash arch-switch).

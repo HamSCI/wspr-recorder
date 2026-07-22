@@ -303,8 +303,8 @@ audit consumers (`smd verifier`, `smd watch wspr`).
   `WSPR_PUMP_INTERVAL_SEC`, `SIGMOND_SQLITE_PATH`, `WSPR_UPLOAD_WAKE_SOCK`,
   `WSPRDAEMON_TAR_COMPRESSION`. Sigmond-seeded `[contract.instance_env]`:
   `WD_DECODE_VIA_DB=1`, `WD_RECEIVER_CALL={reporter_call}`.
-- External decoders `wsprd`/`wsprd.spreading`/`jt9` arch-resolved from
-  `/opt/wsprdaemon-client/bin/decoders/` (PATH fallback).
+- External decoders `wsprd`/`jt9` resolved from `/usr/local/bin`
+  (sigmond's from-source wsjtx-decoders build); spread pass retired.
 - Optional hf-timestd authority `/run/hf-timestd/authority.json` (§8.3);
   identity/coordination from `/etc/sigmond/coordination.env`.
 

@@ -212,10 +212,10 @@ and the list of `decode_modes` downstream consumers should invoke.
 Invokes `wsprd` (2-pass: standard + spreading, merged by preferring
 spreading data then best SNR) and `jt9 --fst4w -Y`, parsing
 `ALL_WSPR.TXT` and `fst4_decodes.dat` by line-count diffing. Returns
-`RawSpot` instances. The spreading pass is skipped when no
-`wsprd.spreading` binary is present. Binaries are arch-resolved by
-`__main__._resolve_decoder_binaries()` from
-`/opt/wsprdaemon-client/bin/decoders/`, falling back to PATH. Each
+`RawSpot` instances. The Doppler-spreading pass is retired (standard
+pass only). `wsprd`/`jt9` are resolved by
+`__main__._resolve_decoder_binaries()` from `/usr/local/bin`
+(sigmond's from-source wsjtx-decoders build). Each
 band gets its own `.phase2/` work_dir under the band's WAV directory
 so its `ALL_WSPR.TXT`/hashtable artefacts don't collide with a
 parallel legacy `wd-decode@*` chain.

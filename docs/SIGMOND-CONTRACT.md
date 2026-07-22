@@ -173,11 +173,11 @@ same production layout, no sigmond required. `install.sh` additionally
 pre-installs the sibling repos `callhash` and `hs-uploader` (not yet
 on PyPI) from local paths.
 
-External decoders (`wsprd`, `wsprd.spreading`) used by full-pipeline
-decode are runtime deps resolved at startup from
-`/opt/wsprdaemon-client/bin/decoders/` (falling back to `PATH`); they
-are declared by operator convention, not by the wspr-recorder deploy
-manifest. `jt9` comes from the `wsjtx` apt package.
+External decoders (`wsprd`, `jt9`) used by full-pipeline decode are
+runtime deps resolved at startup from `/usr/local/bin` (sigmond's
+from-source wsjtx-decoders build; the repo ships no binaries and no
+longer uses the `wsjtx` apt package). The Doppler-spreading pass is
+retired.
 
 ## §6 — Talking to radiod
 

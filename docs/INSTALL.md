@@ -52,10 +52,10 @@ In recorder-only mode (the default), wspr-recorder writes WAVs to
 consumer handles decoding.
 
 In full-pipeline mode (`WD_DECODE_VIA_DB=1`, see below) wspr-recorder
-decodes in-process and needs `wsprd` and `jt9`. They are arch-resolved
-from `/opt/wsprdaemon-client/bin/decoders/` (e.g. `wsprd-x86-v27`,
-`jt9-x86-v27`), falling back to a `PATH` lookup. They are runtime
-dependencies by operator convention, not installed by `install.sh`.
+decodes in-process and needs `wsprd` and `jt9`, resolved from
+`/usr/local/bin` (installed by sigmond's from-source wsjtx-decoders
+build; the repo ships no pre-compiled binaries). They are runtime
+dependencies built by `smd install`, not by wspr-recorder's `install.sh`.
 
 ### sigmond — for the DB sink
 
