@@ -445,78 +445,26 @@ class WsprRecorder:
             trim()
 
     def _resolve_decoder_binaries(self) -> tuple:
-        """Locate (wsprd_path, wsprd_spread_path, jt9_path) for this host.
+        """Locate (wsprd_path, wsprd_spread_path, jt9_path) from the normal
+        install path.
 
-        Resolution order (most → least specific):
-          1. In-repo `bin/decoders/<binary>-<arch>-vNN` — the
-             precompiled binaries are committed alongside the recorder
-             source, so a `git pull` is the only thing needed to keep
-             decoder versions matched with recorder code.
-          2. Legacy `/opt/wsprdaemon-client/bin/decoders/...` — kept
-             for hosts that still install the wsprdaemon-client tree
-             separately.
-          3. PATH lookup (`wsprd`, `jt9`) — last resort for test rigs
-             and ad-hoc setups.
+        wsprd and jt9 are resolved on PATH — sigmond's from-source
+        wsjtx-decoders build installs them to /usr/local/bin.  The recorder no
+        longer ships pre-compiled decoder binaries (GPLv3: build from retained
+        source on-host rather than redistribute binaries; see sigmond
+        _build_wsjtx_decoders).
 
-        The spreading variant follows the same precedence; when no
-        spreading binary is found anywhere, the spread pass is
-        silently skipped by DecoderRunner.
+        The Doppler-spreading second pass is retired.  It relied on a separate,
+        distrusted wsprd variant that never emitted a validated spreading
+        metric — and on x86 the committed "spread" binary was byte-identical to
+        the standard one, so it added nothing but CPU.  A proper redesign
+        (making wsprd emit a spreading value the way jt9 does) is future work;
+        until then WSPR is decoded by the single standard wsprd pass.
         """
-        import platform
-        arch = platform.machine()
-        wsprd_name = {
-            "x86_64":  "wsprd-x86-v27",
-            "aarch64": "wsprd-arm64-v27",
-            "armv7l":  "wsprd-armhf-v26",
-            "armhf":   "wsprd-armhf-v26",
-        }.get(arch)
-        jt9_name = {
-            "x86_64":  "jt9-x86-v27",
-            "aarch64": "jt9-arm64-v27",
-            "armv7l":  "jt9-arm32-v26",
-            "armhf":   "jt9-arm32-v26",
-        }.get(arch)
-        # Note the inconsistent ARM64 naming in the committed
-        # binaries: `wsprd.spread.arm64-v27` uses dots instead of the
-        # dash-separator used by every other variant.  Carry that
-        # quirk here so we find the file as shipped.
-        spread_name = {
-            "x86_64":  "wsprd.spread-x86-v27",
-            "aarch64": "wsprd.spread.arm64-v27",
-            "armv7l":  "wsprd.spread-armhf-v26",
-            "armhf":   "wsprd.spread-armhf-v26",
-        }.get(arch)
-
-        repo_decoder_dir = (
-            Path(__file__).resolve().parent.parent / "bin" / "decoders"
-        )
-        legacy_decoder_dir = Path("/opt/wsprdaemon-client/bin/decoders")
-        search_dirs = (repo_decoder_dir, legacy_decoder_dir)
-
-        def _find(name: Optional[str], fallback: str) -> Optional[str]:
-            if name is None:
-                return None
-            for d in search_dirs:
-                cand = d / name
-                if cand.exists():
-                    return str(cand)
-            # PATH lookup keyed on the unversioned name — historically
-            # operators dropped `wsprd` / `jt9` into /usr/local/bin
-            # outside of the per-arch convention.
-            import shutil
-            return shutil.which(fallback)
-
-        wsprd_path = _find(wsprd_name, "wsprd") or "wsprd"
-        jt9_path = _find(jt9_name, "jt9") or "jt9"
-        # Operator opt-out: WSPR_DISABLE_SPREAD=1 skips the second
-        # (Doppler-spreading) wsprd pass entirely, so WSPR is decoded only by
-        # the standard wsprd — one decode per cycle, ~half the WSPR decode
-        # CPU, at the cost of the spread metric and a few weak-signal spots.
-        # Default unchanged: the spread pass runs when its binary is present.
-        if os.environ.get("WSPR_DISABLE_SPREAD", "0") == "1":
-            wsprd_spread = None
-        else:
-            wsprd_spread = _find(spread_name, "wsprd.spreading")
+        import shutil
+        wsprd_path = shutil.which("wsprd") or "wsprd"
+        jt9_path = shutil.which("jt9") or "jt9"
+        wsprd_spread = None   # spread pass retired pending redesign (see above)
         return wsprd_path, wsprd_spread, jt9_path
 
     def _resolve_decoder(
