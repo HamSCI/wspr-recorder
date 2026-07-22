@@ -104,9 +104,12 @@ name    = "numpy"
 version = "1.20.0"
 venv    = "/opt/git/sigmond/wspr-recorder/venv"
 
-[[deps.apt]]
-name = "wsjtx"
-note = "provides jt9 for FST4W decoding"
+# jt9 (FST4W) + wsprd (WSPR) are NOT taken from the Debian `wsjtx` package.
+# sigmond builds them from pinned WSJT-X source, optimized for this host
+# (_build_wsjtx_decoders in bin/smd, run at install), installed to
+# /usr/local/bin (which leads /usr/bin, so it shadows any apt binary). The
+# recorders execute `jt9`/`wsprd` by name off PATH — no binary-selection probe.
+# apt `wsjtx` dep removed 2026-07-22; see docs/native-binaries.md.
 
 [[deps.apt]]
 name = "whiptail"
