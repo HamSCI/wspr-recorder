@@ -293,6 +293,7 @@ class BandRecorder:
 
         self._initialized = False
         self._synced = False
+        self._last_harvest_off = 0
 
         # Cached constants
         self._samples_per_minute = self.sample_rate * 60
@@ -434,6 +435,14 @@ class BandRecorder:
                     self._resync_requested = False
                     self.reset()
                     return
+
+        # Write-path harvest (throttled to ~1 s of audio): decouples slot
+        # emission from the minute close — see _harvest_ready_slots.
+        if self._synced and (
+                self._ring.absolute_sample_count - self._last_harvest_off
+                >= self.sample_rate):
+            self._last_harvest_off = self._ring.absolute_sample_count
+            self._harvest_ready_slots()
 
     def _anchor_utc_now(self) -> Optional[float]:
         """Live UTC of the FIXED anchor sample (``_first_rtp_timestamp``) per
@@ -663,7 +672,28 @@ class BandRecorder:
         # Close the minute in the ring buffer
         self._ring.close_minute(minute_wallclock, minute_rtp)
 
-        # ── per-period slide-follow harvest (psk SlotWorker pattern) ──────
+        self._harvest_ready_slots()
+        return
+
+    def _harvest_ready_slots(self) -> None:
+        """Emit every clean-UTC period slot whose audio has fully arrived.
+
+        Called from BOTH the minute close and (throttled) the sample write
+        path.  Slot windows are pinned to clean UTC via radiod's live
+        anchor; with a positive anchor offset (dt) a cycle's window ends a
+        fraction of a second AFTER the ring's minute close, so a
+        minute-close-only harvest always misses it and the cycle waits a
+        full minute for the next close — observed on B4 as every WSPR
+        decode/upload running exactly +60 s late (cycle end 17:50:00,
+        WAVs + wsprd at 17:51:00).  Harvesting on the write path emits
+        within ~a second of the slot's true end instead.
+        """
+        anchor_utc_now = self._anchor_utc_now()
+        if anchor_utc_now is None:
+            if self._first_wallclock is None:
+                return
+            anchor_utc_now = self._first_wallclock.timestamp()
+
         # Harvest every clean UTC period-boundary slot whose audio has fully
         # arrived, extracting its window by OFFSET re-pinned to radiod's live
         # mapping (anchor_utc_now).  The slot START is an absolute clean
@@ -827,6 +857,7 @@ class BandRecorder:
         """
         self._initialized = False
         self._synced = False
+        self._last_harvest_off = 0
         self._resync_requested = False
         # Re-adopt the status anchor_epoch baseline on the next boundary so a
         # restart-driven epoch bump doesn't immediately re-trigger a resync.
