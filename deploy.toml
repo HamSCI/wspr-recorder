@@ -154,6 +154,11 @@ parser_attr  = "parse_receiver_channels"
 [[hs_uploader.pipeline]]
 name = "wspr-wsprdaemon"
 batch_limit = 10000
+# Drain-mode budget: without it the daemon ships ONE cycle tar per 30 s
+# pump, and each pump re-runs the (expensive) cycle-discovery query — a
+# backlog can never catch up (observed on B4: 13 days behind at ~1
+# cycle/pump).  ~20k records ≈ 50 cycles per pump amortizes discovery.
+max_records_per_pump = 20000
 [hs_uploader.pipeline.source]
 type = "wspr_cycle"
 db_path = "{sink_path}"
