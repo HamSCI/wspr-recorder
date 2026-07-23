@@ -312,7 +312,13 @@ def _handle_daemon(args) -> None:
     if args.config:
         legacy_argv += ["-c", str(args.config)]
     if getattr(args, "instance", None):
-        legacy_argv += ["--instance", str(args.instance)]
+        # systemd escapes '=' in unit instance names to '\x3d', so with
+        # the %i unit templates a '='-style (reporter-id sentinel)
+        # instance reaches us in escaped form.  Unescape so config
+        # lookup works for both naming styles ('-' names untouched).
+        legacy_argv += [
+            "--instance", str(args.instance).replace("\\x3d", "="),
+        ]
     if getattr(args, "memprofile", False):
         legacy_argv += ["--memprofile"]
     sys.argv = legacy_argv
