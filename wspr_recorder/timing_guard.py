@@ -88,3 +88,81 @@ def dt_guard_step(
     if strikes >= cfg.cycles:
         return 0, True
     return strikes, False
+
+
+# ─── wall-clock slot guard ───────────────────────────────────────────────
+#
+# The dt guard above needs decoded spots to measure dt — in a GROSS anchor
+# fault (minutes off) there are ZERO decodes, so it is blind exactly when
+# the damage is worst.  Observed 2026-07-23 on B4: recorders anchored
+# while radiod was still starting came up ~+10 min ahead; every WAV was
+# labeled 10 min in the future, 0 spots for 20+ min, noise flowing, dt
+# guard silent, and the fleet timing watchdog refused to act ("no peer
+# decoding" — a single-instance host never has a peer).
+#
+# This guard needs no decodes.  Physics: a slot labeled T with period P
+# can only FINISH filling at true wall time >= T+P — samples arrive in
+# real time.  A complete slot harvested well BEFORE its nominal end is
+# impossible unless the RTP→UTC anchor is ahead of true UTC.  (The
+# behind-anchor direction closes slots late, which is indistinguishable
+# from benign decode backlog at this hook — the dt guard owns that side
+# once decodes trickle in.)  System clock is chrony-disciplined (the
+# recorder refuses to start capture until chrony settles), so wall clock
+# is the one ruler the radiod mapping cannot fool.
+
+
+@dataclass
+class WallClockGuardConfig:
+    # A complete slot finishing more than this many seconds before its
+    # nominal end time is physically impossible with a sane anchor.
+    # Write/flush jitter is sub-second; 5 s is far above any of it and
+    # far below any fault worth re-anchoring for.
+    threshold_sec: float = 5.0
+    # Consecutive impossible slots (across bands of one rx) before
+    # firing.  All ~17 bands of a broken rx offend every cycle, so this
+    # trips within one cycle while a lone glitch cannot.
+    strikes: int = 3
+    # Partial slots (shutdown flush, stream-gap harvest) may legitimately
+    # close early — only near-complete slots carry evidence.
+    min_completeness_pct: float = 90.0
+
+    @classmethod
+    def from_env(cls) -> Optional["WallClockGuardConfig"]:
+        """Build from env; returns None when disabled
+        (WSPR_WALLCLOCK_GUARD_SEC=0)."""
+        try:
+            threshold = float(
+                os.environ.get("WSPR_WALLCLOCK_GUARD_SEC", "5.0"))
+        except ValueError:
+            threshold = 5.0
+        if threshold <= 0:
+            return None
+        try:
+            strikes = int(os.environ.get("WSPR_WALLCLOCK_GUARD_STRIKES", "3"))
+        except ValueError:
+            strikes = 3
+        return cls(threshold_sec=threshold, strikes=max(1, strikes))
+
+
+def wallclock_guard_step(
+    strikes: int,
+    early_by_sec: Optional[float],
+    completeness_pct: float,
+    cfg: WallClockGuardConfig,
+) -> Tuple[int, bool]:
+    """One guard step for one harvested slot -> (new_strikes, fire).
+
+    ``early_by_sec`` is (slot_start + period) - now: positive means the
+    slot completed before its nominal end — the impossible direction.
+    Unknown timing or an incomplete slot is inert (no strike, no
+    forgiveness).  A physically plausible slot clears the strikes.
+    Firing resets the count so recovery gets a clean slate.
+    """
+    if early_by_sec is None or completeness_pct < cfg.min_completeness_pct:
+        return strikes, False
+    if early_by_sec <= cfg.threshold_sec:
+        return 0, False
+    strikes += 1
+    if strikes >= cfg.strikes:
+        return 0, True
+    return strikes, False

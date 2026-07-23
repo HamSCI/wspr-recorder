@@ -13,9 +13,10 @@ import logging
 import os
 import signal
 import sys
+import threading
 import time
 import tracemalloc
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -36,7 +37,10 @@ from .decoder import DecoderRunner
 from .callsign_db import CallsignDB
 from .spot_sink import SpotSink, CycleBatcher, resolve_reporter_identity
 from .noise import compute_noise, overload_delta
-from .timing_guard import DtGuardConfig, dt_guard_step
+from .timing_guard import (
+    DtGuardConfig, dt_guard_step,
+    WallClockGuardConfig, wallclock_guard_step,
+)
 from .hs_uploader_shim import WsprUploaderHs
 
 logger = logging.getLogger(__name__)
@@ -181,6 +185,13 @@ class WsprRecorder:
         # (WSPR_DT_GUARD_SEC=0).
         self._dt_guard_cfg = DtGuardConfig.from_env()
         self._dt_guard_strikes: Dict[str, int] = {}
+        # Wall-clock slot guard (timing_guard.py): catches GROSS anchor
+        # faults (minutes off) with zero decodes, where the dt guard is
+        # blind.  Stepped from decode-pool worker threads, hence the
+        # lock.  None = disabled (WSPR_WALLCLOCK_GUARD_SEC=0).
+        self._wallclock_guard_cfg = WallClockGuardConfig.from_env()
+        self._wallclock_guard_strikes: Dict[str, int] = {}
+        self._wallclock_guard_lock = threading.Lock()
         # hs-uploader pumps wspr.spots + wspr.noise → wsprdaemon.org +
         # wsprnet.org from in-process.  v3 Phase A absorbed this from
         # the standalone wd-upload-hs@.service; gated on
@@ -411,6 +422,8 @@ class WsprRecorder:
                         f"materialized ({len(samples)} samples) "
                         f"after host-wide slot acquired"
                     )
+
+                self._wallclock_guard_check(request)
 
                 wav_path = self.wav_writer.write_period(
                     request,
@@ -754,6 +767,51 @@ class WsprRecorder:
             "INVESTIGATE radiod (sample loss / output stalls)",
             rx_source, avg_dt, n_spots, cfg.threshold_sec, cfg.cycles)
         self._reanchor_rx(rx_source)
+
+    def _wallclock_guard_check(self, request: 'DecodeRequest') -> None:
+        """Decode-path hook: wall-clock slot guard (needs no decodes).
+
+        A near-complete slot that finishes before its nominal end time
+        is physically impossible unless the RTP→UTC anchor runs ahead
+        of true UTC (see timing_guard.py for the 2026-07-23 incident).
+        Strikes accumulate per rx across bands; firing re-anchors every
+        band on that rx — the same recovery as the dt guard.  The slot
+        itself still gets written/decoded: it is harmless, and recovery
+        applies from the next harvest on.
+        """
+        cfg = self._wallclock_guard_cfg
+        if cfg is None or request.start_wallclock is None:
+            return
+        n = len(request.samples) if request.samples is not None else 0
+        if n == 0:
+            return
+        gap_samples = sum(g.duration_samples for g in request.gaps)
+        completeness = (n - gap_samples) / n * 100.0
+        nominal_end = request.start_wallclock + timedelta(
+            seconds=request.period_seconds)
+        early_by = (nominal_end - datetime.now(timezone.utc)).total_seconds()
+        with self._wallclock_guard_lock:
+            strikes, fire = wallclock_guard_step(
+                self._wallclock_guard_strikes.get(request.rx_source, 0),
+                early_by, completeness, cfg)
+            self._wallclock_guard_strikes[request.rx_source] = strikes
+        if fire:
+            logger.error(
+                "TIMING FAULT rx=%s mode=wspr: slot %s (%ds, %.0f%% "
+                "complete) finished %.1fs BEFORE its nominal end — "
+                "physically impossible unless the RTP→UTC anchor runs "
+                "ahead of true UTC (anchor grabbed during radiod "
+                "startup?); re-anchoring EVERY band on this rx off fresh "
+                "channel_info; INVESTIGATE radiod restart/startup timing",
+                request.rx_source, request.start_wallclock,
+                request.period_seconds, completeness, early_by)
+            self._reanchor_rx(request.rx_source)
+        elif strikes:
+            logger.warning(
+                "wallclock-guard rx=%s: slot %s (%.0f%% complete) "
+                "finished %.1fs before its nominal end [strike %d/%d]",
+                request.rx_source, request.start_wallclock, completeness,
+                early_by, strikes, cfg.strikes)
 
     def _reanchor_rx(self, rx_source: str) -> None:
         """Reset + rebind every band recorder of ``rx_source`` against its
