@@ -36,6 +36,13 @@ EnvironmentFile=-/etc/wspr-recorder/env/%I.env
 # MALLOC_ARENA_MAX=2 eliminates the fragmentation at negligible
 # allocator-contention cost for this workload.
 Environment=MALLOC_ARENA_MAX=2
+# Cap concurrent long (F15/F30) decodes.  The default (half the workers)
+# let a 6-wide jt9 wall land at :00/:30, starving the RX888 USB IRQ path
+# and dropping sample blocks on ALL channels (hf-timestd
+# docs/T6-BLOCK-SLIP-ROOT-CAUSE-2026-08-10.md).  Long-mode results are
+# not latency-critical; the wave queues into the idle inter-cycle
+# valleys instead.  Override per-host with a drop-in if needed.
+Environment=WSPR_DECODE_LONG_SLOTS=2
 
 WorkingDirectory=/opt/git/sigmond/wspr-recorder
 
