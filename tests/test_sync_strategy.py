@@ -289,7 +289,7 @@ class TestRtpSyncStrategyChannelInfo:
         )
         strategy.set_channel_info(_FakeChannelInfo())
         ref_epoch = utc(second=58).timestamp()
-        with mock.patch("ka9q.rtp_to_wallclock", return_value=ref_epoch) as m:
+        with mock.patch("ka9q.rtp_to_utc", return_value=ref_epoch) as m:
             strategy.should_start_minute(100_000, 240, utc(second=58))
         assert strategy.correlation_source == "rtp_to_wallclock+authority"
         assert strategy.correlation_offset_ns == 4_250
@@ -301,7 +301,7 @@ class TestRtpSyncStrategyChannelInfo:
         strategy = RtpSyncStrategy(SAMPLE_RATE, authority_reader=_FakeReader(None))
         strategy.set_channel_info(_FakeChannelInfo())
         ref_epoch = utc(second=58).timestamp()
-        with mock.patch("ka9q.rtp_to_wallclock", return_value=ref_epoch):
+        with mock.patch("ka9q.rtp_to_utc", return_value=ref_epoch):
             strategy.should_start_minute(100_000, 240, utc(second=58))
         assert strategy.correlation_source == "rtp_to_wallclock"
         assert strategy.correlation_offset_ns is None
@@ -312,7 +312,7 @@ class TestRtpSyncStrategyChannelInfo:
             authority_reader=_FakeReader(_FakeSnap(offset_usable=True, offset_ns=500)),
         )
         strategy.set_channel_info(_FakeChannelInfo())
-        with mock.patch("ka9q.rtp_to_wallclock", return_value=None):
+        with mock.patch("ka9q.rtp_to_utc", return_value=None):
             strategy.should_start_minute(100_000, 240, utc(second=58))
         # rtp_to_wallclock unavailable → priority-2 authority path.
         assert strategy.correlation_source == "authority"

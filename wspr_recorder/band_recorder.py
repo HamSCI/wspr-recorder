@@ -454,7 +454,7 @@ class BandRecorder:
         re-pinning the decode window's offset to it makes the audio track the
         slide smoothly — no frozen-grid drift, no reset/re-correlate storm.
         Falls back to the frozen anchor wallclock when there is no
-        ``channel_info`` / ``rtp_to_wallclock`` returns None, so standalone and
+        ``channel_info`` / ``rtp_to_utc`` returns None, so standalone and
         pre-correlation behave exactly as before.
         """
         if self._first_rtp_timestamp is None or self._first_wallclock is None:
@@ -464,13 +464,13 @@ class BandRecorder:
         if ci is None:
             return frozen
         try:
-            from ka9q import rtp_to_wallclock
-            cur = rtp_to_wallclock(
+            from ka9q import rtp_to_utc
+            cur = rtp_to_utc(
                 self._first_rtp_timestamp & 0xFFFFFFFF, ci,
                 wallclock_hint_sec=frozen,
             )
         except Exception as e:  # noqa: BLE001 — slide-follow must not crash
-            logger.debug("%s: anchor rtp_to_wallclock raised: %s",
+            logger.debug("%s: anchor rtp_to_utc raised: %s",
                          self.band_name, e)
             return frozen
         if cur is None:
@@ -519,7 +519,7 @@ class BandRecorder:
 
         # ── Absolute-divergence check (catches a CONSTANT bad anchor) ──
         # Compare the grid projection against radiod's fresh GPS reference for
-        # this boundary's RTP value.  rtp_to_wallclock reads the
+        # this boundary's RTP value.  rtp_to_utc reads the
         # StatusListener-refreshed channel_info, so this is RTP-referenced
         # (not wall-clock-now) and immune to the constant-offset blind spot of
         # the deviation check below.  Sustained gross divergence ⇒ a frozen
@@ -529,8 +529,8 @@ class BandRecorder:
         if self._synced and ci is not None:
             ref_sec = None
             try:
-                from ka9q import rtp_to_wallclock
-                ref_sec = rtp_to_wallclock(
+                from ka9q import rtp_to_utc
+                ref_sec = rtp_to_utc(
                     minute_rtp, ci,
                     wallclock_hint_sec=minute_wallclock.timestamp(),
                 )

@@ -249,9 +249,9 @@ class RtpSyncStrategy(SyncStrategy):
         # Priority 1: RTP-derived UTC via ka9q rtp_to_wallclock.
         if self._channel_info is not None:
             try:
-                from ka9q import rtp_to_wallclock
+                from ka9q import rtp_to_utc
                 import time as _time
-                utc_sec = rtp_to_wallclock(
+                utc_sec = rtp_to_utc(
                     rtp_timestamp & 0xFFFFFFFF,
                     self._channel_info,
                     wallclock_hint_sec=_time.time() + offset_sec,
@@ -260,13 +260,15 @@ class RtpSyncStrategy(SyncStrategy):
                     utc = datetime.fromtimestamp(
                         utc_sec + offset_sec, tz=timezone.utc,
                     )
+                    # Label strings predate the ka9q rename (rtp_to_wallclock
+                    # -> rtp_to_utc); kept stable for status/journal consumers.
                     source = (
                         "rtp_to_wallclock+authority" if usable
                         else "rtp_to_wallclock"
                     )
                     return utc, source, offset_ns
             except Exception as e:
-                logger.warning("rtp_to_wallclock raised at correlation: %s", e)
+                logger.warning("rtp_to_utc raised at correlation: %s", e)
 
         # Priority 2: authority offset on the client wall clock (legacy).
         if usable:

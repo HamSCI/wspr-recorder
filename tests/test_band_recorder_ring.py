@@ -472,9 +472,9 @@ class TestSlideFollow:
 
         # radiod's mapping: linear in RTP, shifted by a constant slide.  The
         # anchor (rtp 0) reads as frozen_ts + slide; rtp advances 1/rate s.
-        def fake_rtp_to_wallclock(rtp, ci, wallclock_hint_sec=None):
+        def fake_rtp_to_utc(rtp, ci, wallclock_hint_sec=None):
             return frozen_ts + slide_sec + (int(rtp) & 0xFFFFFFFF) / rate
-        monkeypatch.setattr(ka9q, "rtp_to_wallclock", fake_rtp_to_wallclock)
+        monkeypatch.setattr(ka9q, "rtp_to_utc", fake_rtp_to_utc)
 
         results = []
         rec = BandRecorder(
@@ -522,7 +522,7 @@ class TestSlideFollow:
 
         def fake(rtp, ci, wallclock_hint_sec=None):
             return frozen_ts + OFFSET + (int(rtp) & 0xFFFFFFFF) / rate
-        monkeypatch.setattr(ka9q, "rtp_to_wallclock", fake)
+        monkeypatch.setattr(ka9q, "rtp_to_utc", fake)
 
         results = []
         rec = BandRecorder(
