@@ -93,9 +93,14 @@ Nice=5
 # simultaneous slice copies when all cadences fire at :00/:30
 # (~450 MB transient), the wsprd/jt9 child decoders, AND the tmpfs
 # WAV pages under /dev/shm/wspr-recorder. 1G OOM-killed such a config
-# ~30x/day exactly on the F15/F30 ticks (sigma, 2026-06). 2G covers
-# the worst-case tick with headroom while still backstopping a leak.
-MemoryMax=2G
+# ~30x/day exactly on the F15/F30 ticks (sigma, 2026-06). 2G was then
+# raised to cover that worst-case tick, but B4's 2026-08-15/16 27.9h
+# capacity evaluation caught it OOM-killing again at a peak RSS of
+# ~1828 MB against the 2G cap (host MemAvailable never dropped below
+# 3275 MB across the run — not host exhaustion, just a tight per-unit
+# cap). 4G matches the value the wspr-uploader leak fix converged on
+# fleet-wide and gives ~2.2x headroom over the observed peak.
+MemoryMax=4G
 MemorySwapMax=0
 
 NoNewPrivileges=true

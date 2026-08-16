@@ -146,7 +146,7 @@ is restarted rather than silently stalling. `sd_notify` is a
 dependency-free stdlib `AF_UNIX` `SOCK_DGRAM` send and a no-op when
 `NOTIFY_SOCKET` is unset, so the same binary runs standalone. Logs go
 to the journal (`StandardOutput=journal`). Memory is capped at
-`MemoryMax=1G` with `MALLOC_ARENA_MAX=2` to suppress glibc arena
+`MemoryMax=4G` with `MALLOC_ARENA_MAX=2` to suppress glibc arena
 fragmentation from F15/F30 slice allocations (see unit comment).
 `ProtectSystem=strict` with `ReadWritePaths` covering the tmpfs
 spool, `/run`, the log dir, and — for full-pipeline mode — the SQLite

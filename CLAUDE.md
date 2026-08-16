@@ -226,7 +226,7 @@ The feature flags and identity inputs come from the unit's `EnvironmentFile`s (`
 
 ### Systemd unit (`systemd/wspr-recorder@.service`)
 
-`Type=notify`, `WatchdogSec=180`, `TimeoutStartSec=180`, `Restart=always` (`RestartSec=5`), `MemoryMax=1G`. `StandardOutput=journal` — the process log goes to the systemd journal (`journalctl -u wspr-recorder@%i`), not a file. `ProtectSystem=strict` with `ReadWritePaths` covering `/dev/shm/wspr-recorder`, `/var/log/wspr-recorder`, `/run/wspr-recorder`, `/var/lib/sigmond` (the SQLite sink), and `/var/lib/hs-uploader` (the uploader watermark store). The canonical unit is installed by `install.sh` (symlink) and by `deploy.toml`.
+`Type=notify`, `WatchdogSec=180`, `TimeoutStartSec=180`, `Restart=always` (`RestartSec=5`), `MemoryMax=4G`. `StandardOutput=journal` — the process log goes to the systemd journal (`journalctl -u wspr-recorder@%i`), not a file. `ProtectSystem=strict` with `ReadWritePaths` covering `/dev/shm/wspr-recorder`, `/var/log/wspr-recorder`, `/run/wspr-recorder`, `/var/lib/sigmond` (the SQLite sink), and `/var/lib/hs-uploader` (the uploader watermark store). The canonical unit is installed by `install.sh` (symlink) and by `deploy.toml`.
 
 ### Band Configuration (v4 format)
 

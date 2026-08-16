@@ -266,7 +266,7 @@ audit consumers (`smd verifier`, `smd watch wspr`).
   WAV SHALL preserve weak-signal dynamic range (no fixed `×32767` SNR loss),
   with the scale recorded for amplitude reconstruction.
 - `WSP-Q-006` `[DOC]` ✅ Memory SHALL be bounded: per-band ring sizing
-  (`WSP-C-006`), `MemoryMax=1G`, `MALLOC_ARENA_MAX=2` against F15/F30
+  (`WSP-C-006`), `MemoryMax=4G`, `MALLOC_ARENA_MAX=2` against F15/F30
   allocate/free fragmentation; `WD_MEMPROFILE`/`_malloc_trim` available.
 - `WSP-Q-007` `[CODE]` ✅ The decoder SHALL run off radiod's CPU cores (sigmond
   `AFFINITY_UNITS` drop-in) so burst decode can't induce RX888 USB drops.

@@ -16,7 +16,7 @@ sudo systemctl restart 'wspr-recorder@*'
 ```
 
 The canonical unit ([systemd/wspr-recorder@.service](../systemd/wspr-recorder@.service))
-is `Type=notify` with `WatchdogSec=180`, `MemoryMax=1G`, and
+is `Type=notify` with `WatchdogSec=180`, `MemoryMax=4G`, and
 `MALLOC_ARENA_MAX=2`. Restarts always with `RestartSec=5`. `install.sh`
 installs this unit by symlink; pre-contract installs that left behind
 a non-templated `/etc/systemd/system/wspr-recorder.service` are

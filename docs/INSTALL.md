@@ -103,7 +103,7 @@ The script is idempotent (re-running upgrades in place, including
    `Type=notify` with `WatchdogSec=180` / `TimeoutStartSec=180`
    (the daemon sends `sd_notify` `READY=1` once channels are
    provisioned, then pings the watchdog), `StandardOutput=journal`,
-   `MemoryMax=1G`, `MALLOC_ARENA_MAX=2`, and
+   `MemoryMax=4G`, `MALLOC_ARENA_MAX=2`, and
    `EnvironmentFile=-/etc/sigmond/coordination.env`. `ProtectSystem=strict`
    with `ReadWritePaths` covering `/dev/shm/wspr-recorder`,
    `/var/log/wspr-recorder`, `/run/wspr-recorder`, `/var/lib/sigmond`
