@@ -174,7 +174,7 @@ The +120 s headroom above the longest period exists so that the W2 cycle that st
 - **sd_notify without a dependency**: The unit is `Type=notify` with `WatchdogSec`. `_sd_notify()` sends `READY=1` / `WATCHDOG=1` datagrams over the `NOTIFY_SOCKET` `AF_UNIX` socket using only stdlib — no `sdnotify`/`systemd` package. Until `READY=1` the unit sits in `activating` and systemd would time it out at `TimeoutStartSec` (180 s); the watchdog ping at `WATCHDOG_USEC/2` lets systemd restart a wedged daemon. Both calls no-op when the env vars are absent, so standalone runs are unaffected. This is the same pattern psk-recorder / hfdl-recorder use. (Before this was implemented, the daemon never notified and systemd crash-looped it.)
 - **Restart-on-stream-restore**: After a real radiod outage, an in-place `BandRecorder` reset leaves ring-buffer minute alignment off by an unknowable offset and wsprd decodes zero spots. `on_stream_restored` instead `os._exit(75)`s so systemd's `Restart=always` brings the process back for a clean re-sync on the next minute boundary.
 
-## Client contract (v0.7)
+## Client contract (v0.8)
 
 wspr-recorder implements the HamSCI client contract at version 0.8
 (authoritative source: `/opt/git/sigmond/sigmond/docs/CLIENT-CONTRACT.md`).
