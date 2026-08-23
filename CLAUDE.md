@@ -313,7 +313,7 @@ operational sigmond client covering record → decode → sink → upload.
 
 Net effect: with both feature flags set, one `wspr-recorder@<id>.service`
 supersedes `wsprdaemon-client`'s WSPR record + decode + upload role.
-See [docs/PHASE-2-COORDINATION.md](docs/PHASE-2-COORDINATION.md) for the
+See [docs/archive/PHASE-2-COORDINATION.md](docs/archive/PHASE-2-COORDINATION.md) for the
 decision record behind the DB-direct decode work.
 
 ### 2026-04-12: Replace custom RTP ingest with ka9q-python MultiStream

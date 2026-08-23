@@ -88,7 +88,7 @@ pytest tests/
 - [docs/OPERATIONS.md](docs/OPERATIONS.md) — running it: logs, `wspr-ctl`, common failures
 - [docs/ARCHITECTURE.md](docs/ARCHITECTURE.md) — internals for contributors
 - [docs/SIGMOND-CONTRACT.md](docs/SIGMOND-CONTRACT.md) — how wspr-recorder satisfies contract v0.8
-- [docs/PHASE-2-COORDINATION.md](docs/PHASE-2-COORDINATION.md) — historical: the DB-direct decode decision record
+- [docs/archive/PHASE-2-COORDINATION.md](docs/archive/PHASE-2-COORDINATION.md) — historical: the DB-direct decode decision record
 - [CLAUDE.md](CLAUDE.md) — development briefing
 
 ## What it does
