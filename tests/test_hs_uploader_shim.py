@@ -164,6 +164,13 @@ class TestPipelineWiring(unittest.TestCase):
 
     def setUp(self):
         self.tmp = tempfile.mkdtemp()
+        # The shim constructs hs_uploader's watermark store, whose
+        # default_path() falls back to /var/lib/hs-uploader.  Unset, these
+        # tests reach for that real system path: they pass on a station,
+        # where it exists, and fail everywhere else -- passing for a reason
+        # unrelated to the pipeline wiring they exist to check.
+        self._prev_state_dir = os.environ.get("HS_UPLOADER_STATE_DIR")
+        os.environ["HS_UPLOADER_STATE_DIR"] = self.tmp
         self.sink = Path(self.tmp) / "sink.db"
         # Materialise an empty pending_uploads schema so SqliteSource's
         # _ensure_ready() finds it.
@@ -184,6 +191,10 @@ class TestPipelineWiring(unittest.TestCase):
 
     def tearDown(self):
         import shutil
+        if self._prev_state_dir is None:
+            os.environ.pop("HS_UPLOADER_STATE_DIR", None)
+        else:
+            os.environ["HS_UPLOADER_STATE_DIR"] = self._prev_state_dir
         shutil.rmtree(self.tmp, ignore_errors=True)
 
     def _start(self, **overrides):
