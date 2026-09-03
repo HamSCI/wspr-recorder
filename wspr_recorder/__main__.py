@@ -38,9 +38,10 @@ from .callsign_db import CallsignDB
 from .spot_sink import SpotSink, CycleBatcher, resolve_reporter_identity
 from .noise import compute_noise, overload_delta
 from .timing_guard import (
-    DtGuardConfig, dt_guard_step,
+    DtGuardConfig, dt_guard_evidence, dt_guard_step,
     WallClockGuardConfig, wallclock_guard_step,
 )
+from ka9q.recovery_ladder import RecoveryAction, RecoveryLadder
 from .hs_uploader_shim import WsprUploaderHs
 
 logger = logging.getLogger(__name__)
@@ -185,6 +186,9 @@ class WsprRecorder:
         # (WSPR_DT_GUARD_SEC=0).
         self._dt_guard_cfg = DtGuardConfig.from_env()
         self._dt_guard_strikes: Dict[str, int] = {}
+        #: One RecoveryLadder per rx, so a fault on one receiver never
+        #: escalates another.  Created lazily in _dt_guard_observe.
+        self._dt_guard_ladders: Dict[str, RecoveryLadder] = {}
         # Wall-clock slot guard (timing_guard.py): catches GROSS anchor
         # faults (minutes off) with zero decodes, where the dt guard is
         # blind.  Stepped from decode-pool worker threads, hence the
@@ -751,6 +755,13 @@ class WsprRecorder:
         strikes, fire = dt_guard_step(
             self._dt_guard_strikes.get(rx_source, 0), avg_dt, n_spots, cfg)
         self._dt_guard_strikes[rx_source] = strikes
+
+        # Record this cycle against the ladder BEFORE the non-firing return: a
+        # clean cycle is what forecloses an escalation, so it has to be seen
+        # even though it asks for nothing.
+        action = self._dt_guard_observe(rx_source, avg_dt, n_spots, cfg,
+                                        fired=fire)
+
         if not fire:
             if strikes:
                 logger.warning(
@@ -766,7 +777,64 @@ class WsprRecorder:
             "re-anchoring EVERY band on this rx off fresh channel_info; "
             "INVESTIGATE radiod (sample loss / output stalls)",
             rx_source, avg_dt, n_spots, cfg.threshold_sec, cfg.cycles)
+
+        if action is RecoveryAction.RESTART_SELF:
+            # ⛔ AC0G-ND, 2026-09-03.  Re-anchoring is the deepest repair this
+            # process has, and it had already failed: reset all 17 band
+            # recorders, re-seed each from fresh channel_info, fault again two
+            # cycles later, for as long as the fault lasted.  A poisoned
+            # anchor lives in process memory, so only a new process clears it
+            # — and a human had to notice, because every liveness check stayed
+            # green while the recorder completed 120 s slots at "100%
+            # complete" and decoded nothing.
+            ladder = self._dt_guard_ladders.get(rx_source)
+            logger.critical(
+                "TIMING FAULT rx=%s: re-anchoring has NOT cleared this fault "
+                "(%d consecutive faulted cycles); the slot anchor is held in "
+                "this process and only a restart clears it. Exiting so "
+                "systemd (Restart=always) replaces us. Spots resume within a "
+                "cycle or two of the new process settling.",
+                rx_source, getattr(ladder, "consecutive_degraded", 0))
+            self._request_self_restart()
+            return
+
         self._reanchor_rx(rx_source)
+
+    def _dt_guard_observe(self, rx_source: str, avg_dt, n_spots: int,
+                          cfg, *, fired: bool):
+        """Record this cycle against the rx's RecoveryLadder.
+
+        The POLICY — when to re-anchor, and when to stop believing that
+        re-anchoring will help — lives in ka9q-python, because recovering the
+        client<->radiod relationship is a property of that interface.  This
+        method supplies the evidence and carries out the verdict, which is the
+        split ka9q.recovery_ladder's own contract asks for.
+        """
+        evidence = dt_guard_evidence(avg_dt, n_spots, cfg, fired=fired)
+        if evidence is None:
+            return None          # no evidence: neither advance nor clear
+        ladder = self._dt_guard_ladders.get(rx_source)
+        if ladder is None:
+            # One re-anchor attempt, then replace the process.  Re-anchoring
+            # is the ONLY in-process remedy, so a second consecutive faulted
+            # cycle is proof it did not work rather than a reason to repeat it.
+            # Re-anchoring is the ONLY in-process remedy here, so this
+            # ladder has two rungs, not three: re-anchor once, and treat a
+            # second consecutive faulted cycle as proof it did not work
+            # rather than a reason to repeat it.  FULL_RESET is deliberately
+            # unreachable — there is no deeper repair for the client to do.
+            ladder = RecoveryLadder(reprovision_after=1, full_reset_after=2,
+                                    restart_after=2)
+            self._dt_guard_ladders[rx_source] = ladder
+        return ladder.observe(healthy=evidence)
+
+    def _request_self_restart(self) -> None:
+        """Ask the supervisor to replace this process.
+
+        Its own method so a test can observe the request without exiting the
+        test runner, and so the exit stays in one auditable place.
+        """
+        raise SystemExit(1)
 
     def _wallclock_guard_check(self, request: 'DecodeRequest') -> None:
         """Decode-path hook: wall-clock slot guard (needs no decodes).

@@ -66,6 +66,41 @@ class DtGuardConfig:
                    cycles=max(1, cycles))
 
 
+def dt_guard_evidence(
+    avg_dt: Optional[float],
+    n_spots: int,
+    cfg: "DtGuardConfig",
+    *,
+    fired: bool,
+) -> Optional[bool]:
+    """This cycle's evidence for a RecoveryLadder: True / False / None.
+
+    ``True`` healthy, ``False`` faulted, ``None`` no evidence — the SAME
+    three-way distinction ``dt_guard_step`` already makes, and the reason the
+    ladder needs its own reading of the cycle rather than ``not fire``.
+
+    ⛔ AC0G-ND, 2026-09-03.  During a persistent fault the guard fires on
+    every SECOND cycle: it needs ``cfg.cycles`` consecutive offending cycles,
+    then resets the count for a clean slate.  So the cycles in between are
+    offending but silent.  Reading them as healthy would clear the ladder each
+    time and escalation could never arrive — the recorder would re-anchor,
+    fault, re-anchor, fault for as long as the fault lasted, which is exactly
+    what it did that night.
+
+    A strike that has not yet fired is therefore NOT healthy; it is simply not
+    yet proof.  Only a cycle with a real population and |dt| inside the
+    threshold clears the ladder, for the same reason the guard itself gives:
+    "a genuine fault should not be forgiven by a quiet band-minute".
+    """
+    if fired:
+        return False
+    if avg_dt is None or n_spots < cfg.min_spots:
+        return None
+    if abs(avg_dt) <= cfg.threshold_sec:
+        return True
+    return None
+
+
 def dt_guard_step(
     strikes: int,
     avg_dt: Optional[float],

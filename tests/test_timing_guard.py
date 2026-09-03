@@ -120,3 +120,97 @@ def test_wallclock_env_disable():
         assert WallClockGuardConfig.from_env() is None
     finally:
         del os.environ["WSPR_WALLCLOCK_GUARD_SEC"]
+
+
+# --- evidence for the RecoveryLadder ------------------------------------
+#
+# ⛔ AC0G-ND, 2026-09-03.  The dt-guard caught a slot anchor eight minutes off
+# true UTC, re-anchored all 17 bands, faulted again two cycles later,
+# re-anchored, faulted — and would have continued all night.  It counts
+# STRIKES toward firing and never counts FIRES, so nothing could conclude that
+# re-anchoring was not working.  Every liveness check stayed green throughout:
+# the recorder completed 120 s slots at "100% complete" and decoded nothing.
+#
+# Escalating needs a per-cycle verdict, and `not fire` is the wrong one:
+# during a persistent fault the guard fires on every SECOND cycle (it needs
+# `cycles` consecutive offenders, then resets for a clean slate), so the
+# in-between cycles are offending but silent.  Reading those as healthy would
+# clear the ladder every time and the escalation could never arrive.
+
+from wspr_recorder.timing_guard import dt_guard_evidence  # noqa: E402
+
+
+def _cfg(threshold=1.0, cycles=2, min_spots=3):
+    return DtGuardConfig(threshold_sec=threshold, cycles=cycles,
+                         min_spots=min_spots)
+
+
+def test_a_fired_cycle_is_a_fault():
+    assert dt_guard_evidence(+8.0, 10, _cfg(), fired=True) is False
+
+
+def test_a_clean_cycle_with_a_real_population_is_healthy():
+    assert dt_guard_evidence(+0.2, 10, _cfg(), fired=False) is True
+
+
+def test_a_quiet_band_minute_carries_no_evidence():
+    # The guard's own rule: "a genuine fault should not be forgiven by a
+    # quiet band-minute."  The ladder must not be cleared by one either.
+    assert dt_guard_evidence(+0.2, 1, _cfg(), fired=False) is None
+    assert dt_guard_evidence(None, 10, _cfg(), fired=False) is None
+
+
+def test_an_unfired_STRIKE_is_not_healthy():
+    # ⛔ THE case that makes escalation possible.  This cycle is offending
+    # (dt beyond threshold) but has not yet fired.  Calling it healthy would
+    # reset the ladder on every second cycle of a persistent fault.
+    assert dt_guard_evidence(+8.0, 10, _cfg(), fired=False) is None
+
+
+def test_a_persistent_fault_reaches_the_restart():
+    """End to end over the guard's real firing pattern.
+
+    Two offending cycles fire, the count resets, two more fire again — so the
+    ladder sees fault, (nothing), fault and reaches its second rung.  With
+    120 s WSPR cycles that is roughly eight minutes to self-repair, against
+    never before.
+    """
+    from ka9q.recovery_ladder import RecoveryAction, RecoveryLadder
+
+    cfg = _cfg()
+    ladder = RecoveryLadder(reprovision_after=1, full_reset_after=2,
+                            restart_after=2)
+    strikes = 0
+    actions = []
+    for _ in range(4):                      # four consecutive offending cycles
+        strikes, fire = dt_guard_step(strikes, +8.0, 10, cfg)
+        ev = dt_guard_evidence(+8.0, 10, cfg, fired=fire)
+        actions.append(None if ev is None else ladder.observe(healthy=ev))
+
+    assert actions == [None,
+                       RecoveryAction.REPROVISION,
+                       None,
+                       RecoveryAction.RESTART_SELF], actions
+
+
+def test_recovery_before_the_second_fire_forecloses_the_restart():
+    # ⛔ Safety.  Re-anchoring that WORKS must not be followed by a restart:
+    # killing a recovered recorder is worse than the fault it answered.
+    from ka9q.recovery_ladder import RecoveryAction, RecoveryLadder
+
+    cfg = _cfg()
+    ladder = RecoveryLadder(reprovision_after=1, full_reset_after=2,
+                            restart_after=2)
+    strikes = 0
+    for dt in (+8.0, +8.0):                 # fires on the second
+        strikes, fire = dt_guard_step(strikes, dt, 10, cfg)
+        ev = dt_guard_evidence(dt, 10, cfg, fired=fire)
+        if ev is not None:
+            act = ladder.observe(healthy=ev)
+    assert act is RecoveryAction.REPROVISION
+
+    # the re-anchor worked: a clean cycle clears everything
+    strikes, fire = dt_guard_step(strikes, +0.1, 10, cfg)
+    ev = dt_guard_evidence(+0.1, 10, cfg, fired=fire)
+    assert ladder.observe(healthy=ev) is RecoveryAction.NONE
+    assert ladder.consecutive_degraded == 0
