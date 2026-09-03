@@ -174,14 +174,27 @@ install_application() {
     # wspr-recorder editable into the venv, and pins exactly what's in
     # uv.lock.  --no-dev skips dev extras; --frozen requires uv.lock to
     # be current (regenerate locally with `uv lock` if siblings or deps
-    # have shifted).  --upgrade is the equivalent of the old pip
-    # --force-reinstall (re-evaluate every dep against the lock).
+    # have shifted).
+    #
+    # ⛔ The upgrade path used to pass --upgrade, described here as "the
+    # equivalent of the old pip --force-reinstall".  It is not: --upgrade
+    # RE-RESOLVES and REWRITES uv.lock in the checkout (uv 0.11.9 split the
+    # py3.11/3.12 markers, added numpy 2.5.0 and bumped pytest).  The dirty
+    # lock then aborted the next `git pull --ff-only` and made
+    # `smd component update` skip the pull with "uncommitted changes:
+    # uv.lock" — so a host silently stopped tracking main, and the only
+    # visible symptom was a component that never updated again.  Filed as
+    # HamSCI/wspr-recorder#5 on 2026-07-02, worked around by hand on B4 and
+    # again on AC0G-ND 2026-09-03 before being fixed here.
+    #
+    # --reinstall is uv's actual force-reinstall: it rebuilds every package
+    # in the venv while the LOCK stays authoritative and untouched, which is
+    # what the upgrade path wanted all along.  psk-recorder always used
+    # --frozen and was never affected.
     info "Syncing wspr-recorder + siblings (callhash, hs-uploader, ka9q-python) into $INSTALL_DIR/venv"
-    local sync_args=(--project "$SCRIPT_DIR" --no-dev --quiet)
+    local sync_args=(--project "$SCRIPT_DIR" --no-dev --quiet --frozen)
     if [[ "$IS_UPGRADE" == true ]]; then
-        sync_args+=(--upgrade)
-    else
-        sync_args+=(--frozen)
+        sync_args+=(--reinstall)
     fi
     UV_PROJECT_ENVIRONMENT="$INSTALL_DIR/venv" uv sync "${sync_args[@]}"
 
