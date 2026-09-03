@@ -179,6 +179,44 @@ class WallClockGuardConfig:
         return cls(threshold_sec=threshold, strikes=max(1, strikes))
 
 
+def wallclock_guard_evidence(
+    early_by_sec: Optional[float],
+    completeness_pct: float,
+    cfg: "WallClockGuardConfig",
+    *,
+    fired: bool,
+) -> Optional[bool]:
+    """This slot's evidence for a RecoveryLadder: True / False / None.
+
+    Same three-way split as ``wallclock_guard_step``: fired = fault, a
+    physically plausible slot = healthy, and anything inert — unknown timing,
+    or a partial slot that may legitimately close early — carries no evidence.
+    An accumulated strike that has not yet fired is not healthy either; it is
+    simply not yet proof.
+
+    ⛔ AC0G-ND, 2026-09-03.  This guard is the one that works when the dt
+    guard cannot.  A runaway anchor kills every decode, so `dt= ----` and the
+    dt guard sees no samples at all — it goes blind exactly when it is needed.
+    The wall-clock guard needs no decodes, and it fired every cycle for six
+    hours while re-anchoring and never escalating, the slot labels running
+    further ahead each time:
+
+        slot 15:56:00 finished 21858.5s BEFORE its nominal end
+        slot 15:58:00 finished 21915.9s BEFORE its nominal end
+        slot 16:00:00 finished 21972.1s BEFORE its nominal end
+
+    So this guard needs the ladder more than the dt guard does, and the first
+    wiring of it reached only the dt guard.
+    """
+    if fired:
+        return False
+    if early_by_sec is None or completeness_pct < cfg.min_completeness_pct:
+        return None
+    if early_by_sec <= cfg.threshold_sec:
+        return True
+    return None
+
+
 def wallclock_guard_step(
     strikes: int,
     early_by_sec: Optional[float],

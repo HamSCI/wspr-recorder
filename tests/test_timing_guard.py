@@ -214,3 +214,117 @@ def test_recovery_before_the_second_fire_forecloses_the_restart():
     ev = dt_guard_evidence(+0.1, 10, cfg, fired=fire)
     assert ladder.observe(healthy=ev) is RecoveryAction.NONE
     assert ladder.consecutive_degraded == 0
+
+
+# --- the wall-clock guard needs the ladder MORE than the dt guard ---------
+#
+# ⛔ AC0G-ND, 2026-09-03.  The first ladder wiring reached only the dt guard,
+# and the fault that followed proved that was the wrong guard: a runaway
+# anchor destroys every decode, so `dt= ----`, the dt guard has no samples to
+# judge, and it goes blind exactly when it is needed.  The wall-clock guard
+# needs no decodes.  It fired every cycle for SIX HOURS, re-anchoring each
+# time and never escalating, while the slot labels ran further ahead:
+#
+#     slot 15:56:00 finished 21858.5s BEFORE its nominal end
+#     slot 15:58:00 finished 21915.9s BEFORE its nominal end
+#     slot 16:00:00 finished 21972.1s BEFORE its nominal end
+
+from wspr_recorder.timing_guard import (  # noqa: E402
+    WallClockGuardConfig, wallclock_guard_evidence, wallclock_guard_step,
+)
+
+
+def _wcfg(threshold=5.0, strikes=3, min_completeness=90.0):
+    return WallClockGuardConfig(threshold_sec=threshold, strikes=strikes,
+                                min_completeness_pct=min_completeness)
+
+
+def test_a_fired_slot_is_a_fault():
+    assert wallclock_guard_evidence(21858.5, 100.0, _wcfg(), fired=True) is False
+
+
+def test_a_physically_plausible_slot_is_healthy():
+    # Completed at or after its nominal end — the only sane direction.
+    assert wallclock_guard_evidence(-0.4, 100.0, _wcfg(), fired=False) is True
+
+
+def test_a_partial_slot_carries_no_evidence():
+    # A shutdown flush or gap harvest may legitimately close early; the
+    # guard's own rule is "no strike, no forgiveness".
+    assert wallclock_guard_evidence(900.0, 40.0, _wcfg(), fired=False) is None
+
+
+def test_unknown_timing_carries_no_evidence():
+    assert wallclock_guard_evidence(None, 100.0, _wcfg(), fired=False) is None
+
+
+def test_an_unfired_strike_is_not_healthy():
+    # Offending but not yet proof — must neither advance nor clear.
+    assert wallclock_guard_evidence(900.0, 100.0, _wcfg(), fired=False) is None
+
+
+def test_six_hours_of_re_anchoring_would_now_escalate():
+    """The live sequence, judged once per slot as the recorder does.
+
+    Three offending near-complete slots fire the guard (strikes=3). Judged one
+    slot at a time, the second fire reaches RESTART_SELF — so the recorder
+    replaces itself after roughly two cycles instead of re-anchoring for six
+    hours.
+    """
+    from ka9q.recovery_ladder import RecoveryAction, RecoveryLadder
+
+    cfg = _wcfg()
+    ladder = RecoveryLadder(reprovision_after=1, full_reset_after=2,
+                            restart_after=2)
+    strikes = 0
+    judged = []
+    early = 21858.5
+    for _ in range(6):                       # six offending slots
+        strikes, fire = wallclock_guard_step(strikes, early, 100.0, cfg)
+        ev = wallclock_guard_evidence(early, 100.0, cfg, fired=fire)
+        if ev is not None:
+            judged.append(ladder.observe(healthy=ev))
+        early += 56.1                        # the measured growth per slot
+
+    assert judged == [RecoveryAction.REPROVISION,
+                      RecoveryAction.RESTART_SELF], judged
+
+
+def test_a_recovered_anchor_forecloses_the_restart():
+    # ⛔ Safety: re-anchoring that WORKS must not be followed by a restart.
+    from ka9q.recovery_ladder import RecoveryAction, RecoveryLadder
+
+    cfg = _wcfg()
+    ladder = RecoveryLadder(reprovision_after=1, full_reset_after=2,
+                            restart_after=2)
+    strikes = 0
+    for _ in range(3):                       # fires on the third
+        strikes, fire = wallclock_guard_step(strikes, 900.0, 100.0, cfg)
+        ev = wallclock_guard_evidence(900.0, 100.0, cfg, fired=fire)
+        if ev is not None:
+            act = ladder.observe(healthy=ev)
+    assert act is RecoveryAction.REPROVISION
+
+    strikes, fire = wallclock_guard_step(strikes, -0.3, 100.0, cfg)
+    ev = wallclock_guard_evidence(-0.3, 100.0, cfg, fired=fire)
+    assert ladder.observe(healthy=ev) is RecoveryAction.NONE
+    assert ladder.consecutive_degraded == 0
+
+
+def test_both_guards_share_one_ladder():
+    """Either guard reaching futility is the same conclusion.
+
+    They detect one fault — the anchor is wrong — so a dt-guard fault
+    followed by a wall-clock fault must escalate, rather than each guard
+    counting to two on its own while the station stays broken.
+    """
+    from ka9q.recovery_ladder import RecoveryAction, RecoveryLadder
+
+    ladder = RecoveryLadder(reprovision_after=1, full_reset_after=2,
+                            restart_after=2)
+    assert ladder.observe(
+        healthy=dt_guard_evidence(+8.0, 10, _cfg(), fired=True)
+    ) is RecoveryAction.REPROVISION
+    assert ladder.observe(
+        healthy=wallclock_guard_evidence(21858.5, 100.0, _wcfg(), fired=True)
+    ) is RecoveryAction.RESTART_SELF

@@ -39,7 +39,7 @@ from .spot_sink import SpotSink, CycleBatcher, resolve_reporter_identity
 from .noise import compute_noise, overload_delta
 from .timing_guard import (
     DtGuardConfig, dt_guard_evidence, dt_guard_step,
-    WallClockGuardConfig, wallclock_guard_step,
+    WallClockGuardConfig, wallclock_guard_evidence, wallclock_guard_step,
 )
 from ka9q.recovery_ladder import RecoveryAction, RecoveryLadder
 from .hs_uploader_shim import WsprUploaderHs
@@ -187,8 +187,14 @@ class WsprRecorder:
         self._dt_guard_cfg = DtGuardConfig.from_env()
         self._dt_guard_strikes: Dict[str, int] = {}
         #: One RecoveryLadder per rx, so a fault on one receiver never
-        #: escalates another.  Created lazily in _dt_guard_observe.
-        self._dt_guard_ladders: Dict[str, RecoveryLadder] = {}
+        #: escalates another.  SHARED by both timing guards: they detect the
+        #: same underlying fault (the RTP->UTC anchor is wrong), so either one
+        #: reaching futility is the same conclusion and must not have to
+        #: rediscover it separately.
+        self._anchor_ladders: Dict[str, RecoveryLadder] = {}
+        #: Last slot already judged by the wall-clock guard, per rx — that
+        #: guard fires several times in a cycle when many bands offend.
+        self._wallclock_ladder_slot: Dict[str, object] = {}
         # Wall-clock slot guard (timing_guard.py): catches GROSS anchor
         # faults (minutes off) with zero decodes, where the dt guard is
         # blind.  Stepped from decode-pool worker threads, hence the
@@ -787,7 +793,7 @@ class WsprRecorder:
             # — and a human had to notice, because every liveness check stayed
             # green while the recorder completed 120 s slots at "100%
             # complete" and decoded nothing.
-            ladder = self._dt_guard_ladders.get(rx_source)
+            ladder = self._anchor_ladders.get(rx_source)
             logger.critical(
                 "TIMING FAULT rx=%s: re-anchoring has NOT cleared this fault "
                 "(%d consecutive faulted cycles); the slot anchor is held in "
@@ -813,20 +819,47 @@ class WsprRecorder:
         evidence = dt_guard_evidence(avg_dt, n_spots, cfg, fired=fired)
         if evidence is None:
             return None          # no evidence: neither advance nor clear
-        ladder = self._dt_guard_ladders.get(rx_source)
+        return self._anchor_ladder_for(rx_source).observe(healthy=evidence)
+
+    def _anchor_ladder_for(self, rx_source: str) -> RecoveryLadder:
+        """The anchor-recovery ladder for one rx, created on first use.
+
+        SHARED by both timing guards.  They detect the same underlying fault —
+        the RTP->UTC anchor is wrong — so either one reaching futility is the
+        same conclusion, and neither should have to rediscover it alone.
+
+        Two reachable rungs, not three: re-anchoring is the ONLY in-process
+        remedy for a wrong anchor, so a second faulted judgement is proof it
+        did not work rather than a reason to repeat it.  FULL_RESET is
+        deliberately unreachable — there is no deeper repair a client can
+        perform on itself.
+        """
+        ladder = self._anchor_ladders.get(rx_source)
         if ladder is None:
-            # One re-anchor attempt, then replace the process.  Re-anchoring
-            # is the ONLY in-process remedy, so a second consecutive faulted
-            # cycle is proof it did not work rather than a reason to repeat it.
-            # Re-anchoring is the ONLY in-process remedy here, so this
-            # ladder has two rungs, not three: re-anchor once, and treat a
-            # second consecutive faulted cycle as proof it did not work
-            # rather than a reason to repeat it.  FULL_RESET is deliberately
-            # unreachable — there is no deeper repair for the client to do.
             ladder = RecoveryLadder(reprovision_after=1, full_reset_after=2,
                                     restart_after=2)
-            self._dt_guard_ladders[rx_source] = ladder
-        return ladder.observe(healthy=evidence)
+            self._anchor_ladders[rx_source] = ladder
+        return ladder
+
+    def _wallclock_ladder_observe(self, rx_source: str, slot, early_by,
+                                  completeness: float, cfg, *, fired: bool):
+        """Record this SLOT against the rx's anchor ladder, at most once.
+
+        ⛔ At most once per slot, deliberately.  The guard's own comment notes
+        that "all ~17 bands of a broken rx offend every cycle", so it fires
+        several times within one cycle — and re-anchoring can only be judged
+        by the NEXT slot.  Advancing per fire would exit the process seconds
+        after re-anchoring, before the repair had any chance to show.  One
+        judgement per slot gives it that chance.
+        """
+        evidence = wallclock_guard_evidence(early_by, completeness, cfg,
+                                            fired=fired)
+        if evidence is None:
+            return None
+        if self._wallclock_ladder_slot.get(rx_source) == slot:
+            return None                      # this slot already judged
+        self._wallclock_ladder_slot[rx_source] = slot
+        return self._anchor_ladder_for(rx_source).observe(healthy=evidence)
 
     def _request_self_restart(self) -> None:
         """Ask the supervisor to replace this process.
@@ -863,6 +896,9 @@ class WsprRecorder:
                 self._wallclock_guard_strikes.get(request.rx_source, 0),
                 early_by, completeness, cfg)
             self._wallclock_guard_strikes[request.rx_source] = strikes
+        action = self._wallclock_ladder_observe(
+            request.rx_source, request.start_wallclock, early_by,
+            completeness, cfg, fired=fire)
         if fire:
             logger.error(
                 "TIMING FAULT rx=%s mode=wspr: slot %s (%ds, %.0f%% "
@@ -873,6 +909,22 @@ class WsprRecorder:
                 "channel_info; INVESTIGATE radiod restart/startup timing",
                 request.rx_source, request.start_wallclock,
                 request.period_seconds, completeness, early_by)
+            if action is RecoveryAction.RESTART_SELF:
+                # ⛔ AC0G-ND, 2026-09-03.  This guard fired every cycle for
+                # SIX HOURS, re-anchoring each time, while the slot labels ran
+                # further ahead: 21858s, 21915s, 21972s... and every decode was
+                # lost, so `dt= ----` and the dt guard — the only guard then
+                # wired to this ladder — saw no samples and never escalated.
+                logger.critical(
+                    "TIMING FAULT rx=%s: re-anchoring has NOT cleared an "
+                    "anchor that runs ahead of true UTC (%d faulted "
+                    "judgements). It is held in this process; only a restart "
+                    "clears it. Exiting so systemd (Restart=always) replaces "
+                    "us.", request.rx_source,
+                    self._anchor_ladder_for(request.rx_source)
+                        .consecutive_degraded)
+                self._request_self_restart()
+                return
             self._reanchor_rx(request.rx_source)
         elif strikes:
             logger.warning(
