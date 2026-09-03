@@ -328,3 +328,62 @@ def test_both_guards_share_one_ladder():
     assert ladder.observe(
         healthy=wallclock_guard_evidence(21858.5, 100.0, _wcfg(), fired=True)
     ) is RecoveryAction.RESTART_SELF
+
+
+# --- the restart must actually happen, from a worker thread ---------------
+#
+# ⛔ AC0G-ND, 2026-09-03.  The first implementation raised SystemExit, and
+# both timing guards are hooks that run on WORKER threads (CycleBatcher's
+# flush hook, and the decode path).  SystemExit raised off the main thread
+# does not exit the interpreter — it terminates that one thread, silently.
+#
+# The result was worse than the fault it answered: the escalation logged
+# "only a restart clears it" six times in twelve minutes, the process stayed
+# up, and each attempt quietly killed a worker thread.  WSPR bands fell from
+# 17 to 2-5 as those threads died.
+
+import re as _re  # noqa: E402
+from pathlib import Path as _Path  # noqa: E402
+
+_MAIN = _Path(__file__).resolve().parent.parent / "wspr_recorder" / "__main__.py"
+
+
+def _restart_method_source() -> str:
+    text = _MAIN.read_text()
+    m = _re.search(r"def _request_self_restart\(self\)(.|\n)*?\n    def ", text)
+    assert m, "_request_self_restart not found — did it get renamed?"
+    return m.group(0)
+
+
+def test_the_restart_does_not_use_SystemExit():
+    # SystemExit is thread-local in effect. A guard hook raising it kills a
+    # worker and leaves the fault in place.
+    # The docstring names SystemExit to warn against it, so look for it as a
+    # STATEMENT — a line that actually raises — not as a word.
+    raises = [ln.strip() for ln in _restart_method_source().splitlines()
+              if ln.strip().startswith("raise SystemExit")]
+    assert raises == [], (
+        f"SystemExit off the main thread kills only that thread — it cannot "
+        f"replace the process (AC0G-ND 2026-09-03): {raises}")
+
+
+def test_it_signals_its_own_process():
+    body = _restart_method_source()
+    assert "os.kill(os.getpid()" in body, (
+        "a signal to our own pid reaches the main thread from any thread")
+    assert "SIGTERM" in body, (
+        "SIGTERM lets the process run its own shutdown and looks to systemd "
+        "like an ordinary stop, which Restart=always replaces")
+
+
+def test_there_is_a_last_resort_if_the_signal_does_not_take():
+    body = _restart_method_source()
+    assert "os._exit" in body, (
+        "a signal that is blocked or ignored must not leave the station "
+        "broken with nothing further attempted")
+
+
+def test_the_reason_is_recorded_where_it_regressed():
+    # Whitespace-normalised: the explanation wraps across lines.
+    body = " ".join(_restart_method_source().split())
+    assert "worker thread" in body

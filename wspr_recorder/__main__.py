@@ -862,12 +862,33 @@ class WsprRecorder:
         return self._anchor_ladder_for(rx_source).observe(healthy=evidence)
 
     def _request_self_restart(self) -> None:
-        """Ask the supervisor to replace this process.
+        """Ask the supervisor to replace this process, from ANY thread.
 
-        Its own method so a test can observe the request without exiting the
-        test runner, and so the exit stays in one auditable place.
+        ⛔ This must NOT raise SystemExit.  AC0G-ND, 2026-09-03: the first
+        version did, and both timing guards are hooks that run on worker
+        threads — CycleBatcher's flush hook and the decode path.  SystemExit
+        raised off the main thread does not exit the interpreter; it
+        terminates that one thread, silently.  So the escalation logged
+        "only a restart clears it" six times in twelve minutes, the process
+        stayed up, and each attempt QUIETLY KILLED A WORKER THREAD.  Bands
+        fell from 17 to 2-5 as the threads died — the fix made the station
+        worse than the fault it was answering.
+
+        SIGTERM to our own pid reaches the main thread wherever it is raised,
+        runs whatever shutdown the process already installs, and looks to
+        systemd like an ordinary stop, which `Restart=always` then replaces.
+        `os._exit` is the last resort: it cannot be blocked, but it also skips
+        every flush, so it is only for a signal that did not take.
         """
-        raise SystemExit(1)
+        import signal as _signal
+
+        logger.critical("requesting replacement: SIGTERM to self (pid %d)",
+                        os.getpid())
+        try:
+            os.kill(os.getpid(), _signal.SIGTERM)
+        except Exception:                                    # noqa: BLE001
+            logger.exception("SIGTERM to self failed; exiting hard")
+            os._exit(1)
 
     def _wallclock_guard_check(self, request: 'DecodeRequest') -> None:
         """Decode-path hook: wall-clock slot guard (needs no decodes).
