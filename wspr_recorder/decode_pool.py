@@ -42,6 +42,7 @@ import heapq
 import logging
 import os
 import threading
+import time
 from concurrent.futures import Future
 from typing import Any, Callable, List, Optional, Tuple
 
@@ -95,6 +96,7 @@ class PriorityDecodePool:
         self._long: List[Tuple] = []
         self._seq = 0
         self._long_inflight = 0
+        self._running = 0            # jobs a worker has picked up and not finished
         self._shutdown = False
 
         self._cond = threading.Condition()
@@ -123,7 +125,10 @@ class PriorityDecodePool:
             if self._shutdown:
                 raise RuntimeError("submit after shutdown")
             self._seq += 1
-            entry = (period, self._seq, fn, args, kwargs, future)
+            # The enqueue time rides along so backlog_snapshot() can say how
+            # long the oldest queued job has waited — the one number that
+            # separates "busy" from "falling behind" (see backlog_monitor).
+            entry = (period, self._seq, fn, args, kwargs, future, time.monotonic())
             if period >= LONG_PERIOD_SECONDS:
                 heapq.heappush(self._long, entry)
             else:
@@ -136,6 +141,25 @@ class PriorityDecodePool:
         """Jobs queued but not yet picked up by a worker."""
         with self._cond:
             return len(self._short) + len(self._long)
+
+    def backlog_snapshot(self) -> dict:
+        """Queue depth, age of the oldest queued job, and jobs in flight.
+
+        ``oldest_wait_s`` is the decode-backlog signal: a job that has
+        waited longer than its own period means the pool did not drain one
+        cycle's work within a cycle, so the backlog can only grow.
+        """
+        now = time.monotonic()
+        with self._cond:
+            enq = [e[6] for e in self._short] + [e[6] for e in self._long]
+            return {
+                "queued": len(self._short) + len(self._long),
+                "queued_short": len(self._short),
+                "queued_long": len(self._long),
+                "oldest_wait_s": (now - min(enq)) if enq else 0.0,
+                "running": self._running,
+                "workers": self._max_workers,
+            }
 
     def shutdown(self, wait: bool = True, cancel_futures: bool = False) -> None:
         with self._cond:
@@ -202,13 +226,15 @@ class PriorityDecodePool:
             entry = self._take_next()
             if entry is _SHUTDOWN:
                 return
-            period, _seq, fn, args, kwargs, future = entry
+            period, _seq, fn, args, kwargs, future, _t_enq = entry
             is_long = period >= LONG_PERIOD_SECONDS
             if not future.set_running_or_notify_cancel():
                 # Future was cancelled before we started it.
                 if is_long:
                     self._release_long()
                 continue
+            with self._cond:
+                self._running += 1
             try:
                 result = fn(*args, **kwargs)
             except BaseException as exc:  # noqa: BLE001 — mirror Future semantics
@@ -218,6 +244,8 @@ class PriorityDecodePool:
             else:
                 future.set_result(result)
             finally:
+                with self._cond:
+                    self._running -= 1
                 if is_long:
                     self._release_long()
 

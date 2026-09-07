@@ -201,15 +201,29 @@ ip maddr show                  # confirm the host joined the mcast groups
 - Sample rate mismatch — `channel_defaults.sample_rate` must equal
   the radiod preset's actual rate; otherwise 720 000 samples ≠ 60 s.
 
-### `Executor backlog high` in `wspr-ctl health`
+### `decode backlog STUCK` / `decode backlog GROWING` (log and `wspr-ctl health`)
 
-The WAV-write/decoder thread pool (sized to the process's
-available-CPU count) is queueing faster than it drains. `tmpfs` is
-memory-speed, so for a recorder-only deployment this almost always
-means CPU contention; in full-pipeline mode it can also mean wsprd /
-jt9 decodes are running long. Check `Nice=5` is not being overridden,
-and whether another process on the box is saturating a core
-wspr-recorder is pinned to (see `run_isolated.sh`).
+The decode-backlog monitor (`backlog_monitor.py`) samples the decoder
+pool once a minute and judges it two ways:
+
+- **STUCK** — the oldest queued decode has waited longer than
+  `WSPR_BACKLOG_WARN_WAIT_SEC` (default 120 s, one W2 period). One
+  cycle's work was not drained within a cycle, so the queue can only
+  grow from here.
+- **GROWING** — the queue is at least `WSPR_BACKLOG_FLOOR` deep
+  (default: the worker count) and has grown, never shrinking, across
+  `WSPR_BACKLOG_GROW_SAMPLES` samples (default 5, i.e. 5 minutes).
+
+The spike at :00 and :30, when every cadence emits at once, trips
+neither. A WARNING is logged on entry, repeated every 10 minutes while
+it persists, and an INFO line marks recovery; `status.json` and
+`wspr-ctl health` carry the latest assessment under `decode_backlog`.
+
+Causes: CPU contention (another process saturating a core
+wspr-recorder is pinned to — see `run_isolated.sh`), a decoder clock
+cap set too low (the wsprdaemon K6FOD case: a 1.4 GHz cap starved the
+decoders and 3600 files piled up unnoticed), `Nice=5` being
+overridden, or wsprd / jt9 decodes running long in full-pipeline mode.
 
 ### RSS grows steadily, Python heap flat
 

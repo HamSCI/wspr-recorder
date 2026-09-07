@@ -43,6 +43,7 @@ from .timing_guard import (
 )
 from ka9q.recovery_ladder import RecoveryAction, RecoveryLadder
 from .hs_uploader_shim import WsprUploaderHs
+from .backlog_monitor import BacklogMonitor
 
 logger = logging.getLogger(__name__)
 
@@ -245,6 +246,9 @@ class WsprRecorder:
         # the worker count drives CPU use, not peak RSS.
         from .decode_pool import build_decode_pool
         self.executor = build_decode_pool()
+        # Decode-backlog monitor: samples the pool every minute, warns when the
+        # decoders fall behind the cycle (see backlog_monitor.py).
+        self._backlog_monitor = BacklogMonitor(workers=self.executor._max_workers)
 
         # GPSDO/RTP-ruler integrity alarm (tier-sourced) replaces the old
         # wall-clock skew monitor.  BandRecorder reads the timing tier from
@@ -1277,6 +1281,29 @@ class WsprRecorder:
             except Exception as e:
                 logger.error(f"memprofile error: {e}")
 
+    BACKLOG_SAMPLE_INTERVAL = 60
+
+    def _backlog_snapshot(self) -> dict:
+        snap = getattr(self.executor, "backlog_snapshot", None)
+        if callable(snap):
+            try:
+                return snap()
+            except Exception:
+                pass
+        return {"queued": self._executor_backlog(), "oldest_wait_s": 0.0, "running": 0,
+                "workers": getattr(self.executor, "_max_workers", 0)}
+
+    async def _backlog_loop(self) -> None:
+        """Sample the decode pool once a minute and let the monitor judge it."""
+        while self._running:
+            try:
+                await asyncio.sleep(self.BACKLOG_SAMPLE_INTERVAL)
+                self._backlog_monitor.observe(self._backlog_snapshot(), time.monotonic())
+            except asyncio.CancelledError:
+                break
+            except Exception as e:
+                logger.error(f"Backlog monitor error: {e}")
+
     async def _status_loop(self) -> None:
         """Periodically write status file."""
         status_path = Path(self.config.recorder.output_dir) / self.config.recorder.status_file
@@ -1495,6 +1522,7 @@ class WsprRecorder:
         
         status["executor_backlog"] = self._executor_backlog()
         status["executor_workers"] = self.executor._max_workers
+        status["decode_backlog"] = self._backlog_monitor.as_dict()
         if self._memprofile:
             current, peak = tracemalloc.get_traced_memory()
             status["tracemalloc"] = {
@@ -1624,8 +1652,12 @@ class WsprRecorder:
         active_bands = sum(1 for r in self.band_recorders.values() if r._synced)
         
         backlog = self._executor_backlog()
-        if backlog > self.executor._max_workers * 4:
-            issues.append(f"Executor backlog high: {backlog} queued")
+        # Judge the pool now (a health query must not wait for the minute
+        # sampler) with the monitor's stuck/growing rules; the old flat
+        # "> 4 x workers" test missed a slow slide and cried at the :00 spike.
+        assessment = self._backlog_monitor.assess(self._backlog_snapshot())
+        if assessment.level == "warn":
+            issues.append(assessment.reason)
 
         return {
             "healthy": healthy,
@@ -1635,6 +1667,7 @@ class WsprRecorder:
             "uptime_seconds": time.time() - self._start_time if self._start_time else 0,
             "executor_backlog": backlog,
             "executor_workers": self.executor._max_workers,
+            "decode_backlog": assessment.as_dict(),
         }
     
     def _ipc_config(self, params: Optional[Dict]) -> Dict:
@@ -2017,6 +2050,7 @@ class WsprRecorder:
             status_task = asyncio.create_task(self._status_loop())
             health_task = asyncio.create_task(self._health_check_loop())
             memprofile_task = asyncio.create_task(self._memprofile_loop())
+            backlog_task = asyncio.create_task(self._backlog_loop())
             lifetime_task = asyncio.create_task(self._lifetime_keepalive_loop())
             watchdog_task = asyncio.create_task(self._watchdog_loop())
 
@@ -2036,13 +2070,14 @@ class WsprRecorder:
             status_task.cancel()
             health_task.cancel()
             memprofile_task.cancel()
+            backlog_task.cancel()
             lifetime_task.cancel()
             watchdog_task.cancel()
 
             try:
                 await asyncio.gather(
                     cleanup_task, status_task, health_task, memprofile_task,
-                    lifetime_task,
+                    backlog_task, lifetime_task,
                     return_exceptions=True,
                 )
             except Exception:
