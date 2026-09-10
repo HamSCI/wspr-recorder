@@ -219,7 +219,7 @@ class TestRtpSyncStrategyWithAuthority:
         strategy = RtpSyncStrategy(SAMPLE_RATE)
         with caplog.at_level(logging.WARNING, logger="wspr_recorder.sync_strategy"):
             strategy.should_start_minute(100_000, 240, utc(second=58))
-        assert strategy.correlation_source == "wall_clock"
+        assert strategy.correlation_source == "wallclock_fallback"
         assert strategy.correlation_offset_ns is None
         # Warning must flag the standalone-fallback semantics.
         assert any("standalone fallback" in r.message for r in caplog.records)
@@ -227,7 +227,7 @@ class TestRtpSyncStrategyWithAuthority:
     def test_reader_with_no_snapshot_falls_back_to_wall_clock(self):
         strategy = RtpSyncStrategy(SAMPLE_RATE, authority_reader=_FakeReader(None))
         strategy.should_start_minute(100_000, 240, utc(second=58))
-        assert strategy.correlation_source == "wall_clock"
+        assert strategy.correlation_source == "wallclock_fallback"
 
     def test_reader_with_unusable_offset_falls_back_to_wall_clock(self):
         # t_level_active=None -> offset_usable=False (bootstrap-pending or T0)
@@ -236,7 +236,7 @@ class TestRtpSyncStrategyWithAuthority:
             authority_reader=_FakeReader(_FakeSnap(offset_usable=False)),
         )
         strategy.should_start_minute(100_000, 240, utc(second=58))
-        assert strategy.correlation_source == "wall_clock"
+        assert strategy.correlation_source == "wallclock_fallback"
 
     def test_reader_with_usable_offset_uses_authority_source(self):
         strategy = RtpSyncStrategy(
@@ -244,7 +244,7 @@ class TestRtpSyncStrategyWithAuthority:
             authority_reader=_FakeReader(_FakeSnap(offset_usable=True, offset_ns=812_345)),
         )
         strategy.should_start_minute(100_000, 240, utc(second=58))
-        assert strategy.correlation_source == "authority"
+        assert strategy.correlation_source == "authority_on_wallclock"
         assert strategy.correlation_offset_ns == 812_345
 
     def test_reader_exception_treated_as_unavailable(self, caplog):
@@ -253,10 +253,11 @@ class TestRtpSyncStrategyWithAuthority:
                 raise RuntimeError("kaboom")
         strategy = RtpSyncStrategy(SAMPLE_RATE, authority_reader=_BoomReader())
         import logging
-        with caplog.at_level(logging.WARNING, logger="wspr_recorder.sync_strategy"):
+        # The shared helper owns the read and the warning now.
+        with caplog.at_level(logging.WARNING, logger="hamsci_dsp.timing"):
             strategy.should_start_minute(100_000, 240, utc(second=58))
-        assert strategy.correlation_source == "wall_clock"
-        assert any("Authority reader raised" in r.message for r in caplog.records)
+        assert strategy.correlation_source == "wallclock_fallback"
+        assert any("authority read failed at anchor" in r.message for r in caplog.records)
 
     def test_correlation_happens_once(self):
         """Authority reader should be consulted at correlation, not every packet."""
@@ -291,7 +292,7 @@ class TestRtpSyncStrategyChannelInfo:
         ref_epoch = utc(second=58).timestamp()
         with mock.patch("ka9q.rtp_to_utc", return_value=ref_epoch) as m:
             strategy.should_start_minute(100_000, 240, utc(second=58))
-        assert strategy.correlation_source == "rtp_to_wallclock+authority"
+        assert strategy.correlation_source == "rtp_to_utc+authority"
         assert strategy.correlation_offset_ns == 4_250
         m.assert_called_once()
         # hint passed for wrap disambiguation
@@ -303,7 +304,7 @@ class TestRtpSyncStrategyChannelInfo:
         ref_epoch = utc(second=58).timestamp()
         with mock.patch("ka9q.rtp_to_utc", return_value=ref_epoch):
             strategy.should_start_minute(100_000, 240, utc(second=58))
-        assert strategy.correlation_source == "rtp_to_wallclock"
+        assert strategy.correlation_source == "rtp_to_utc"
         assert strategy.correlation_offset_ns is None
 
     def test_rtp_to_wallclock_none_falls_back_to_authority(self):
@@ -315,7 +316,7 @@ class TestRtpSyncStrategyChannelInfo:
         with mock.patch("ka9q.rtp_to_utc", return_value=None):
             strategy.should_start_minute(100_000, 240, utc(second=58))
         # rtp_to_wallclock unavailable → priority-2 authority path.
-        assert strategy.correlation_source == "authority"
+        assert strategy.correlation_source == "authority_on_wallclock"
         assert strategy.correlation_offset_ns == 500
 
     def test_no_channel_info_keeps_legacy_authority_source(self):
@@ -325,7 +326,7 @@ class TestRtpSyncStrategyChannelInfo:
             authority_reader=_FakeReader(_FakeSnap(offset_usable=True, offset_ns=7)),
         )
         strategy.should_start_minute(100_000, 240, utc(second=58))
-        assert strategy.correlation_source == "authority"
+        assert strategy.correlation_source == "authority_on_wallclock"
 
     def test_channel_info_is_readable_via_public_property(self):
         """Regression: BandRecorder's RTP-referenced timing watchdogs reach
@@ -370,7 +371,7 @@ class TestRtpSyncStrategyReset:
         )
         # Establish correlation
         strategy.should_start_minute(100_000, 240, utc(second=58))
-        assert strategy.correlation_source == "authority"
+        assert strategy.correlation_source == "authority_on_wallclock"
         assert strategy.correlation_offset_ns == 999
 
         strategy.reset()
@@ -385,7 +386,7 @@ class TestRtpSyncStrategyReset:
         # Pre-outage: correlate near old RTP timestamps
         strategy.should_start_minute(100_000, 240, utc(second=58))
         old_boundary = strategy._next_boundary
-        assert strategy.correlation_source == "wall_clock"
+        assert strategy.correlation_source == "wallclock_fallback"
         assert old_boundary is not None
 
         strategy.reset()
@@ -398,7 +399,7 @@ class TestRtpSyncStrategyReset:
         # timestamp is the new t=0.
         new_rtp_base = 8_000_000_000
         strategy.should_start_minute(new_rtp_base, 240, utc(hour=1, second=58))
-        assert strategy.correlation_source == "wall_clock"
+        assert strategy.correlation_source == "wallclock_fallback"
         # The projected next boundary must be in the *new* RTP space —
         # near new_rtp_base, not anywhere near the pre-reset projection
         # which was anchored at rtp_ts=100_000.
@@ -424,3 +425,32 @@ class TestRtpSyncStrategyReset:
         that should not raise even though they have no correlation cache."""
         ClockSyncStrategy(SAMPLE_RATE).reset()
         FallbackSyncStrategy(SAMPLE_RATE).reset()
+
+
+
+class TestAnchorExposedForTheReport:
+    """§18.5: the recorder reports the registration its labels ride.  The
+    strategy keeps the AnchorUTC it correlated on so the instance-level
+    report can be built from it, not from a fresh authority read."""
+
+    def test_anchor_is_none_before_correlation(self):
+        strategy = RtpSyncStrategy(SAMPLE_RATE)
+        assert strategy.anchor is None
+
+    def test_anchor_carries_the_applied_offset(self):
+        strategy = RtpSyncStrategy(
+            SAMPLE_RATE,
+            authority_reader=_FakeReader(_FakeSnap(offset_usable=True, offset_ns=4_250)),
+        )
+        strategy.set_channel_info(_FakeChannelInfo())
+        with mock.patch("ka9q.rtp_to_utc", return_value=utc(second=58).timestamp()):
+            strategy.should_start_minute(100_000, 240, utc(second=58))
+        assert strategy.anchor.offset_ns == 4_250
+        assert strategy.anchor.source == "rtp_to_utc+authority"
+
+    def test_reset_drops_the_anchor(self):
+        strategy = RtpSyncStrategy(SAMPLE_RATE)
+        strategy.should_start_minute(100_000, 240, utc(second=58))
+        assert strategy.anchor is not None
+        strategy.reset()
+        assert strategy.anchor is None

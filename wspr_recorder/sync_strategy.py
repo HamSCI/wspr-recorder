@@ -17,14 +17,15 @@ from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Optional, Protocol, TYPE_CHECKING
 
+from hamsci_dsp.timing import AnchorUTC, acquire_anchor_utc
+
 logger = logging.getLogger(__name__)
 
 
 class _AuthorityReaderProtocol(Protocol):
     """Structural interface of the authority reader that RtpSyncStrategy
-    consumes. Defined as a Protocol so sync_strategy.py has no hard
-    dependency on authority_reader.py (and can be tested with a fake
-    reader)."""
+    consumes (hamsci_dsp.timing.AuthorityReader in production).  A
+    Protocol so tests can hand in a fake reader."""
     def read(self): ...  # returns object with offset_usable + rtp_to_utc_offset_ns
 
 
@@ -132,8 +133,14 @@ class RtpSyncStrategy(SyncStrategy):
         self._channel_info = channel_info
         # Correlation state
         self._correlated = False
-        self._correlation_source: Optional[str] = None  # "rtp_to_wallclock[+authority]" | "authority" | "wall_clock"
+        # hamsci_dsp.timing.acquire_anchor_utc's vocabulary, shared with
+        # psk/meteor: "rtp_to_utc+authority" | "rtp_to_utc" |
+        # "authority_on_wallclock" | "wallclock_fallback".
+        self._correlation_source: Optional[str] = None
         self._correlation_offset_ns: Optional[int] = None
+        # The anchor the correlation pinned — what the §3
+        # timing_authority_applied report describes (§18.5: the labels).
+        self._anchor: Optional[AnchorUTC] = None
         self._next_boundary: Optional[int] = None  # unwrapped RTP ts of next boundary
         self._next_minute: Optional[datetime] = None  # UTC wall clock of next boundary
         # 32-bit unwrap tracking
@@ -175,9 +182,9 @@ class RtpSyncStrategy(SyncStrategy):
 
     def _correlate(self, rtp_timestamp: int, wall_clock: datetime) -> None:
         """One-time correlation: find the RTP timestamp of the next minute
-        boundary.  Prefers RTP-derived UTC (rtp_to_wallclock + authority
-        offset) when channel_info is available, then the authority offset
-        on the wall clock, then the bare wall clock."""
+        boundary.  Prefers RTP-derived UTC (rtp_to_utc + authority offset)
+        when channel_info is available, then the authority offset on the
+        wall clock, then the bare wall clock — the shared helper's order."""
         unwrapped = self._unwrapped  # already set by caller
 
         reference_utc, source, offset_ns = self._acquire_reference_utc(
@@ -197,7 +204,7 @@ class RtpSyncStrategy(SyncStrategy):
         self._next_minute = next_minute
         self._correlation_source = source
         self._correlation_offset_ns = offset_ns
-        if source == "wall_clock":
+        if source == "wallclock_fallback":
             logger.warning(
                 f"RtpSync: correlated via wall clock (no channel_info and "
                 f"no hf-timestd authority — standalone fallback; "
@@ -221,71 +228,44 @@ class RtpSyncStrategy(SyncStrategy):
     ) -> tuple:
         """Return (utc, source, offset_ns) for the one-time correlation.
 
-        Priority (most→least accurate), matching codar/psk/msk144:
-          1. ``rtp_to_wallclock(rtp, channel_info) + authority_offset`` —
-             UTC derived from radiod's GPS/RTP timebase, off the client
-             system clock entirely (source ``rtp_to_wallclock[+authority]``).
-          2. ``wall_clock + authority_offset`` — legacy path when
-             channel_info is absent but an authority offset exists
-             (source ``authority``).
-          3. bare ``wall_clock`` — standalone fallback (source
-             ``wall_clock``).
+        One implementation for every sigmond recorder:
+        ``hamsci_dsp.timing.acquire_anchor_utc`` — radiod's GPS/RTP timebase
+        plus hf-timestd's §18 offset when channel_info is present; the
+        offset on ``wall_clock`` when it is not; bare ``wall_clock`` as the
+        standalone fallback.  The 216-line private reader and the hand-
+        rolled priority ladder this replaced (2026-09-10) had already
+        drifted from psk/meteor's vocabulary.
 
-        The minute-correlation only needs ~30 s accuracy to land on the
-        right boundary, but deriving from RTP removes the residual
-        client-clock dependence of the wall-clock paths.
+        ``wall_clock`` is the packet's arrival time, so it stands in for
+        "now" in the fallback; it names this packet's first sample.
         """
-        snap = None
-        if self.authority_reader is not None:
-            try:
-                snap = self.authority_reader.read()
-            except Exception as e:
-                logger.warning("Authority reader raised: %s", e)
-                snap = None
-        usable = snap is not None and snap.offset_usable
-        offset_ns = snap.rtp_to_utc_offset_ns if usable else None
-        offset_sec = (offset_ns / 1_000_000_000) if usable else 0.0
+        from ka9q import rtp_to_utc
+        anchor = acquire_anchor_utc(
+            first_rtp=rtp_timestamp,
+            channel_info=self._channel_info,
+            rtp_to_utc=rtp_to_utc,
+            authority_reader=self.authority_reader,
+            sample_rate=self.sample_rate,
+            now_fn=lambda: wall_clock.timestamp(),
+        )
+        self._anchor = anchor
+        return anchor.datetime, anchor.source, anchor.offset_ns
 
-        # Priority 1: RTP-derived UTC via ka9q rtp_to_wallclock.
-        if self._channel_info is not None:
-            try:
-                from ka9q import rtp_to_utc
-                import time as _time
-                utc_sec = rtp_to_utc(
-                    rtp_timestamp & 0xFFFFFFFF,
-                    self._channel_info,
-                    wallclock_hint_sec=_time.time() + offset_sec,
-                )
-                if utc_sec is not None:
-                    utc = datetime.fromtimestamp(
-                        utc_sec + offset_sec, tz=timezone.utc,
-                    )
-                    # Label strings predate the ka9q rename (rtp_to_wallclock
-                    # -> rtp_to_utc); kept stable for status/journal consumers.
-                    source = (
-                        "rtp_to_wallclock+authority" if usable
-                        else "rtp_to_wallclock"
-                    )
-                    return utc, source, offset_ns
-            except Exception as e:
-                logger.warning("rtp_to_utc raised at correlation: %s", e)
-
-        # Priority 2: authority offset on the client wall clock (legacy).
-        if usable:
-            utc = wall_clock + timedelta(seconds=offset_sec)
-            return utc, "authority", offset_ns
-
-        # Priority 3: bare wall clock (standalone fallback).
-        return wall_clock, "wall_clock", None
+    @property
+    def anchor(self) -> Optional[AnchorUTC]:
+        """The anchor the correlation pinned (None before correlation and
+        after ``reset``).  Its ``timing_authority_applied()`` is this
+        band's honest §3 report."""
+        return self._anchor
 
     @property
     def correlation_source(self) -> Optional[str]:
-        """'authority' | 'wall_clock' | None (not yet correlated)."""
+        """acquire_anchor_utc's source label, or None (not yet correlated)."""
         return self._correlation_source
 
     @property
     def correlation_offset_ns(self) -> Optional[int]:
-        """Applied RTP→UTC offset in ns when source=='authority'; None otherwise."""
+        """Applied RTP→UTC offset in ns when an authority offset was usable; None otherwise."""
         return self._correlation_offset_ns
 
     def should_start_minute(
@@ -345,6 +325,7 @@ class RtpSyncStrategy(SyncStrategy):
         self._correlated = False
         self._correlation_source = None
         self._correlation_offset_ns = None
+        self._anchor = None
         self._next_boundary = None
         self._next_minute = None
         self._last_raw = None

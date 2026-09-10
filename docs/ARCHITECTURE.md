@@ -84,7 +84,7 @@ wspr_recorder/
   decode_mode.py       # W2/F2/F5/F15/F30 cadence, modes_completing_at_minute
   sync_strategy.py     # RtpSyncStrategy, ClockSyncStrategy, FallbackSyncStrategy
   timing_service.py    # chrony/hf-timestd status, TimingMetadata, strategy factory
-  authority_reader.py  # timing-authority lookup
+  (timing authority: hamsci_dsp.timing — shared with psk/meteor/mag)
   wav_writer.py        # write_period: peak-normalize, atomic WAV+JSON
   ipc_server.py        # JSON-RPC Unix socket server + IPCClient
   wspr_ctl.py          # CLI client entry point (wspr-ctl)

@@ -197,10 +197,14 @@ Sections implemented:
   wizard + `sigmond.wizard_dispatch`; third consumer of the lib).
 - **§17** — output sinks in inventory (SQLite sink + per-mode log
   files / journal).
-- **§18 (timing authority)** — capability boolean declared;
-  `timing_authority_applied` always `null` (RTP-default mode). A
-  subscriber path via `authority_reader.py` exists but is not yet
-  wired into the recording pipeline.
+- **§18 (timing authority)** — every band correlates through the
+  suite-shared `hamsci_dsp.timing.acquire_anchor_utc` (the private
+  `authority_reader.py` retired 2026-09-10; its tests moved to hamsci-dsp),
+  which applies hf-timestd's published offset whenever `authority.json`
+  is fresh.  `_anchor_utc_now` re-pins with the frozen anchor wallclock as
+  the wrap hint.  The status loop writes `timing-authority.json` beside
+  `status.json` once a minute and `inventory` reads
+  `timing_authority_applied` from it; stale or absent reads as null.
 
 ## Configuration
 
@@ -264,7 +268,7 @@ pytest with pytest-asyncio (`asyncio_mode = "auto"`). Tests are in `tests/`, ~36
 - `test_config.py` — frequency parsing, BandConfig, [[band]] TOML, backward compatibility
 - `test_sync_strategy.py` — RTP correlation, 32-bit wrap, wall-clock sync
 - `test_contract.py` — inventory/validate JSON shape, SSRC-collision and version-lag checks
-- `test_authority_reader.py`, `test_configurator.py`, `test_lifetime.py` — timing authority, config rendering, lifetime keepalive
+- `test_configurator.py`, `test_lifetime.py` — config rendering, lifetime keepalive (the reader's tests live in hamsci-dsp now)
 
 ### Decoder binaries
 

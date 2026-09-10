@@ -8,6 +8,8 @@ from importlib.metadata import version as pkg_version
 from pathlib import Path
 from typing import Any
 
+from hamsci_dsp.timing import read_applied_state
+
 from .config import Config, _derive_radiod_id, placeholder_status_addresses
 from .version import GIT_INFO
 
@@ -98,18 +100,16 @@ def build_inventory(config: Config, config_path: Path) -> dict:
         "uses_timing_calibration": config.timing.authority in ("fusion", "auto"),
         "provides_timing_calibration": False,
         "chain_delay_ns_applied": _chain_delay_ns(instance_id),
-        # CONTRACT v0.7 §18 — runtime-state field paired with the
-        # capability boolean above.  null = §18 RTP-default mode (the
-        # only mode wspr-recorder currently runs in; no §18 subscriber
-        # path wired yet).  When a §18 subscriber lands, this will
-        # populate with {source, tier, sigma_ns, snapshot_age_s,
-        # radiod_id} from the AuthoritySnapshot the subscriber last
-        # fetched.  WSPR is slot-quantized to two-minute boundaries
-        # so timing-authority gating is not urgent for spot quality;
-        # the field is reported now to satisfy the v0.7 inventory
-        # shape and to give sigmond's adapter something concrete to
-        # display.
-        "timing_authority_applied": None,
+        # §18.5 (amendment 2026-09-04): the field describes the LABELS
+        # the running recorder writes.  Every band correlates through
+        # hamsci_dsp.timing.acquire_anchor_utc, which applies hf-timestd's
+        # offset whenever authority.json is fresh; the daemon leaves the
+        # block it applies beside status.json once a minute
+        # (<output_dir>/timing-authority.json).  Stale or absent reads as
+        # null — nothing running means nothing applied.
+        "timing_authority_applied": read_applied_state(
+            Path(config.recorder.output_dir) / "timing-authority.json",
+        ),
     }
 
     # The process log goes to the systemd journal

@@ -338,13 +338,14 @@ audit consumers (`smd verifier`, `smd watch wspr`).
   `uses_timing_calibration`, `provides_timing_calibration=false`,
   `chain_delay_ns_applied`, `timing_authority_applied`. Field semantics:
   [CLIENT-CONTRACT.md](https://github.com/HamSCI/sigmond/blob/main/docs/CLIENT-CONTRACT.md).
-- `WSP-I-002` `[CODE]` 🟡 **§18 timing-authority consumer (read-but-not-applied):**
-  declares the capability boolean; `authority_reader.py` exists and the sync path
-  can read `/run/hf-timestd/authority.json` for the RTP→UTC offset, but
-  `timing_authority_applied` is always `null` and `provides_timing_calibration`
-  is `false`. Full §18 gating is intentionally not wired — WSPR/FST4W products are
-  2-minute-window-quantized, so RTP-default timing is sufficient (deliberate design
-  decision, sigmond #36). Subscriber obligations are the contract's, not restated here.
+- `WSP-I-002` `[CODE]` ✅ **§18 timing-authority subscriber:** every band
+  correlates through `hamsci_dsp.timing.acquire_anchor_utc`, which applies
+  hf-timestd's published RTP→UTC offset to the minute labels whenever
+  `authority.json` is fresh.  `inventory` reports `timing_authority_applied` from
+  the block the status loop writes beside `status.json` once a minute (§18.5
+  amendment of 2026-09-04: the field describes the labels); a stale file reads
+  as null.  `provides_timing_calibration` stays `false`.  Hard-deadline gating
+  on the tier remains unwired.  Subscriber obligations are the contract's.
 - `WSP-I-003` `[DOC]` ✅ The §8 radiod-scoped chain delay
   (`RADIOD_<ID>_CHAIN_DELAY_NS`) is **surfaced, not applied** (minute-quantized
   WSPR). The §7 multicast destination is ka9q-python-derived;
@@ -420,13 +421,12 @@ reported 0 (tmpfs, ephemeral).
 
 ## 12. Risks & open questions
 
-- `WSP-F-090` `[NEW]` ✅ **§18 timing authority read-and-stamped for provenance,
-  intentionally NOT applied to gate timing:** the authority is read (startup
-  correlation) and stamped into each record for provenance, but
-  `timing_authority_applied` is always `null` and `provides_timing_calibration=false`.
-  wspr-recorder's products are WSPR/FST4W 2-minute-window-quantized, so RTP-default
-  timing is sufficient and §18 gating is deliberately not wired. This is a recorded
-  design decision (sigmond #36), not an open gap.
+- `WSP-F-090` `[NEW]` ✅ **§18 timing authority applied to the labels and
+  reported:** the startup correlation applies the authority offset, the
+  slide-follow re-pin keeps applying the live offset, each record carries the
+  provenance block, and `timing_authority_applied` reports the registration the
+  labels ride.  Tier-gated start/stop decisions stay unwired (WSPR/FST4W windows
+  tolerate the residual).
 - `WSP-F-091` `[NEW]` 🟡 **Frozen-boundary regression class:** the `channel_info`
   attr-name mismatch that silently disabled the RTP-referenced timing watchdogs
   (resolved 2026-06-16) had no regression test. A test SHALL assert the

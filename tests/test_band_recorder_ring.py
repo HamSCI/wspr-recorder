@@ -537,3 +537,39 @@ class TestSlideFollow:
         for r in w2:  # every slot starts on a clean even-minute UTC boundary
             assert int(round(r.start_wallclock.timestamp())) % 120 == 0
         assert rec._abs_div_faults == 0
+
+
+
+class TestSlideFollowWrapHint:
+    """The slide-follow re-maps the FIXED anchor RTP every minute.  Its wrap
+    hint must be the anchor's own instant, never "now": once the anchor is
+    older than P/2 the epoch flips and the grid jumps a full period (psk on
+    AC0G-B4, 2026-09-08).  wspr always passed the frozen anchor wallclock;
+    this pins that behaviour through the shared helper."""
+
+    def test_repin_hints_with_the_frozen_anchor_wallclock(self, monkeypatch):
+        import ka9q
+        rate = 1200
+        anchor_wc = datetime(2026, 4, 8, 0, 2, 0, tzinfo=timezone.utc)
+        frozen_ts = anchor_wc.timestamp()
+        calls = []
+
+        def fake_rtp_to_utc(rtp, ci, wallclock_hint_sec=None):
+            calls.append((int(rtp) & 0xFFFFFFFF, wallclock_hint_sec))
+            return frozen_ts + (int(rtp) & 0xFFFFFFFF) / rate
+        monkeypatch.setattr(ka9q, "rtp_to_utc", fake_rtp_to_utc)
+        # "now" is five days past the anchor.
+        monkeypatch.setattr("hamsci_dsp.timing.time.time", lambda: frozen_ts + 432_000.0)
+
+        rec = BandRecorder(
+            ssrc=1, frequency_hz=14095600, band_name="20",
+            sample_rate=rate, decode_modes=[DecodeMode.W2],
+            on_period_complete=lambda r: None,
+            sync_strategy=_SyncWithCI(sample_rate=rate, minute_wallclock=anchor_wc),
+        )
+        feed_ramp(rec, 3, rate)
+        # The watchdogs map the LATEST rtp too, and for a fresh rtp a "now"
+        # hint is right; the anchor rtp (0 here) is the one that ages.
+        anchor_hints = [h for r, h in calls if r == 0]
+        assert anchor_hints, "the slide-follow never re-mapped the anchor rtp"
+        assert all(abs(h - frozen_ts) < 1e-6 for h in anchor_hints)

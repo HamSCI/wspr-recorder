@@ -463,29 +463,22 @@ class BandRecorder:
         ci = getattr(self.sync_strategy, "channel_info", None)
         if ci is None:
             return frozen
-        try:
-            from ka9q import rtp_to_utc
-            cur = rtp_to_utc(
-                self._first_rtp_timestamp & 0xFFFFFFFF, ci,
-                wallclock_hint_sec=frozen,
-            )
-        except Exception as e:  # noqa: BLE001 — slide-follow must not crash
-            logger.debug("%s: anchor rtp_to_utc raised: %s",
-                         self.band_name, e)
-            return frozen
-        if cur is None:
-            return frozen
-        # §18 authority offset (mirror sync_strategy._acquire_reference_utc).
-        reader = getattr(self.sync_strategy, "authority_reader", None)
-        if reader is not None:
-            try:
-                snap = reader.read()
-                if snap is not None and getattr(snap, "offset_usable", False):
-                    cur += snap.rtp_to_utc_offset_ns / 1_000_000_000
-            except Exception as e:  # noqa: BLE001
-                logger.debug("%s: authority read at anchor raised: %s",
-                             self.band_name, e)
-        return cur
+        from ka9q import rtp_to_utc
+        from hamsci_dsp.timing import acquire_anchor_utc
+        # ``anchor_hint_utc=frozen``: the anchor rtp is FIXED and ages, so
+        # the wrap hint must be its own instant, never "now" — after P/2
+        # (49.7 h at 12 kHz) a "now" hint picks the wrong epoch and the
+        # grid jumps a full period (psk on AC0G-B4, 2026-09-08).  wspr got
+        # this right from the start; the shared helper now carries it.
+        a = acquire_anchor_utc(
+            first_rtp=self._first_rtp_timestamp,
+            channel_info=ci,
+            rtp_to_utc=rtp_to_utc,
+            authority_reader=getattr(self.sync_strategy, "authority_reader", None),
+            sample_rate=self.sample_rate,
+            anchor_hint_utc=frozen,
+        )
+        return a.utc if a.rtp_referenced else frozen
 
     def _on_minute_boundary(self) -> None:
         """Called when samples_per_minute samples have been written."""

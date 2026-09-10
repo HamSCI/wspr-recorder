@@ -1549,16 +1549,36 @@ class WsprRecorder:
             f"{source_key}/{ssrc}": recorder.get_stats()
             for (source_key, ssrc), recorder in self.band_recorders.items()
         }
-        
+        status["timing_authority_applied"] = self._applied_state()
+
         return status
-    
+
+    def _applied_state(self) -> Optional[Dict]:
+        """The §3 ``timing_authority_applied`` block for this instance —
+        the shared rule over every band's correlation anchor (populated
+        iff each anchored band is corrected; channel counts attached)."""
+        from hamsci_dsp.timing import applied_state_for_anchors
+        return applied_state_for_anchors(
+            (getattr(r.sync_strategy, "anchor", None)
+             for r in self.band_recorders.values()),
+            client_radiod=self.config.radiod.status_address,
+        )
+
     def _write_status(self, path: Path) -> None:
-        """Write status to JSON file."""
+        """Write status to JSON file, and the applied-state file beside it
+        that ``wspr-recorder inventory --json`` (another process) reads."""
         try:
+            status = self._get_status_dict()
             with open(path, 'w') as f:
-                json.dump(self._get_status_dict(), f, indent=2)
+                json.dump(status, f, indent=2)
         except Exception as e:
             logger.error(f"Failed to write status: {e}")
+            return
+        from hamsci_dsp.timing import write_applied_state
+        write_applied_state(
+            path.with_name("timing-authority.json"),
+            status.get("timing_authority_applied"),
+        )
     
     # -------------------------------------------------------------------------
     # IPC Handlers

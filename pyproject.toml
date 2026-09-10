@@ -31,6 +31,7 @@ dependencies = [
     "tomli>=2.0.0;python_version<'3.11'",
     "callhash>=1.0.0",
     "hs-uploader>=0.1.0",
+    "hamsci-dsp>=0.8.0",
 ]
 
 [tool.uv.sources]
@@ -45,6 +46,7 @@ dependencies = [
 callhash    = { path = "../callhash",    editable = true }
 hs-uploader = { path = "../hs-uploader", editable = true }
 ka9q-python = { path = "../ka9q-python", editable = true }
+hamsci-dsp  = { path = "../hamsci-dsp",  editable = true }
 
 [project.optional-dependencies]
 dev = [

@@ -174,7 +174,7 @@ class TimingMetadata:
     client_radiod: Optional[str] = None
 
     # Canonical timing-provenance block, sourced from hf-timestd's
-    # adjudicated authority.json (authority_reader.to_timing_authority).
+    # adjudicated authority.json (hamsci_dsp.timing.AuthoritySnapshot.to_timing_authority).
     # This is the authoritative record and is identical in shape across
     # all sigmond clients; the fields above are diagnostics/fallbacks.
     timing_authority: Optional[Dict[str, Any]] = None
@@ -440,13 +440,13 @@ class TimingService:
 
         # Authoritative source: hf-timestd's adjudicated authority.json.
         # This is the unified, canonical timing provenance for ALL sigmond
-        # clients (authority_reader.to_timing_authority). It supersedes the
+        # clients (hamsci_dsp.timing.AuthoritySnapshot.to_timing_authority). It supersedes the
         # legacy fusion-API / chrony picture below — those remain only as a
         # fallback when authority.json is unavailable, and as diagnostic
         # sub-fields. (Historically wspr annotated from the fusion HTTP API,
         # which predated authority.json and ignored tier/sigma adjudication;
         # this is the S1 conformance fix.)
-        from .authority_reader import (
+        from hamsci_dsp.timing import (
             AuthorityReader, standalone_timing_authority,
         )
         try:
@@ -705,7 +705,7 @@ class TimingService:
         Each BandRecorder should get its own instance (RtpSyncStrategy
         tracks per-stream RTP timestamp state).
         """
-        from .authority_reader import AuthorityReader
+        from hamsci_dsp.timing import AuthorityReader
         from .sync_strategy import (
             RtpSyncStrategy, ClockSyncStrategy, FallbackSyncStrategy,
         )

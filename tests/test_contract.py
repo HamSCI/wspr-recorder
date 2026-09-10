@@ -144,3 +144,33 @@ class ValidateV04Tests(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+
+class TimingAuthorityAppliedFromRuntimeState(unittest.TestCase):
+    """§18.5: the field describes the labels the RUNNING recorder writes.
+    The daemon leaves its applied block at <output_dir>/timing-authority.json
+    beside status.json; inventory (another process) reports it while fresh
+    and null otherwise."""
+
+    STATE = Path("/tmp/wspr-recorder-test/timing-authority.json")
+
+    def tearDown(self):
+        self.STATE.unlink(missing_ok=True)
+
+    def _inst(self):
+        proc = _run("inventory", "--json")
+        return json.loads(proc.stdout)["instances"][0]
+
+    def test_fresh_state_file_is_reported_verbatim(self):
+        from hamsci_dsp.timing import write_applied_state
+        block = {"source": "hf-timestd@gov", "tier": "T6", "sigma_ns": 3972,
+                 "snapshot_age_s": 1.0, "radiod_id": "test"}
+        write_applied_state(self.STATE, block)
+        self.assertEqual(self._inst()["timing_authority_applied"], block)
+
+    def test_stale_state_file_reports_null(self):
+        import time
+        from hamsci_dsp.timing import write_applied_state
+        write_applied_state(self.STATE, {"tier": "T6"}, now_fn=lambda: time.time() - 3600)
+        self.assertIsNone(self._inst()["timing_authority_applied"])
