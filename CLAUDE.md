@@ -45,6 +45,25 @@ PYTHONPATH=. python3 -m wspr_recorder -c config.toml
 # Production install / upgrade (uses sigmond's shared _ensure_uv helper)
 sudo ./scripts/install.sh           # first-run: user, venv (via uv), config, systemd
 sudo ./scripts/deploy.sh            # ongoing: refresh + restart instances
+```
+
+⛔ **Station venv: `uv sync` alone breaks decoding.** sigmond is deliberately
+absent from `uv.lock` (host-wide orchestrator, lazy-imported), and `uv sync` is
+exact — it REMOVES sigmond from `/opt/git/sigmond/wspr-recorder/venv`. Without
+it `spot_sink` cannot import `sigmond.hamsci_sink`; the recorder then RECORDS
+WAVs but never DECODES, and `smd wspr watch` shows nothing. `deploy.sh` does not
+touch the venv, so whenever a dependency changes (e.g. hamsci-dsp on 2026-09-10)
+run BOTH lines install.sh runs, as `sigmond`, from inside the checkout:
+
+```bash
+UV_PROJECT_ENVIRONMENT=venv uv sync --no-dev --frozen
+uv pip install --python venv/bin/python3 -e /opt/git/sigmond/sigmond
+venv/bin/python -c 'import sigmond.hamsci_sink'   # must succeed before restart
+```
+
+Acceptance after the restart: the startup line `decode: DB-direct via SpotSink
+ENABLED`, then a `cycle UTC … spots` line within ~4 min. (2026-09-10: a sync
+without the pip line cost B4 2 h 46 min and ND 26 min of WSPR decode.)
 
 # Run with CPU isolation (production-like)
 ./run_isolated.sh

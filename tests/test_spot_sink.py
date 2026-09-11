@@ -515,3 +515,46 @@ class TestSpotSinkPlumbsReporterId(unittest.TestCase):
     def test_default_none(self):
         sink = SpotSink(rx_call="AC0G", rx_grid="EM38", enabled=False)
         self.assertIsNone(sink.reporter_id)
+
+
+class TestSpotSinkDisabledReason(unittest.TestCase):
+    """A disabled sink must say WHY.  On 2026-09-10 a bare `uv sync` stripped
+    sigmond from the venv; the startup line blamed WD_DECODE_VIA_DB, the env
+    flag was fine, and two stations recorded-without-decoding for hours."""
+
+    def test_enabled_sink_has_no_reason(self):
+        w = MagicMock(); w.is_noop = False
+        sink = SpotSink(rx_call="A", rx_grid="EM", enabled=True, writer=w)
+        self.assertIsNone(sink.disabled_reason)
+        level, text = sink.startup_verdict()
+        self.assertEqual(level, "info")
+        self.assertIn("ENABLED", text)
+
+    def test_reason_env_flag_unset(self):
+        with patch.dict(os.environ, {}, clear=False):
+            os.environ.pop("WD_DECODE_VIA_DB", None)
+            sink = SpotSink(rx_call="A", rx_grid="EM")
+        self.assertIn("WD_DECODE_VIA_DB", sink.disabled_reason)
+        level, text = sink.startup_verdict()
+        self.assertEqual(level, "warning")
+        self.assertIn("EnvironmentFile", text)
+        self.assertNotIn("not importable", text)
+
+    def test_reason_writer_not_importable(self):
+        with patch.dict(os.environ, {"WD_DECODE_VIA_DB": "1"}), \
+             patch("wspr_recorder.spot_sink._resolve_writer", return_value=None):
+            sink = SpotSink(rx_call="A", rx_grid="EM")
+        self.assertFalse(sink.enabled)
+        self.assertIn("not importable", sink.disabled_reason)
+        level, text = sink.startup_verdict()
+        self.assertEqual(level, "warning")
+        self.assertIn("uv pip install", text)          # the remedy
+        self.assertNotIn("WD_DECODE_VIA_DB unset", text)  # the wrong blame
+
+    def test_reason_writer_is_noop(self):
+        w = MagicMock(); w.is_noop = True
+        with patch.dict(os.environ, {"WD_DECODE_VIA_DB": "1"}):
+            sink = SpotSink(rx_call="A", rx_grid="EM", writer=w)
+        self.assertFalse(sink.enabled)
+        self.assertIn("no-op", sink.disabled_reason)
+        self.assertIn("sink.db", sink.startup_verdict()[1])

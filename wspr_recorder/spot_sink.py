@@ -388,11 +388,31 @@ class SpotSink:
         # radiod_id so every row still has a meaningful reporter_id.
         self.reporter_id = reporter_id
 
+        # Why the sink is disabled, or None.  Three causes, three remedies —
+        # the startup line must name the right one (2026-09-10: a bare
+        # `uv sync` stripped sigmond from the venv, the line blamed the env
+        # flag, and two stations recorded without decoding for hours).
+        self.disabled_reason: Optional[str] = None
         if enabled is None:
             enabled = _enabled()
+            if not enabled:
+                self.disabled_reason = (
+                    "WD_DECODE_VIA_DB unset/0 — the unit's EnvironmentFile "
+                    "likely did not load (instance-name escaping; see the "
+                    "note in systemd/wspr-recorder@.service)"
+                )
+        elif not enabled:
+            self.disabled_reason = "disabled explicitly (enabled=False)"
         self._writer = writer if enabled else None
         if enabled and self._writer is None:
             self._writer = _resolve_writer()
+            if self._writer is None:
+                self.disabled_reason = (
+                    "sigmond.hamsci_sink not importable — sigmond is missing "
+                    "from this venv (a bare `uv sync` removes it; run "
+                    "`uv pip install --python venv/bin/python3 -e "
+                    "/opt/git/sigmond/sigmond`, then restart)"
+                )
         # Writer.from_env() returns a NO-OP writer (is_noop=True) when
         # the producer user can't write to the sink — e.g. wsprdaemon
         # has no g+w on /var/lib/sigmond/sink.db.  Without this check,
@@ -408,6 +428,10 @@ class SpotSink:
                 _whoami(),
             )
             self._writer = None
+            self.disabled_reason = (
+                f"sigmond writer is a no-op — producer user {_whoami()} "
+                "lacks g+w on /var/lib/sigmond/sink.db"
+            )
         self.enabled = self._writer is not None
 
         if self.enabled:
@@ -431,6 +455,22 @@ class SpotSink:
         # `submit_noise_batches` call.  Lazy so stations that don't
         # ship noise pay nothing.
         self._noise_writer = None
+
+
+    def startup_verdict(self) -> tuple[str, str]:
+        """(log level, one-line decode-mode verdict) for the daemon's startup.
+
+        A silently-disabled sink is exactly how a receiver ends up RECORDING
+        WAVs but never DECODING; the line must be loud AND name the cause.
+        """
+        if self.enabled:
+            return ("info",
+                    "decode: DB-direct via SpotSink ENABLED "
+                    f"(writing to {getattr(self._writer, 'database', '?')})")
+        return ("warning",
+                f"decode: DB-direct SpotSink DISABLED: {self.disabled_reason} "
+                "— this receiver RECORDS but will NOT decode unless a legacy "
+                "wd-decode@* chain is running")
 
     def submit_batch(
         self,
