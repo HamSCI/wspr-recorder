@@ -9,19 +9,35 @@ jt9 runs with -Y flag to expose numeric 22-bit hashes for resolution.
 """
 
 import logging
+import os
 import re
 import subprocess
+import time
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import List, Optional
 
 from .callsign_db import CallsignDB
+from .decode_health import HEALTH
 from .decode_mode import DecodeMode, DECODE_MODE_PKT_MODES
 
 logger = logging.getLogger(__name__)
 
 # Maximum ALL_WSPR.TXT size before truncation (matches v3)
 MAX_ALL_WSPR_SIZE = 200_000
+
+# Wall-clock kill for a decoder.  WSPRD_TIMEOUT_S applies to the 2-minute
+# modes, which really are racing the next cycle; LONG_DECODE_TIMEOUT_S to
+# F5/F15/F30, which are not (see decode_fst4w and decode_health.py).
+WSPRD_TIMEOUT_S = 110
+LONG_DECODE_TIMEOUT_S = 300
+
+
+def _env_int(name: str, default: int) -> int:
+    try:
+        return int(os.environ.get(name, "") or default)
+    except ValueError:
+        return default
 
 # Regex for jt9 -Y numeric hash: <NNNNNNN> (7-digit zero-padded)
 _HASH22_RE = re.compile(r'<(\d{1,7})>')
@@ -85,7 +101,8 @@ class DecoderRunner:
         # Track fst4_decodes.dat line count for diffing
         self._fst4_prev_lines: int = 0
 
-    def decode_wspr(self, wav_path: Path) -> List[RawSpot]:
+    def decode_wspr(self, wav_path: Path,
+                    cycle_start: Optional[float] = None) -> List[RawSpot]:
         """
         Run wsprd twice (standard + spreading), merge via best-spot logic.
 
@@ -110,13 +127,17 @@ class DecoderRunner:
         # Set ``WSPR_FEED_HASHTABLE=1`` to re-enable the legacy
         # behaviour for A/B testing.
         ht_path = self.work_dir / "hashtable.txt"
+        # Decode-health accounting: how long this cycle's decode took, and
+        # whether wsprd was killed before it finished (see decode_health.py).
+        _t0 = time.monotonic()
+        _killed: List[bool] = []
         import os as _os
         if _os.environ.get("WSPR_FEED_HASHTABLE", "0") == "1":
             self.callsign_db.write_wsprd_hashtable(ht_path)
 
         # Run standard pass
         standard_spots = self._run_wsprd(
-            wav_path, self.wsprd_path, spreading=False,
+            wav_path, self.wsprd_path, spreading=False, killed=_killed,
         )
 
         # Run spreading pass — skipped when no spreading binary was
@@ -124,7 +145,7 @@ class DecoderRunner:
         # standard spots unchanged from the merge step in that case.
         if self.wsprd_spread_path:
             spreading_spots = self._run_wsprd(
-                wav_path, self.wsprd_spread_path, spreading=True,
+                wav_path, self.wsprd_spread_path, spreading=True, killed=_killed,
             )
         else:
             spreading_spots = []
@@ -151,10 +172,12 @@ class DecoderRunner:
         # Truncate ALL_WSPR.TXT if too large
         self._truncate_all_wspr()
 
+        self._record_health("W2", 120, cycle_start, _t0, killed=bool(_killed))
         return merged
 
     def decode_fst4w(self, wav_path: Path, period: int,
-                     mode: DecodeMode) -> List[RawSpot]:
+                     mode: DecodeMode,
+                     cycle_start: Optional[float] = None) -> List[RawSpot]:
         """
         Run jt9 -Y --fst4w on a period-length WAV file.
 
@@ -170,6 +193,8 @@ class DecoderRunner:
         # own ``fst4w_calls.txt`` across invocations unless the
         # operator opts back into CallsignDB-driven seeding.
         calls_path = self.work_dir / "fst4w_calls.txt"
+        # Decode-health accounting (see decode_health.py)
+        _t0 = time.monotonic()
         import os as _os
         if _os.environ.get("WSPR_FEED_HASHTABLE", "0") == "1":
             self.callsign_db.write_jt9_calls(calls_path)
@@ -182,10 +207,20 @@ class DecoderRunner:
         (self.work_dir / "plotspec").touch()
         (self.work_dir / "decdata").touch()
 
+        # 110 s is the right wall-clock kill for a 2-minute slot.  It is the
+        # WRONG one for F5/F15/F30: those have their own 5, 15 and 30 minute
+        # cycles, they all come due together at :00 and :30, and killing jt9 at
+        # 110 s throws away a decode that had minutes of headroom — silently,
+        # since a killed decoder reports no spots.  So scale the kill with the
+        # slot length, still bounded, so a wedged jt9 cannot hold a pool worker
+        # indefinitely.  The 2-minute work queued behind it is not lost: the
+        # pool runs short periods first and drains it afterwards.
+        kill_after = (WSPRD_TIMEOUT_S if period <= 120
+                      else _env_int("WSPR_LONG_DECODE_TIMEOUT_SEC", LONG_DECODE_TIMEOUT_S))
         # Run jt9
         cmd = [
             "nice", "-n", "19",
-            "timeout", "110",
+            "timeout", str(kill_after),
             self.jt9_path,
             "-Y",
             "-a", str(self.work_dir),
@@ -198,7 +233,7 @@ class DecoderRunner:
 
         try:
             result = subprocess.run(
-                cmd, capture_output=True, text=True, timeout=120,
+                cmd, capture_output=True, text=True, timeout=kill_after + 10,
                 cwd=str(self.work_dir),
             )
             if result.returncode != 0 and result.returncode != 1:
@@ -206,8 +241,14 @@ class DecoderRunner:
                     f"{self.band_name}: jt9 exited {result.returncode}: "
                     f"{result.stderr[:200]}"
                 )
+            # 124 is the 'timeout 110' above killing jt9 mid-decode: this
+            # period produced no spots, which is a lost cycle, not a quiet one.
+            if result.returncode == 124:
+                self._record_health(mode.value, period, cycle_start, _t0, killed=True)
+                return []
         except subprocess.TimeoutExpired:
             logger.warning(f"{self.band_name}: jt9 timed out")
+            self._record_health(mode.value, period, cycle_start, _t0, killed=True)
             return []
         except FileNotFoundError:
             logger.error(f"{self.band_name}: jt9 not found at {self.jt9_path}")
@@ -246,7 +287,31 @@ class DecoderRunner:
         if new > 0:
             logger.info(f"{self.band_name}: {new} new callsigns from jt9")
 
+        self._record_health(mode.value, period, cycle_start, _t0, killed=False)
         return spots
+
+    def _record_health(self, mode: str, period_s: int,
+                       cycle_start: Optional[float], t0: float,
+                       *, killed: bool) -> None:
+        """File one decode outcome with the decode-health ledger.
+
+        ``cycle_start`` is the wall-clock start of the audio slice, so the
+        audio was complete at ``cycle_start + period_s`` and everything after
+        that is this decode running late.  Callers that don't know the cycle
+        (tests, decode_cycle) pass None and only the elapsed/killed half is
+        recorded.  Never raises: health accounting must not break a decode.
+        """
+        try:
+            elapsed = time.monotonic() - t0
+            HEALTH.record(
+                band=self.band_name, mode=mode, period_s=period_s,
+                cycle_start=(cycle_start if cycle_start is not None
+                             else time.time() - elapsed - period_s),
+                decode_start=time.time() - elapsed,
+                elapsed_s=elapsed, killed=killed,
+            )
+        except Exception:                                    # noqa: BLE001
+            logger.debug("decode-health: could not record outcome", exc_info=True)
 
     def decode_cycle(self, wav_path: Path,
                      modes: List[DecodeMode]) -> List[RawSpot]:
@@ -277,7 +342,8 @@ class DecoderRunner:
     # ------------------------------------------------------------------
 
     def _run_wsprd(self, wav_path: Path, wsprd_bin: str,
-                   spreading: bool = False) -> List[RawSpot]:
+                   spreading: bool = False,
+                   killed: Optional[List[bool]] = None) -> List[RawSpot]:
         """Run a single wsprd pass and parse ALL_WSPR.TXT for new spots."""
         all_wspr_path = self.work_dir / "ALL_WSPR.TXT"
         prev_lines = self._count_lines(all_wspr_path)
@@ -302,6 +368,8 @@ class DecoderRunner:
             )
         except subprocess.TimeoutExpired:
             logger.warning(f"{self.band_name}: wsprd timed out")
+            if killed is not None:
+                killed.append(True)
             return []
         except FileNotFoundError:
             logger.error(f"{self.band_name}: wsprd not found at {wsprd_bin}")

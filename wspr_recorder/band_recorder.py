@@ -12,11 +12,13 @@ import logging
 import math
 import os
 import numpy as np
+
 from dataclasses import dataclass, field
 from typing import Optional, Callable, List, Tuple
 from datetime import datetime, timedelta, timezone
 from concurrent.futures import ThreadPoolExecutor
 
+from .decode_health import HEALTH as DECODE_HEALTH
 from .sync_strategy import SyncStrategy, FallbackSyncStrategy
 from .decode_mode import (
     DecodeMode, DECODE_MODE_PERIODS,
@@ -761,6 +763,15 @@ class BandRecorder:
                             f"{self.band_name}: {period_sec}s slot at "
                             f"{start_wallclock} not resident (offset {start_off}, "
                             f"slide {slide:+.2f}s) — skipping"
+                        )
+                        # Skipping here means this cycle is never decoded at all,
+                        # which is the one outcome an operator has to be able to
+                        # count.  File it, then carry on.
+                        DECODE_HEALTH.record_drop(
+                            band=self.band_name, period_s=period_sec,
+                            cycle_start=start_wallclock.timestamp(),
+                            detail=f"audio no longer resident in the ring "
+                                   f"(offset {start_off}, slide {slide:+.2f}s)",
                         )
                         nxt += period_sec
                         continue

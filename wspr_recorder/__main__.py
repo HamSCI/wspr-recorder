@@ -44,6 +44,7 @@ from .timing_guard import (
 from ka9q.recovery_ladder import RecoveryAction, RecoveryLadder
 from .hs_uploader_shim import WsprUploaderHs
 from .backlog_monitor import BacklogMonitor
+from .decode_health import HEALTH as DECODE_HEALTH
 
 logger = logging.getLogger(__name__)
 
@@ -418,6 +419,13 @@ class WsprRecorder:
                             "skipping cycle", request.band_name,
                             request.period_seconds,
                         )
+                        DECODE_HEALTH.record_drop(
+                            band=request.band_name,
+                            period_s=request.period_seconds,
+                            cycle_start=request.start_wallclock.timestamp(),
+                            detail="deferred slice was evicted from the ring "
+                                   "before its host-wide decode slot came free",
+                        )
                         return
                     samples, gaps, start_wc, start_rtp = extracted
                     request.samples = samples
@@ -643,7 +651,10 @@ class WsprRecorder:
             for mode in request.modes:
                 try:
                     if mode == DecodeMode.W2:
-                        spots = runner.decode_wspr(decoder_wav)
+                        spots = runner.decode_wspr(
+                            decoder_wav,
+                            cycle_start=request.start_wallclock.timestamp(),
+                        )
                         # wsprd's `-c` flag wrote the C2 file in the same
                         # work_dir.  Compute per-cycle noise immediately so
                         # we don't race the next decode that would overwrite
@@ -659,6 +670,7 @@ class WsprRecorder:
                             decoder_wav,
                             period=request.period_seconds,
                             mode=mode,
+                            cycle_start=request.start_wallclock.timestamp(),
                         )
                 except Exception as exc:
                     logger.warning(
@@ -1523,6 +1535,9 @@ class WsprRecorder:
         status["executor_backlog"] = self._executor_backlog()
         status["executor_workers"] = self.executor._max_workers
         status["decode_backlog"] = self._backlog_monitor.as_dict()
+        # What the backlog has actually cost: decodes killed by their timeout,
+        # decodes that outran their cycle, and cycles never decoded at all.
+        status["decode_health"] = DECODE_HEALTH.summary()
         if self._memprofile:
             current, peak = tracemalloc.get_traced_memory()
             status["tracemalloc"] = {
@@ -1678,6 +1693,13 @@ class WsprRecorder:
         assessment = self._backlog_monitor.assess(self._backlog_snapshot())
         if assessment.level == "warn":
             issues.append(assessment.reason)
+        # The backlog monitor says "falling behind now"; these say what was
+        # already lost.  A killed decode or a dropped cycle is unhealthy.
+        health_issues = DECODE_HEALTH.issues()
+        if health_issues:
+            issues.extend(health_issues)
+            if DECODE_HEALTH.summary(window_s=3600.0)["cycles_missed"]:
+                healthy = False
 
         return {
             "healthy": healthy,
@@ -1688,8 +1710,21 @@ class WsprRecorder:
             "executor_backlog": backlog,
             "executor_workers": self.executor._max_workers,
             "decode_backlog": assessment.as_dict(),
+            "decode_health": DECODE_HEALTH.summary(window_s=3600.0),
         }
     
+    def _ipc_decode_health(self, params: Optional[Dict]) -> Dict:
+        """IPC: the decode-health ledger — which cycles the decoders did not
+        finish in time.  ``params={"hours": N}`` changes the window (24 h
+        default)."""
+        hours = 24.0
+        if params and "hours" in params:
+            try:
+                hours = float(params["hours"])
+            except (TypeError, ValueError):
+                pass
+        return DECODE_HEALTH.summary(window_s=hours * 3600.0)
+
     def _ipc_config(self, params: Optional[Dict]) -> Dict:
         """IPC: Get configuration summary."""
         return {
@@ -1715,6 +1750,7 @@ class WsprRecorder:
         self.ipc_server.register("bands", self._ipc_bands)
         self.ipc_server.register("band_status", self._ipc_band_status)
         self.ipc_server.register("health", self._ipc_health)
+        self.ipc_server.register("decode_health", self._ipc_decode_health)
         self.ipc_server.register("config", self._ipc_config)
         
         await self.ipc_server.start()

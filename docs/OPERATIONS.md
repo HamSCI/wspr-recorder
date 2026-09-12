@@ -61,6 +61,7 @@ Unix-socket JSON-RPC at `/run/wspr-recorder/control.sock`.
 ```bash
 wspr-ctl ping                   # {"pong": true}
 wspr-ctl health                 # exit 0 healthy, 2 unhealthy
+wspr-ctl decode-health          # cycles the decoders did not finish in time (exit 2 if any were lost)
 wspr-ctl status                 # full status (uptime, bands, timing, exec queue)
 wspr-ctl timing                 # chrony/hf-timestd source + tier
 wspr-ctl bands                  # per-band: ssrc, synced, ring minutes, packets, periods
@@ -224,6 +225,56 @@ wspr-recorder is pinned to — see `run_isolated.sh`), a decoder clock
 cap set too low (the wsprdaemon K6FOD case: a 1.4 GHz cap starved the
 decoders and 3600 files piled up unnoticed), `Nice=5` being
 overridden, or wsprd / jt9 decodes running long in full-pipeline mode.
+
+### A band stops keeping up: `wspr-ctl decode-health`
+
+A decode that runs longer than its cycle is **not** a fault. Decode jobs
+are triggered by the audio being available, never by a clock:
+`band_recorder` emits a slot the moment
+`leading_off >= start_off + n_samples` and walks its `_slot_next_utc`
+cursor forward one period at a time, so a late emitter emits every
+pending slot in order; `_dispatch_request` submits without blocking, and
+`PriorityDecodePool` runs short periods ahead of long ones. The :00 and
+:30 waves, where F5+F15+F30 come due together on every band, drain by
+themselves.
+
+The decode-health ledger (`decode_health.py`) records what happens when
+they don't. `wspr-ctl decode-health` prints it (`--hours N`, `--json`):
+
+- **BEHIND** — a band has been at least `WSPR_DECODE_LATE_SEC` (120 s,
+  one W2 cycle) behind for `WSPR_DECODE_SUSTAIN_CYCLES` (5) decodes in a
+  row *and* has made no net progress over that run. Logged ERROR once
+  per episode, reminder every 5 cycles. A burst that is draining —
+  lateness falling cycle over cycle — never trips it, however late it
+  started.
+- **CAUGHT_UP** — a late run ended by itself; says how long it lasted
+  and how far behind it got. A transient leaves a record, never an
+  error.
+- **KILLED** — wsprd / jt9 was killed by its timeout, so that mode
+  reported no spots for that cycle. A definite lost cycle.
+- **DROPPED** — the cycle was never decoded: its audio was no longer
+  resident in the ring (a slid short slot, or a deferred F15/F30 slice
+  evicted before its host-wide slot came free).
+- **LATE** — one late start. Recorded, never alarmed on its own; it is
+  what the BEHIND rule is computed from.
+
+`late` — the seconds from "audio complete" to "decode started" — is the
+backlog in seconds, per band. `wspr-ctl health` goes unhealthy while a
+band is in a BEHIND episode or a cycle has been lost in the last hour.
+Events are appended to `decode-health.jsonl` in the state directory
+(`/var/lib/wspr-recorder` under systemd), so the history survives a
+restart and `wspr-ctl decode-health` still reports after a crash, when
+the socket is gone. `WSPR_DECODE_HEALTH=0` disables the ledger.
+
+The decoder's wall-clock kill scales with the slot: 110 s for the
+2-minute modes, which really are racing the next cycle, and
+`WSPR_LONG_DECODE_TIMEOUT_SEC` (default 300 s) for F5/F15/F30, which are
+not — killing an F30 jt9 at 110 s threw away a decode that had 30
+minutes of headroom, and did it silently.
+
+wsprdaemon carries the same rule and the same names in
+`wd-decode-health.sh`, reported by `wsprdaemon.sh -b` (`wdb`), so one
+report reads the same on either system.
 
 ### RSS grows steadily, Python heap flat
 
