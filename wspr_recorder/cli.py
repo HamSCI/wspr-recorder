@@ -312,12 +312,12 @@ def _handle_daemon(args) -> None:
     if args.config:
         legacy_argv += ["-c", str(args.config)]
     if getattr(args, "instance", None):
-        # systemd escapes '=' in unit instance names to '\x3d', so with
-        # the %i unit templates a '='-style (reporter-id sentinel)
-        # instance reaches us in escaped form.  Unescape so config
-        # lookup works for both naming styles ('-' names untouched).
+        # The unit passes --instance %i, and %i keeps systemd's spelling
+        # (AC0G\x3dB4).  Decode every \xHH so config lookup finds
+        # /etc/wspr-recorder/AC0G=B4.toml ('-' names pass untouched).
+        from ._reporter_id import unescape_systemd_instance
         legacy_argv += [
-            "--instance", str(args.instance).replace("\\x3d", "="),
+            "--instance", unescape_systemd_instance(str(args.instance)),
         ]
     if getattr(args, "memprofile", False):
         legacy_argv += ["--memprofile"]
