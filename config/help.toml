@@ -103,19 +103,9 @@ hidden = true
 [channel_defaults.high]
 hidden = true
 
-# Tier 2 — antenna / RX-chain tuning knob.
+# Policy 2026-10-23: channel gain is fixed at 0 dB, AGC off; not an operator knob.
 [channel_defaults.gain]
-title          = "Channel gain (dB)"
-help           = """Per-channel manual gain applied by radiod (AGC
-is off for WSPR — consistent levels matter more than instantaneous
-response).  Adjust to match your RX/antenna chain so wsprdaemon
-sees reasonable signal levels.
-
-0.0 dB is the typical starting point; raise if you're under-leveled,
-lower if you're saturating."""
-example        = "0.0"
-validator_hint = "float (dB)"
-required       = false
+hidden = true
 
 # --- Timing ---------------------------------------------------------
 #

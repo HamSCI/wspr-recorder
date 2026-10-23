@@ -205,8 +205,10 @@ class ChannelDefaults:
             sample_rate=data.get("sample_rate", 12000),
             mode=data.get("mode", "usb"),
             encoding=data.get("encoding", "f32"),
-            agc=data.get("agc", False),
-            gain=data.get("gain", 0.0),
+            # Policy 2026-10-23: no per-channel AGC, fixed 0 dB.  The keys
+            # are read for old configs but never honored.
+            agc=False,
+            gain=0.0,
             low=data.get("low", 1300),
             high=data.get("high", 1700),
         )
@@ -635,8 +637,8 @@ def load_config(config_path: str) -> Config:
             sample_rate=ch.get("sample_rate", config.channel_defaults.sample_rate),
             mode=ch.get("mode", config.channel_defaults.mode),
             encoding=ch.get("encoding", config.channel_defaults.encoding),
-            agc=ch.get("agc", config.channel_defaults.agc),
-            gain=ch.get("gain", config.channel_defaults.gain),
+            agc=False,   # policy 2026-10-23: never per-channel AGC
+            gain=0.0,    # fixed 0 dB
             low=ch.get("low", config.channel_defaults.low),
             high=ch.get("high", config.channel_defaults.high),
         )

@@ -476,8 +476,8 @@ class ReceiverManager:
                 frequency_hz=float(freq_hz),
                 preset=defaults.mode,
                 sample_rate=defaults.sample_rate,
-                agc_enable=1 if defaults.agc else 0,
-                gain=defaults.gain,
+                agc_enable=0,    # policy 2026-10-23: never per-channel AGC,
+                gain=0.0,        # fixed 0 dB; config cannot override
                 encoding=encoding_int,
                 lifetime=lifetime_arg,
             )
@@ -521,8 +521,8 @@ class ReceiverManager:
                 frequency_hz=float(freq_hz),
                 preset=defaults.mode,
                 sample_rate=defaults.sample_rate,
-                agc_enable=1 if defaults.agc else 0,
-                gain=defaults.gain,
+                agc_enable=0,    # policy 2026-10-23: never per-channel AGC,
+                gain=0.0,        # fixed 0 dB; config cannot override
                 encoding=encoding_int,
                 on_samples=sink.on_samples,
                 on_stream_dropped=sink.on_stream_dropped,
@@ -648,8 +648,8 @@ class ReceiverManager:
                         frequency_hz=float(state.frequency_hz),
                         preset=defaults.mode,
                         sample_rate=target_rate,
-                        agc_enable=1 if defaults.agc else 0,
-                        gain=defaults.gain,
+                        agc_enable=0,    # policy 2026-10-23: never per-channel AGC,
+                        gain=0.0,        # fixed 0 dB; config cannot override
                         encoding=encoding_int,
                         lifetime=lifetime_arg,
                     )
