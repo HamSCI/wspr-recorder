@@ -363,11 +363,16 @@ class WavWriter:
         """
         Write a period-length WAV file from a DecodeRequest.
 
-        Samples arrive as float32 from the ring buffer. They are
-        peak-normalized over the full period and converted to int16
-        for the WAV (wsprd/jt9 require int16 PCM). The applied scale
-        factor is recorded in the JSON sidecar so absolute amplitude
-        can be reconstructed downstream.
+        Samples arrive as float32 from the ring buffer and, with
+        ``sample_format == "float32"`` (the config default), are written
+        UNCHANGED as an IEEE-float WAV: the UberSDR wsprd and jt9 builds
+        sigmond installs read float32 WAVs directly (verified on KJ6MKI
+        2026-10-28 against raw radiod captures: identical decodes to the
+        int16 path, FST4W included), so nothing is quantised or rescaled
+        between radiod and the decoder — rob's rule: all samples stay
+        32-bit float.  ``sample_format == "int16"`` keeps the former
+        behaviour (per-period peak-normalisation to the full int16 range,
+        scale recorded in the sidecar) for decoders that need PCM16.
 
         Args:
             request: DecodeRequest with float32 samples and metadata
@@ -392,23 +397,29 @@ class WavWriter:
             tmp_path = band_dir / f".{filename}.tmp"
             json_path = band_dir / f"{filename[:-4]}.json"
 
-            # Per-period peak-normalize float32 → int16. Uses the full
-            # int16 range regardless of signal level, maximizing dynamic
-            # range for weak WSPR signals.
             peak = float(np.abs(request.samples).max()) if len(request.samples) else 0.0
-            if peak > 0.0:
-                scale = 32767.0 / peak
+            if self.sample_format == "float32":
+                # Pass the ring's float32 through untouched (IEEE float WAV,
+                # format tag 3).  No normalisation: absolute level survives.
+                scale = 1.0
+                self._write_float32_wav(tmp_path, request.samples)
             else:
-                scale = 1.0  # silent period — emit zeros
-            int16_samples = np.clip(
-                request.samples * scale, -32768.0, 32767.0,
-            ).astype(np.int16)
+                # Per-period peak-normalize float32 → int16. Uses the full
+                # int16 range regardless of signal level, maximizing dynamic
+                # range for weak WSPR signals.
+                if peak > 0.0:
+                    scale = 32767.0 / peak
+                else:
+                    scale = 1.0  # silent period — emit zeros
+                int16_samples = np.clip(
+                    request.samples * scale, -32768.0, 32767.0,
+                ).astype(np.int16)
 
-            with wave.open(str(tmp_path), 'wb') as wav:
-                wav.setnchannels(1)
-                wav.setsampwidth(2)
-                wav.setframerate(self.sample_rate)
-                wav.writeframes(int16_samples.tobytes())
+                with wave.open(str(tmp_path), 'wb') as wav:
+                    wav.setnchannels(1)
+                    wav.setsampwidth(2)
+                    wav.setframerate(self.sample_rate)
+                    wav.writeframes(int16_samples.tobytes())
 
             tmp_path.rename(wav_path)
 
@@ -441,7 +452,7 @@ class WavWriter:
                 "band_name": request.band_name,
                 "sample_rate": self.sample_rate,
                 "samples": n_samples,
-                "sample_format": "int16",
+                "sample_format": self.sample_format,
                 "normalization": {
                     "float32_peak": peak,
                     "int16_scale": scale,
