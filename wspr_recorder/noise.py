@@ -44,6 +44,18 @@ logger = logging.getLogger(__name__)
 _RMS_NL_ADJUST = -74.31   # cal_rms_offset + 10*log10(1/cal_ne_bw)
 _FFT_NL_ADJUST = -187.7   # cal_c2_correction
 
+# Float32 decoder WAV (wav_writer sample_format "float32", the default since
+# 2026-10-28): the WAV carries radiod's float samples unscaled, and the
+# UberSDR wsprd scales a float WAV by 32767 internally before writing its C2
+# file (measured on KJ6MKI: C2 level differs from a -1 dBFS-normalised int16
+# WAV by exactly the normalisation gain).  wsprdaemon's decoding.sh works on
+# a WAV sox normalised to -1 dBFS and then subtracts
+# ``sdr_noise_level_adjust = -peak_dBFS - 60 - 1``; the two peak terms cancel,
+# so against the unnormalised float data its whole correction collapses to a
+# constant +60 dB on both the RMS and the C2 side.  Verified against legacy
+# KJ6MKI 20 m (sox RMS -16.18 dB, peak -81.29 dBFS → -114.5 before band cal).
+_FLOAT_WAV_LEVEL_ADJUST = 60.0
+
 # Per-band KA9Q/RX888 noise calibration (dB, added to the computed noise).  The base RMS/FFT calibration above was
 # derived on a KiwiSDR; applied to an RX888/ka9q-radio chain it over-reads the noise floor by a band-dependent
 # ~5-10 dB.  These offsets were measured at AI6VN against a co-located calibrated KiwiSDR treated as ground truth
@@ -173,6 +185,42 @@ def compute_fft_noise(c2_path: Path) -> Optional[float]:
 
 # -------- combined: one cycle, one NoiseMeasurement --------
 
+def read_wav_mono_float(path: Path) -> tuple[int, Optional[np.ndarray]]:
+    """Read a mono WAV as float32 in [-1, 1] — int16 (tag 1) or IEEE float
+    (tag 3, what ``WavWriter.write_period`` emits by default).  Returns
+    ``(sample_rate, samples)``; ``(0, None)`` if the file can't be parsed.
+    The stdlib ``wave`` module rejects float WAVs, which is why the RMS noise
+    side went blank when the decoder WAV became float32."""
+    try:
+        data = Path(path).read_bytes()
+    except OSError:
+        return 0, None
+    if data[:4] != b"RIFF" or data[8:12] != b"WAVE":
+        return 0, None
+    pos = 12; fmt = None; payload = None
+    while pos + 8 <= len(data):
+        cid = data[pos:pos + 4]
+        size = struct.unpack("<I", data[pos + 4:pos + 8])[0]
+        if cid == b"fmt ":
+            fmt = data[pos + 8:pos + 8 + size]
+        elif cid == b"data":
+            payload = data[pos + 8:pos + 8 + size]
+            break
+        pos += 8 + size + (size & 1)
+    if fmt is None or payload is None or len(fmt) < 16:
+        return 0, None
+    tag, nch, sr, _br, _ba, bits = struct.unpack("<HHIIHH", fmt[:16])
+    if tag == 3 and bits == 32:
+        x = np.frombuffer(payload, dtype="<f4").astype(np.float32)
+    elif tag == 1 and bits == 16:
+        x = np.frombuffer(payload, dtype="<i2").astype(np.float32) / 32768.0
+    else:
+        return 0, None
+    if nch > 1:
+        x = x[::nch]
+    return int(sr), x
+
+
 def compute_noise(
     *,
     samples: Optional[np.ndarray],
@@ -180,6 +228,7 @@ def compute_noise(
     c2_path: Optional[Path],
     overload_count: int = 0,
     band: Optional[str] = None,
+    float_wav: bool = False,
 ) -> NoiseMeasurement:
     """One-shot for a decode cycle.  Either side returning None is
     tolerated — wsprdaemon.org accepts spots with a missing noise
@@ -194,6 +243,14 @@ def compute_noise(
     rms = (compute_rms_noise(samples, sample_rate)
            if samples is not None else None)
     fft = compute_fft_noise(c2_path) if c2_path is not None else None
+    if float_wav:
+        # See _FLOAT_WAV_LEVEL_ADJUST: the decoder WAV (and so wsprd's C2
+        # file) carried unnormalised float data; bring both sides onto
+        # wsprdaemon's calibrated scale.
+        if rms is not None:
+            rms += _FLOAT_WAV_LEVEL_ADJUST
+        if fft is not None:
+            fft += _FLOAT_WAV_LEVEL_ADJUST
     if band is not None:
         if rms is not None:
             rms += _RMS_CAL_OFFSET.get(band, 0.0)

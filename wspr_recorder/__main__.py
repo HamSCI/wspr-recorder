@@ -36,7 +36,7 @@ from .decode_mode import DecodeMode
 from .decoder import DecoderRunner
 from .callsign_db import CallsignDB
 from .spot_sink import SpotSink, CycleBatcher, resolve_reporter_identity
-from .noise import compute_noise, overload_delta
+from .noise import compute_noise, read_wav_mono_float, overload_delta
 from .timing_guard import (
     DtGuardConfig, dt_guard_evidence, dt_guard_step,
     WallClockGuardConfig, wallclock_guard_evidence, wallclock_guard_step,
@@ -1115,21 +1115,16 @@ class WsprRecorder:
         # Load audio samples — mono int16 at sample_rate.  Convert to
         # float32 normalized to [-1, 1] for parity with v1's sox-based
         # measurement (which works on float internally).
-        try:
-            import wave
-            with wave.open(str(decoder_wav), "rb") as wf:
-                sr = wf.getframerate()
-                n = wf.getnframes()
-                raw = wf.readframes(n)
-        except Exception as exc:
+        # int16 or IEEE-float WAV (write_period emits float32 by default);
+        # the float case also tells compute_noise to apply the level
+        # adjustment that wsprdaemon's normalise-then-subtract arithmetic
+        # reduces to (see noise._FLOAT_WAV_LEVEL_ADJUST).
+        sr, samples = read_wav_mono_float(decoder_wav)
+        if samples is None:
             logger.debug(
-                "noise: cannot read WAV %s: %s — skipping rms half",
-                decoder_wav.name, exc,
+                "noise: cannot read WAV %s — skipping rms half", decoder_wav.name,
             )
-            sr = 0
-            samples = None
-        else:
-            samples = np.frombuffer(raw, dtype=np.int16).astype(np.float32) / 32768.0
+        float_wav = getattr(self.wav_writer, "sample_format", "int16") == "float32"
         # wsprd writes <stem>.c2 next to the input WAV.  Most-recent
         # *.c2 in work_dir is a safe fallback if the naming differs.
         c2_candidate = work_dir / f"{decoder_wav.stem}.c2"
@@ -1145,6 +1140,7 @@ class WsprRecorder:
             measurement = compute_noise(
                 samples=samples,
                 sample_rate=sr,
+                float_wav=float_wav,
                 c2_path=c2_candidate,
                 band=request.band_name,   # per-band KA9Q/RX888 noise calibration
                 overload_count=overload_count,
