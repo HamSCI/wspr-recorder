@@ -41,6 +41,8 @@ def _env_int(name: str, default: int) -> int:
 
 # Regex for jt9 -Y numeric hash: <NNNNNNN> (7-digit zero-padded)
 _HASH22_RE = re.compile(r'<(\d{1,7})>')
+# fst4_decodes.dat leading nutc column: i6.6 → exactly six digits.
+_NUTC_RE = re.compile(r"\d{6}")
 
 
 @dataclass
@@ -503,22 +505,43 @@ class DecoderRunner:
         """
         Parse one line from fst4_decodes.dat.
 
-        Format (21-22 fields):
-        icand itry nsyncoh iaptype ijitter npct ntype Keff nsync_qual
-        nharderrors dmin nhp hd sync xsnr xdt fsig w50 call grid power
+        WSJT-X ``lib/fst4_decode.f90`` (format 3021) writes, per decode::
+
+            nutc icand itry nsyncoh iaptype ijitter npct ntype Keff nsync_qual
+            nharderrors dmin nhp hd sync xsnr xdt fsig w50 <message…>
+
+        ``nutc`` is ``i6.6`` (zero-padded HHMMSS, e.g. ``000526``) and ``fsig``
+        is the AUDIO offset in Hz (``f7.1``, e.g. ``1535.0``) — not an absolute
+        frequency.  The message is ``CALL GRID PWR``, ``<hash> GRID6 PWR`` (-Y)
+        or ``CALL PWR``.
+
+        Until 2026-10-28 this parser assumed no ``nutc`` column and an absolute
+        ``fsig``: every index was off by one, ``int("CM88")`` raised, and every
+        FST4W decode jt9 produced was dropped — no sigmond site had ever
+        uploaded an FST4W spot (KJ6MKI migration, 40 m: 254/254 lines lost).
+        The historical 18-numeric-column form (no ``nutc``) is still accepted.
         """
         parts = line.split()
-        if len(parts) < 21:
+        if len(parts) < 20:
+            return None
+        off = 1 if _NUTC_RE.fullmatch(parts[0]) else 0
+        if len(parts) < 20 + off:
             return None
 
         try:
-            snr = int(round(float(parts[14])))    # xsnr
-            dt = float(parts[15])                  # xdt
-            freq_hz = float(parts[16])             # fsig (Hz)
+            snr = int(round(float(parts[14 + off])))    # xsnr
+            dt = float(parts[15 + off])                  # xdt
+            fsig_hz = float(parts[16 + off])             # fsig: audio offset (Hz)
+            # jt9's fsig is relative to the WAV's 0 Hz, i.e. to this band's
+            # dial.  Keep accepting an absolute value (old fixtures) by size.
+            freq_hz = fsig_hz if fsig_hz >= 100_000.0 else self.frequency_hz + fsig_hz
             freq_mhz = freq_hz / 1e6
-            call = parts[18]                       # call
-            grid = parts[19] if len(parts) > 19 else ""
-            power = int(parts[20]) if len(parts) > 20 else 0
+            msg = parts[18 + off:]                       # call [grid] [power]
+            call = msg[0]
+            grid = msg[1] if len(msg) > 1 else ""
+            power = int(msg[2]) if len(msg) > 2 else 0
+            if len(msg) == 2 and grid.lstrip("+-").isdigit():
+                power, grid = int(grid), ""              # "CALL PWR" (no grid)
 
             # Check for -Y numeric hash
             hash22 = None
@@ -527,9 +550,9 @@ class DecoderRunner:
                 hash22 = int(m.group(1))
 
             # Derive date/time from context (use placeholder, will be set by caller)
-            sync_quality = float(parts[13])        # sync
-            nhardmin = int(parts[9])               # nharderrors
-            metric = float(parts[10])              # dmin
+            sync_quality = float(parts[13 + off])  # sync
+            nhardmin = int(parts[9 + off])         # nharderrors
+            metric = float(parts[10 + off])        # dmin
 
             return RawSpot(
                 date="", time="",  # filled by caller from WAV filename

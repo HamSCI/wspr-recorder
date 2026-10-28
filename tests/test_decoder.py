@@ -101,6 +101,37 @@ class TestParseFst4Line:
         runner = make_runner()
         assert runner._parse_fst4_line("too short") is None
 
+    def test_real_jt9_line_with_nutc_and_audio_fsig(self):
+        """What jt9 (WSJT-X fst4_decode.f90 format 3021) actually writes:
+        a leading zero-padded nutc and fsig as the AUDIO offset in Hz.
+        Verbatim from KJ6MKI 40 m, 2026-10-28 (WB6CXC FST4W-120 beacon)."""
+        runner = make_runner()          # dial 14095600 in this fixture
+        line = ("000526   2  1  8  0  0  0  1  66  80   0   0.0   0   0.0"
+                "    43.16 -10.3  0.56 1535.0  0.012 WB6CXC CM88 30")
+        spot = runner._parse_fst4_line(line)
+        assert spot is not None
+        assert spot.snr == -10
+        assert abs(spot.dt - 0.56) < 1e-9
+        assert round(spot.freq * 1e6) == 14095600 + 1535      # dial + fsig
+        assert (spot.call, spot.grid, spot.power) == ("WB6CXC", "CM88", 30)
+        assert abs(spot.sync_quality - 43.16) < 1e-9
+        assert spot.nhardmin == 0          # nharderrors (col 10); nsync_qual=80 is col 9
+        assert spot.metric == 0.0          # dmin
+        assert spot.hash22 is None
+
+    def test_real_jt9_line_hash_and_no_grid(self):
+        runner = make_runner()
+        hashed = ("000526   5  1  8  0  0  0  1  66  74  12   3.5  12   3.5"
+                  "     7.63 -18.6  0.48 1460.0  0.258 <2288505> EM79 30")
+        spot = runner._parse_fst4_line(hashed)
+        assert spot is not None and spot.hash22 == 2288505
+        assert round(spot.freq * 1e6) == 14095600 + 1460
+        no_grid = ("000526   5  1  8  0  0  0  1  66  74  12   3.5  12   3.5"
+                   "     7.63 -18.6  0.48 1460.0  0.258 W8GPS 30")
+        spot = runner._parse_fst4_line(no_grid)
+        assert spot is not None
+        assert (spot.call, spot.grid, spot.power) == ("W8GPS", "", 30)
+
 
 class TestMergeWsprPasses:
     """Test merging of standard and spreading wsprd passes."""
