@@ -50,6 +50,7 @@ ProtectSystem=strict
 ProtectHome=read-only
 # /var/lib/sigmond: the shared sink.db (pending_uploads) + upload-wake.sock.
 # /var/lib/hs-uploader: the uploader's watermark store.
+# The "-" prefix makes both optional, so the unit starts without sigmond.
 # No /dev/shm/wspr-recorder, no StateDirectory (callhash) — those are
 # decode-side only.
 ReadWritePaths=-/var/lib/sigmond -/var/lib/hs-uploader

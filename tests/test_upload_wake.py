@@ -91,3 +91,15 @@ def test_radiod_strips_plain_local_suffix(tmp_path):
 def test_radiod_empty_address_is_remote(tmp_path):
     assert _radiod_is_local("", conf_dir=str(tmp_path)) is False
     assert _radiod_is_local(None, conf_dir=str(tmp_path)) is False
+
+
+def test_wake_path_follows_hs_uploaders_sink(tmp_path, monkeypatch):
+    """The recorder's notify and the daemon share one socket: the one beside
+    the sink hs_uploader resolves."""
+    from hs_uploader.sink import writer as hs_writer
+    for var in ("WSPR_UPLOAD_WAKE_SOCK", "HS_UPLOADER_WAKE_SOCK",
+                "HAMSCI_SINK_PATH", "SIGMOND_SQLITE_PATH"):
+        monkeypatch.delenv(var, raising=False)
+    sink = str(tmp_path / "hs" / "sink.db")
+    monkeypatch.setattr(hs_writer, "sink_path", lambda *a, **k: sink)
+    assert upload_wake.wake_path() == str(tmp_path / "hs" / "upload-wake.sock")

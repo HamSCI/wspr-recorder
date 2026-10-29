@@ -113,8 +113,10 @@ ProtectSystem=strict
 ProtectHome=read-only
 # /var/lib/sigmond: the SQLite sink wspr.spots/noise are written to.
 # /var/lib/hs-uploader: the in-process uploader's watermark store.
-# Both required because ProtectSystem=strict makes everything else
-# read-only — matches psk-recorder / hfdl-recorder.
+# The "-" prefix makes both optional, so the unit starts on a host without
+# sigmond.  Where a directory exists, ProtectSystem=strict would otherwise
+# make it read-only, so it must stay listed — matches psk-recorder /
+# hfdl-recorder.
 ReadWritePaths=/dev/shm/wspr-recorder /var/log/wspr-recorder /run/wspr-recorder -/var/lib/sigmond -/var/lib/hs-uploader
 ReadOnlyPaths=/etc/wspr-recorder
 PrivateNetwork=false

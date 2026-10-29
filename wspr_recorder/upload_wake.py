@@ -45,7 +45,17 @@ _DEBUG = os.environ.get("WSPR_WAKE_DEBUG", "").strip().lower() in (
 
 
 def wake_path() -> str:
-    """Resolve the shared wake-socket path (same dir as the sink)."""
+    """Resolve the shared wake-socket path (same dir as the sink).
+
+    Delegates to hs-uploader, so this process and the daemon agree on the
+    socket.  The body below serves a venv without hs-uploader.
+    """
+    try:
+        from hs_uploader.wake import wake_path as _hs_wake_path
+    except ImportError:
+        pass
+    else:
+        return _hs_wake_path()
     env = os.environ.get("WSPR_UPLOAD_WAKE_SOCK", "").strip()
     if env:
         return env
