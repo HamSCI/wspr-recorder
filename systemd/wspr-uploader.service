@@ -52,7 +52,7 @@ ProtectHome=read-only
 # /var/lib/hs-uploader: the uploader's watermark store.
 # No /dev/shm/wspr-recorder, no StateDirectory (callhash) — those are
 # decode-side only.
-ReadWritePaths=/var/lib/sigmond /var/lib/hs-uploader
+ReadWritePaths=-/var/lib/sigmond -/var/lib/hs-uploader
 ReadOnlyPaths=/etc/wspr-recorder
 PrivateNetwork=false
 # Outbound SFTP/HTTP only — no raw-socket / multicast RTP capture here, so

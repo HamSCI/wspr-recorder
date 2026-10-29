@@ -148,24 +148,29 @@ def resolve_reporter_identity(env=None):
 
 
 def _resolve_writer():
-    """Return a sigmond.hamsci_sink.Writer, or None.
+    """Return an hs_uploader.sink.Writer, or None.
 
-    Lazy-imported so wspr-recorder runs cleanly on hosts that haven't
-    installed sigmond (CI, kiwi-only deployments).  We always target
+    Lazy-imported so wspr-recorder runs cleanly on hosts without
+    hs-uploader (CI, kiwi-only deployments).  The writer's home is
+    ``hs_uploader.sink``; ``sigmond.hamsci_sink`` remains a fallback
+    for one release.  We always target
     the per-mode `wspr` database (resolved via the standard
     `hamsci_sink.Writer.from_env(mode="wspr", table="spots")` factory),
     so operators can override via `SIGMOND_SQLITE_DB_WSPR`
     without code changes.
     """
     try:
-        from sigmond.hamsci_sink import Writer  # type: ignore[import-not-found]
+        from hs_uploader.sink import Writer  # type: ignore[import-not-found]
     except ImportError:
-        logger.warning(
-            "spot_sink: sigmond.hamsci_sink not importable — DB writes "
-            "disabled.  Add /opt/git/sigmond/sigmond/lib to PYTHONPATH "
-            "or install sigmond alongside wsprdaemon-client to enable."
-        )
-        return None
+        try:
+            from sigmond.hamsci_sink import Writer  # type: ignore[import-not-found]
+        except ImportError:
+            logger.warning(
+                "spot_sink: hs_uploader.sink not importable — DB writes "
+                "disabled.  Install hs-uploader alongside "
+                "wsprdaemon-client to enable."
+            )
+            return None
     return Writer.from_env(
         mode="wspr", table="spots", schema_version=SCHEMA_VERSION,
     )

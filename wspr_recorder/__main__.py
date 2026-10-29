@@ -2210,7 +2210,7 @@ class WsprRecorder:
         #   2. cycle_batcher.stop() joins the writer thread and
         #      flushes any cycle whose deadline hasn't yet hit.
         #   3. spot_sink.close() then commits + closes the
-        #      hamsci_sink.Writer.
+        #      hs_uploader.sink.Writer.
         if self.cycle_batcher is not None:
             try:
                 self.cycle_batcher.stop()

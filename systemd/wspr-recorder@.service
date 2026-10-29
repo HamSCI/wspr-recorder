@@ -115,7 +115,7 @@ ProtectHome=read-only
 # /var/lib/hs-uploader: the in-process uploader's watermark store.
 # Both required because ProtectSystem=strict makes everything else
 # read-only — matches psk-recorder / hfdl-recorder.
-ReadWritePaths=/dev/shm/wspr-recorder /var/log/wspr-recorder /run/wspr-recorder /var/lib/sigmond /var/lib/hs-uploader
+ReadWritePaths=/dev/shm/wspr-recorder /var/log/wspr-recorder /run/wspr-recorder -/var/lib/sigmond -/var/lib/hs-uploader
 ReadOnlyPaths=/etc/wspr-recorder
 PrivateNetwork=false
 
