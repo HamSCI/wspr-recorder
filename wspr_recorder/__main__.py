@@ -1774,6 +1774,79 @@ class WsprRecorder:
         except Exception:
             logger.debug("sd_notify %r failed (not under systemd?)", message)
 
+    # Delays between connect attempts while no radiod answers; the last
+    # value repeats without end.  AC0G-B2, 2026-10-15 and 2026-11-04: the
+    # recorder tried the radiod's mDNS name once, exited 0, and systemd's
+    # start limit (10 in 300 s) locked the unit out until a person noticed.
+    _CONNECT_RETRY_DELAYS = (5, 10, 20, 40, 60)
+
+    async def _wait_interruptible(self, seconds: float) -> bool:
+        """Sleep up to ``seconds``; return True if shutdown was requested."""
+        try:
+            await asyncio.wait_for(self._shutdown_event.wait(), timeout=seconds)
+            return True
+        except asyncio.TimeoutError:
+            return False
+
+    async def _connect_with_backoff(self) -> int:
+        """Connect every source; while none connects, wait and retry.
+
+        Returns the number of connected sources, or 0 if shutdown arrived
+        first.  Sources that connected in a round proceed even if their
+        siblings failed (existing behaviour); the retry covers the case
+        where no source answered.  Sends READY=1 and a waiting STATUS
+        before the first wait so Type=notify's start timeout never fires.
+        """
+        keys = list(self.receiver_managers.keys())
+        waiting_since = None
+        attempt = 0
+        while True:
+            connect_results = await asyncio.gather(
+                *[
+                    asyncio.to_thread(self.receiver_managers[k].connect)
+                    for k in keys
+                ],
+                return_exceptions=True,
+            )
+            n_connected = 0
+            for k, res in zip(keys, connect_results):
+                if isinstance(res, Exception):
+                    if attempt == 0:
+                        logger.error("Source %s: connect raised: %s", k, res)
+                elif res:
+                    n_connected += 1
+                elif attempt == 0:
+                    logger.error("Source %s: failed to connect to radiod", k)
+            if n_connected:
+                if waiting_since is not None:
+                    logger.info(
+                        "radiod reachable after %.0f s; resuming startup",
+                        time.monotonic() - waiting_since,
+                    )
+                    self._sd_notify(b"STATUS=running")
+                return n_connected
+            addrs = ", ".join(
+                str(getattr(self.receiver_managers[k], "_status_address", k))
+                for k in keys
+            )
+            if waiting_since is None:
+                waiting_since = time.monotonic()
+                logger.warning(
+                    "radiod unreachable at %s; staying up and retrying "
+                    "(5 s, doubling to 60 s, without end)", addrs,
+                )
+                self._sd_notify(
+                    b"READY=1\nSTATUS=waiting for radiod " + addrs.encode()
+                )
+                for k in keys:
+                    self.receiver_managers[k].quiet_failures = True
+            delay = self._CONNECT_RETRY_DELAYS[
+                min(attempt, len(self._CONNECT_RETRY_DELAYS) - 1)
+            ]
+            attempt += 1
+            if await self._wait_interruptible(delay):
+                return 0
+
     def _total_samples_received(self):
         """Sum of RTP samples ingested across all band recorders.  Advances
         continuously while radiod streams (independent of band activity);
@@ -2037,26 +2110,9 @@ class WsprRecorder:
             logger.info("Connecting to radiod (parallel across %d source(s))...",
                         len(self.receiver_managers))
             keys = list(self.receiver_managers.keys())
-            connect_results = await asyncio.gather(
-                *[
-                    asyncio.to_thread(self.receiver_managers[k].connect)
-                    for k in keys
-                ],
-                return_exceptions=True,
-            )
-            n_connected = 0
-            for k, res in zip(keys, connect_results):
-                if isinstance(res, Exception):
-                    logger.error("Source %s: connect raised: %s", k, res)
-                elif res:
-                    n_connected += 1
-                else:
-                    logger.error("Source %s: failed to connect to radiod", k)
+            n_connected = await self._connect_with_backoff()
             if n_connected == 0:
-                logger.error(
-                    "All %d source(s) failed to connect — aborting startup",
-                    len(self.receiver_managers),
-                )
+                # Only reachable on shutdown during the wait.
                 startup_feeder.cancel()
                 return
 

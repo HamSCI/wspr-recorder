@@ -330,6 +330,8 @@ class ReceiverManager:
             os.environ.get("WSPR_PROVISION_SPACING_SEC", "0.3")
         )
 
+    quiet_failures = False
+
     def connect(self) -> bool:
         """Provision all channels and register them with MultiStream(s)."""
         try:
@@ -385,7 +387,9 @@ class ReceiverManager:
             )
             return success > 0
         except Exception as e:
-            logger.error(f"Failed to connect to radiod: {e}")
+            # quiet_failures: startup retry loop logs the episode once.
+            (logger.debug if self.quiet_failures else logger.error)(
+                f"Failed to connect to radiod: {e}")
             self.state.connected = False
             return False
 
