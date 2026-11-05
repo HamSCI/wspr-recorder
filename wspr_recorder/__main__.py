@@ -117,6 +117,29 @@ def _radiod_is_local(status_address: str, conf_dir: str = "/etc/radio") -> bool:
     return Path(conf_dir, f"radiod@{inst}.conf").exists()
 
 
+class _quiet_ka9q:
+    """Drop ka9q's own per-try failure records for a waiting episode.
+
+    RadiodControl._connect logs an ERROR with a traceback each time the
+    radiod name will not resolve; the recorder logs the episode once.
+    """
+
+    LOGGERS = ("ka9q.control", "ka9q.utils")
+
+    class _Drop(logging.Filter):
+        def filter(self, record):
+            return record.levelno > logging.ERROR
+
+    def __init__(self):
+        self._filter = self._Drop()
+        for name in self.LOGGERS:
+            logging.getLogger(name).addFilter(self._filter)
+
+    def remove(self):
+        for name in self.LOGGERS:
+            logging.getLogger(name).removeFilter(self._filter)
+
+
 class WsprRecorder:
     """
     Main WSPR recorder application.
@@ -1781,12 +1804,28 @@ class WsprRecorder:
     _CONNECT_RETRY_DELAYS = (5, 10, 20, 40, 60)
 
     async def _wait_interruptible(self, seconds: float) -> bool:
-        """Sleep up to ``seconds``; return True if shutdown was requested."""
+        """Sleep up to ``seconds``; return True if shutdown was requested.
+
+        Waits in slices of half the watchdog interval and sends WATCHDOG=1
+        after each, because systemd enforces WatchdogSec from READY=1 and
+        _watchdog_loop only starts after connect.
+        """
+        wd = os.environ.get("WATCHDOG_USEC")
         try:
-            await asyncio.wait_for(self._shutdown_event.wait(), timeout=seconds)
-            return True
-        except asyncio.TimeoutError:
-            return False
+            slice_s = int(wd) / 1_000_000 / 2 if wd else 30.0
+        except ValueError:
+            slice_s = 30.0
+        end = time.monotonic() + seconds
+        while True:
+            left = end - time.monotonic()
+            if left <= 0:
+                return False
+            try:
+                await asyncio.wait_for(
+                    self._shutdown_event.wait(), timeout=min(left, slice_s))
+                return True
+            except asyncio.TimeoutError:
+                self._sd_notify(b"WATCHDOG=1")
 
     async def _connect_with_backoff(self) -> int:
         """Connect every source; while none connects, wait and retry.
@@ -1800,52 +1839,70 @@ class WsprRecorder:
         keys = list(self.receiver_managers.keys())
         waiting_since = None
         attempt = 0
-        while True:
-            connect_results = await asyncio.gather(
-                *[
-                    asyncio.to_thread(self.receiver_managers[k].connect)
+        quiet = None
+        try:
+            while True:
+                connect_results = await asyncio.gather(
+                    *[
+                        asyncio.to_thread(self.receiver_managers[k].connect)
+                        for k in keys
+                    ],
+                    return_exceptions=True,
+                )
+                n_connected = 0
+                failed = []
+                for k, res in zip(keys, connect_results):
+                    if isinstance(res, Exception):
+                        failed.append(k)
+                        if attempt == 0:
+                            logger.error("Source %s: connect raised: %s", k, res)
+                    elif res:
+                        n_connected += 1
+                    else:
+                        failed.append(k)
+                        if attempt == 0:
+                            logger.error(
+                                "Source %s: failed to connect to radiod", k)
+                if n_connected:
+                    if waiting_since is not None:
+                        logger.info(
+                            "radiod reachable after %.0f s; resuming startup",
+                            time.monotonic() - waiting_since,
+                        )
+                        self._sd_notify(b"STATUS=running")
+                    return n_connected
+                addrs = ", ".join(
+                    str(getattr(self.receiver_managers[k], "_status_address", k))
                     for k in keys
-                ],
-                return_exceptions=True,
-            )
-            n_connected = 0
-            for k, res in zip(keys, connect_results):
-                if isinstance(res, Exception):
-                    if attempt == 0:
-                        logger.error("Source %s: connect raised: %s", k, res)
-                elif res:
-                    n_connected += 1
-                elif attempt == 0:
-                    logger.error("Source %s: failed to connect to radiod", k)
-            if n_connected:
-                if waiting_since is not None:
-                    logger.info(
-                        "radiod reachable after %.0f s; resuming startup",
-                        time.monotonic() - waiting_since,
+                )
+                for k in failed:  # drop the half-built control/listener
+                    try:
+                        self.receiver_managers[k].shutdown()
+                    except Exception:
+                        logger.debug("teardown after failed try", exc_info=True)
+                if waiting_since is None:
+                    waiting_since = time.monotonic()
+                    quiet = _quiet_ka9q()
+                    logger.warning(
+                        "radiod unreachable at %s; staying up and retrying "
+                        "(5 s, doubling to 60 s, without end)", addrs,
                     )
-                    self._sd_notify(b"STATUS=running")
-                return n_connected
-            addrs = ", ".join(
-                str(getattr(self.receiver_managers[k], "_status_address", k))
-                for k in keys
-            )
-            if waiting_since is None:
-                waiting_since = time.monotonic()
-                logger.warning(
-                    "radiod unreachable at %s; staying up and retrying "
-                    "(5 s, doubling to 60 s, without end)", addrs,
-                )
-                self._sd_notify(
-                    b"READY=1\nSTATUS=waiting for radiod " + addrs.encode()
-                )
-                for k in keys:
-                    self.receiver_managers[k].quiet_failures = True
-            delay = self._CONNECT_RETRY_DELAYS[
-                min(attempt, len(self._CONNECT_RETRY_DELAYS) - 1)
-            ]
-            attempt += 1
-            if await self._wait_interruptible(delay):
-                return 0
+                    self._sd_notify(
+                        b"READY=1\nSTATUS=waiting for radiod " + addrs.encode()
+                    )
+                    for k in keys:
+                        self.receiver_managers[k].quiet_failures = True
+                delay = self._CONNECT_RETRY_DELAYS[
+                    min(attempt, len(self._CONNECT_RETRY_DELAYS) - 1)
+                ]
+                attempt += 1
+                if await self._wait_interruptible(delay):
+                    return 0
+        finally:
+            if quiet is not None:
+                quiet.remove()
+            for k in keys:  # a later full_reset() failure must log at ERROR
+                self.receiver_managers[k].quiet_failures = False
 
     def _total_samples_received(self):
         """Sum of RTP samples ingested across all band recorders.  Advances
@@ -1925,6 +1982,7 @@ class WsprRecorder:
         self._running = True
         self._start_time = time.time()
         self._shutdown_event = asyncio.Event()
+        self._loop = asyncio.get_running_loop()
 
         if self._memprofile and not tracemalloc.is_tracing():
             tracemalloc.start(25)
@@ -2293,7 +2351,13 @@ class WsprRecorder:
     def request_shutdown(self) -> None:
         """Request graceful shutdown."""
         if self._shutdown_event:
-            self._shutdown_event.set()
+            loop = getattr(self, "_loop", None)
+            if loop is not None and loop.is_running():
+                # Event.set() from a signal handler never wakes the selector;
+                # a 60 s startup wait then ends only at the next timer.
+                loop.call_soon_threadsafe(self._shutdown_event.set)
+            else:
+                self._shutdown_event.set()
 
 
 def setup_logging(verbose: bool = False, log_file: Optional[str] = None) -> None:

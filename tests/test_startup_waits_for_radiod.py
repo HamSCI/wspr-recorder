@@ -5,6 +5,10 @@ the unit out.  It now reports READY, waits 5, 10, 20, 40, 60 s, and retries.
 """
 import asyncio
 import logging
+import os
+import signal
+import threading
+import time
 
 from wspr_recorder.__main__ import WsprRecorder
 
@@ -12,19 +16,26 @@ from wspr_recorder.__main__ import WsprRecorder
 class FakeRM:
     _status_address = "bee1-hf-status.local"
 
-    def __init__(self, fail_times):
+    def __init__(self, fail_times, log_each=False):
+        self.log_each = log_each
         self.fail_times = fail_times
         self.calls = 0
         self.quiet_failures = False
 
     def connect(self):
         self.calls += 1
+        if self.calls <= self.fail_times and self.log_each:
+            logging.getLogger("ka9q.control").error(
+                "Unexpected error connecting to radiod", exc_info=True)
         return self.calls > self.fail_times
 
+    def shutdown(self):
+        self.shutdowns = getattr(self, "shutdowns", 0) + 1
 
-def make(fail_times, shutdown_after=None):
+
+def make(fail_times, shutdown_after=None, log_each=False):
     rec = object.__new__(WsprRecorder)
-    rec.receiver_managers = {"a": FakeRM(fail_times)}
+    rec.receiver_managers = {"a": FakeRM(fail_times, log_each)}
     rec._shutdown_event = asyncio.Event()
     rec.sent = []
     rec.delays = []
@@ -82,3 +93,60 @@ def test_shutdown_interrupts_the_wait():
     rec = make(99, shutdown_after=2)
     assert asyncio.run(rec._connect_with_backoff()) == 0
     assert rec.delays == [5, 10]
+
+
+def test_ka9q_per_try_errors_are_filtered_during_the_episode(caplog):
+    rec = make(4, log_each=True)
+    with caplog.at_level(logging.DEBUG):
+        asyncio.run(rec._connect_with_backoff())
+    first_warn = next(i for i, r in enumerate(caplog.records)
+                      if r.levelno == logging.WARNING)
+    after = [r for r in caplog.records[first_warn + 1:]
+             if r.name.startswith("ka9q")]
+    assert after == []
+    assert logging.getLogger("ka9q.control").filters == []
+    assert rec.receiver_managers["a"].shutdowns == 4  # half-built state dropped
+
+
+def test_ka9q_filter_removed_on_shutdown():
+    rec = make(99, shutdown_after=1, log_each=True)
+    asyncio.run(rec._connect_with_backoff())
+    assert logging.getLogger("ka9q.control").filters == []
+
+
+def test_quiet_failures_reset_after_the_episode():
+    rec = make(2)
+    asyncio.run(rec._connect_with_backoff())
+    assert rec.receiver_managers["a"].quiet_failures is False
+
+
+def test_wait_keeps_petting_the_watchdog(monkeypatch):
+    monkeypatch.setenv("WATCHDOG_USEC", "200000")  # slices of 0.1 s
+    rec = object.__new__(WsprRecorder)
+    rec._shutdown_event = asyncio.Event()
+    sent = []
+    rec._sd_notify = sent.append
+    assert asyncio.run(rec._wait_interruptible(0.45)) is False
+    assert sent.count(b"WATCHDOG=1") >= 2
+
+
+def test_sigterm_during_the_wait_ends_it_within_a_second():
+    rec = object.__new__(WsprRecorder)
+    rec._sd_notify = lambda m: None
+    old = signal.getsignal(signal.SIGUSR1)
+    signal.signal(signal.SIGUSR1, lambda *a: rec.request_shutdown())
+
+    async def go():
+        rec._shutdown_event = asyncio.Event()
+        rec._loop = asyncio.get_running_loop()
+        threading.Timer(0.2, os.kill, (os.getpid(), signal.SIGUSR1)).start()
+        t0 = time.monotonic()
+        stopped = await rec._wait_interruptible(3)
+        return stopped, time.monotonic() - t0
+
+    try:
+        stopped, took = asyncio.run(go())
+    finally:
+        signal.signal(signal.SIGUSR1, old)
+    assert stopped is True
+    assert took < 1.0

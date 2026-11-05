@@ -341,7 +341,8 @@ class ReceiverManager:
             # docstring at top of file.
             _wait_for_chrony_settled()
 
-            logger.info(f"Connecting to radiod at {self._status_address}")
+            (logger.debug if self.quiet_failures else logger.info)(
+                f"Connecting to radiod at {self._status_address}")
             # client_id makes ka9q-python derive a per-(client, radiod)
             # multicast destination so this recorder's WSPR channels
             # never share a multicast group with peer clients on the
@@ -385,7 +386,10 @@ class ReceiverManager:
                 f"Provisioned {success}/{len(self.config.frequencies)} channels "
                 f"across {len(self._multi_by_group)} multicast group(s)"
             )
-            return success > 0
+            ok = success > 0
+            if ok:
+                self.quiet_failures = False
+            return ok
         except Exception as e:
             # quiet_failures: startup retry loop logs the episode once.
             (logger.debug if self.quiet_failures else logger.error)(
