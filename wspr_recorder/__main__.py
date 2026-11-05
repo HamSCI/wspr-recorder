@@ -117,27 +117,53 @@ def _radiod_is_local(status_address: str, conf_dir: str = "/etc/radio") -> bool:
     return Path(conf_dir, f"radiod@{inst}.conf").exists()
 
 
-class _quiet_ka9q:
-    """Drop ka9q's own per-try failure records for a waiting episode.
+class _EpisodeGuard:
+    """For one waiting episode: quiet the per-try log lines, pet the watchdog.
 
-    RadiodControl._connect logs an ERROR with a traceback each time the
-    radiod name will not resolve; the recorder logs the episode once.
+    Per-try records at or below ERROR from ka9q and from the client's
+    receiver manager are dropped, so an outage logs the episode's one
+    WARNING and one INFO and nothing between.  A thread sends WATCHDOG=1
+    every half WATCHDOG_USEC (floor 1 s), because provisioning against a
+    radiod that resolves but stays silent blocks for up to two minutes
+    with no chance to pet from the caller.  A missing, zero or negative
+    WATCHDOG_USEC means no petting.  Call start(), then stop() in a finally.
     """
-
-    LOGGERS = ("ka9q.control", "ka9q.utils")
 
     class _Drop(logging.Filter):
         def filter(self, record):
             return record.levelno > logging.ERROR
 
-    def __init__(self):
+    def __init__(self, notify, logger_names):
+        self._notify = notify
+        self._names = tuple(logger_names)
         self._filter = self._Drop()
-        for name in self.LOGGERS:
-            logging.getLogger(name).addFilter(self._filter)
+        self._stop = threading.Event()
+        self._thread = None
+        try:
+            usec = int(os.environ.get("WATCHDOG_USEC", "0"))
+        except ValueError:
+            usec = 0
+        self._period = max(1.0, usec / 1_000_000 / 2) if usec > 0 else None
 
-    def remove(self):
-        for name in self.LOGGERS:
+    def start(self):
+        for name in self._names:
+            logging.getLogger(name).addFilter(self._filter)
+        if self._period is not None:
+            self._thread = threading.Thread(
+                target=self._pet, name="watchdog-pet", daemon=True)
+            self._thread.start()
+
+    def _pet(self):
+        while not self._stop.wait(self._period):
+            self._notify(b"WATCHDOG=1")
+
+    def stop(self):
+        for name in self._names:
             logging.getLogger(name).removeFilter(self._filter)
+        self._stop.set()
+        if self._thread is not None:
+            self._thread.join()
+            self._thread = None
 
 
 class WsprRecorder:
@@ -1806,26 +1832,13 @@ class WsprRecorder:
     async def _wait_interruptible(self, seconds: float) -> bool:
         """Sleep up to ``seconds``; return True if shutdown was requested.
 
-        Waits in slices of half the watchdog interval and sends WATCHDOG=1
-        after each, because systemd enforces WatchdogSec from READY=1 and
-        _watchdog_loop only starts after connect.
+        The episode's _EpisodeGuard thread pets the watchdog meanwhile.
         """
-        wd = os.environ.get("WATCHDOG_USEC")
         try:
-            slice_s = int(wd) / 1_000_000 / 2 if wd else 30.0
-        except ValueError:
-            slice_s = 30.0
-        end = time.monotonic() + seconds
-        while True:
-            left = end - time.monotonic()
-            if left <= 0:
-                return False
-            try:
-                await asyncio.wait_for(
-                    self._shutdown_event.wait(), timeout=min(left, slice_s))
-                return True
-            except asyncio.TimeoutError:
-                self._sd_notify(b"WATCHDOG=1")
+            await asyncio.wait_for(self._shutdown_event.wait(), timeout=seconds)
+            return True
+        except asyncio.TimeoutError:
+            return False
 
     async def _connect_with_backoff(self) -> int:
         """Connect every source; while none connects, wait and retry.
@@ -1839,7 +1852,7 @@ class WsprRecorder:
         keys = list(self.receiver_managers.keys())
         waiting_since = None
         attempt = 0
-        quiet = None
+        guard = None
         try:
             while True:
                 connect_results = await asyncio.gather(
@@ -1882,7 +1895,12 @@ class WsprRecorder:
                         logger.debug("teardown after failed try", exc_info=True)
                 if waiting_since is None:
                     waiting_since = time.monotonic()
-                    quiet = _quiet_ka9q()
+                    guard = _EpisodeGuard(
+                        lambda m: self._sd_notify(m),
+                        ("ka9q.control", "ka9q.utils",
+                         "wspr_recorder.receiver_manager"),
+                    )
+                    guard.start()
                     logger.warning(
                         "radiod unreachable at %s; staying up and retrying "
                         "(5 s, doubling to 60 s, without end)", addrs,
@@ -1899,8 +1917,8 @@ class WsprRecorder:
                 if await self._wait_interruptible(delay):
                     return 0
         finally:
-            if quiet is not None:
-                quiet.remove()
+            if guard is not None:
+                guard.stop()
             for k in keys:  # a later full_reset() failure must log at ERROR
                 self.receiver_managers[k].quiet_failures = False
 

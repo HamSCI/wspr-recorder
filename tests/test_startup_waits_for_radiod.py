@@ -120,14 +120,83 @@ def test_quiet_failures_reset_after_the_episode():
     assert rec.receiver_managers["a"].quiet_failures is False
 
 
-def test_wait_keeps_petting_the_watchdog(monkeypatch):
-    monkeypatch.setenv("WATCHDOG_USEC", "200000")  # slices of 0.1 s
-    rec = object.__new__(WsprRecorder)
-    rec._shutdown_event = asyncio.Event()
-    sent = []
-    rec._sd_notify = sent.append
-    assert asyncio.run(rec._wait_interruptible(0.45)) is False
-    assert sent.count(b"WATCHDOG=1") >= 2
+class BlockingRM(FakeRM):
+    def __init__(self, block_s):
+        super().__init__(0)
+        self.block_s = block_s
+
+    def connect(self):
+        self.calls += 1
+        if self.calls == 2:
+            time.sleep(self.block_s)   # blocks a worker thread, as a silent radiod does
+        return self.calls >= 3
+
+
+def test_watchdog_is_petted_while_connect_blocks(monkeypatch):
+    monkeypatch.setenv("WATCHDOG_USEC", "2000000")  # period floor 1 s
+    rec = make(0)
+    rec.receiver_managers = {"a": BlockingRM(2.5)}
+    asyncio.run(rec._connect_with_backoff())
+    assert rec.sent.count(b"WATCHDOG=1") >= 2
+    assert not [t for t in threading.enumerate() if t.name == "watchdog-pet"]
+
+
+def test_no_watchdog_thread_without_watchdog_usec(monkeypatch):
+    for bad in (None, "0", "-5", "junk"):
+        if bad is None:
+            monkeypatch.delenv("WATCHDOG_USEC", raising=False)
+        else:
+            monkeypatch.setenv("WATCHDOG_USEC", bad)
+        rec = make(2)
+        asyncio.run(rec._connect_with_backoff())
+        assert b"WATCHDOG=1" not in rec.sent
+
+
+def test_watchdog_thread_stopped_after_shutdown(monkeypatch):
+    monkeypatch.setenv("WATCHDOG_USEC", "2000000")
+    rec = make(99, shutdown_after=1)
+    asyncio.run(rec._connect_with_backoff())
+    assert not [t for t in threading.enumerate() if t.name == "watchdog-pet"]
+
+
+def test_client_receiver_manager_logs_are_quiet_during_the_episode(caplog):
+    rml = logging.getLogger("wspr_recorder.receiver_manager")
+
+    class Noisy(FakeRM):
+        def connect(self):
+            self.calls += 1
+            rml.info("Connecting to radiod at x")
+            rml.error("Failed to provision 20m")
+            rml.info("Provisioned 0/17 channels")
+            return self.calls > self.fail_times
+
+    rec = make(0)
+    rec.receiver_managers = {"a": Noisy(3)}
+    with caplog.at_level(logging.DEBUG):
+        asyncio.run(rec._connect_with_backoff())
+        rml.info("after success")
+    recs = caplog.records
+    w = next(i for i, r in enumerate(recs) if r.levelno == logging.WARNING)
+    between = [r for r in recs[w + 1:]
+               if r.name == "wspr_recorder.receiver_manager"
+               and r.getMessage() != "after success"]
+    assert between == []
+    assert recs[-1].getMessage() == "after success"
+
+
+def test_shutdown_clears_stopped_streams():
+    from wspr_recorder.receiver_manager import ReceiverManager
+    rm = object.__new__(ReceiverManager)
+    rm._status_listener = None
+    rm._control = None
+    rm.stop_streams = lambda: None
+    class St: connected = True; channels = {1: object()}
+    rm.state = St()
+    rm._multi_by_group = {("g", 1): object()}
+    rm._lifetime_entries = [1]
+    rm.shutdown()
+    assert rm.state.channels == {} and rm._multi_by_group == {}
+    assert rm._lifetime_entries == []
 
 
 def test_sigterm_during_the_wait_ends_it_within_a_second():

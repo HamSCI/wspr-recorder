@@ -969,4 +969,8 @@ class ReceiverManager:
                 logger.debug(f"Error closing control: {e}")
             finally:
                 self._control = None
+        # Stopped streams must not be reused by a later connect() try.
+        self.state.channels.clear()
+        self._multi_by_group.clear()
+        self._lifetime_entries.clear()
         self.state.connected = False
