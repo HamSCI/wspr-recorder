@@ -2159,6 +2159,9 @@ class WsprRecorder:
                 status_address=src.status_address,
                 port=src.port,
                 source_key=src.key,
+                on_band_producible=(
+                    self.cycle_batcher.set_band_producible
+                    if self.cycle_batcher is not None else None),
             )
         logger.info(
             "Configured %d source(s): %s",

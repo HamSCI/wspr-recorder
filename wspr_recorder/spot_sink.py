@@ -867,6 +867,9 @@ class CycleBatcher:
         #
         # Shape: {rx_source: {band_name: [period_sec, ...]}}
         self._bands_by_source: dict = {}
+        # Bands radiod cannot produce (above ADC Nyquist), per rx_source.
+        # Set by the receiver manager; excluded from the expected set.
+        self._unproducible_bands: dict = {}
         self._stop = threading.Event()
         # Wake callback — invoked after every flush that committed
         # spots so an in-process uploader can pump immediately
@@ -946,6 +949,22 @@ class CycleBatcher:
                 for src, bands in bands_by_source.items()
             }
 
+    def set_band_producible(self, rx_source: str, band: str,
+                            producible: bool) -> None:
+        """Record whether radiod can produce ``band`` for ``rx_source``.
+
+        The receiver manager skips bands above the ADC Nyquist; those
+        bands never report, so they must not count toward the cycle's
+        expected set.  ``producible=True`` restores a band (for example
+        after the sample rate rises and it gets provisioned).
+        """
+        with self._lock:
+            skipped = self._unproducible_bands.setdefault(rx_source, set())
+            if producible:
+                skipped.discard(band)
+            else:
+                skipped.add(band)
+
     def _expected_bands_for_cycle(
         self,
         cycle_key: Tuple[str, str],
@@ -985,7 +1004,10 @@ class CycleBatcher:
             return set()
         epoch_sec = int(dt.timestamp())
         expected: set = set()
+        skipped = self._unproducible_bands.get(rx_source, ())
         for band, periods in bands_for_source.items():
+            if band in skipped:
+                continue
             for p in periods:
                 if p > 0 and epoch_sec % p == 0:
                     expected.add(band)

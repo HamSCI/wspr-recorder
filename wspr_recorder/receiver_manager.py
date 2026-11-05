@@ -293,8 +293,13 @@ class ReceiverManager:
         status_address: Optional[str] = None,
         port: Optional[int] = None,
         source_key: Optional[str] = None,
+        on_band_producible: Optional[Callable[[str, str, bool], None]] = None,
     ):
         self.config = config
+        # Called (source_key, band_name, producible) when a band is skipped
+        # above Nyquist (False) or provisioned (True), so the cycle batcher
+        # stops or resumes waiting for it.
+        self._on_band_producible = on_band_producible
         self.sink_factory = sink_factory
         # Per-source overrides; default to the legacy config.radiod
         # so single-source callers (existing tests, single-radiod
@@ -397,7 +402,16 @@ class ReceiverManager:
             self.state.connected = False
             return False
 
-    def _read_frontend_samprate(self, ssrc: int) -> Optional[int]:
+    def _notify_band_producible(self, band_name: str, producible: bool) -> None:
+        cb = getattr(self, "_on_band_producible", None)
+        if cb is None:
+            return
+        try:
+            cb(self.source_key, band_name, producible)
+        except Exception:  # noqa: BLE001
+            logger.exception("on_band_producible callback failed")
+
+    def _read_frontend_samprate(self, ssrc: int, log: bool = True) -> Optional[int]:
         """Read radiod's front-end ADC sample rate (Hz) from a channel's status.
 
         Every channel's status packet carries the shared ``FrontendStatus``; a
@@ -408,10 +422,11 @@ class ReceiverManager:
             st = self._control.poll_status(ssrc)
             rate = getattr(getattr(st, "frontend", None), "input_samprate", None)
             if rate and int(rate) > 1_000_000:
-                logger.info(
-                    "radiod front-end sample rate = %d Hz (Nyquist %d Hz)",
-                    int(rate), int(rate) // 2,
-                )
+                if log:
+                    logger.info(
+                        "radiod front-end sample rate = %d Hz (Nyquist %d Hz)",
+                        int(rate), int(rate) // 2,
+                    )
                 return int(rate)
         except Exception as exc:  # noqa: BLE001
             logger.debug("could not read front-end samprate from ssrc %s: %s", ssrc, exc)
@@ -469,6 +484,7 @@ class ReceiverManager:
                 band_name, freq_hz / 1e6,
                 (self._input_samprate_hz or 0) // 2, self._input_samprate_hz or 0,
             )
+            self._notify_band_producible(band_name, False)
             return False
 
         defaults = self.config.channel_defaults
@@ -503,6 +519,7 @@ class ReceiverManager:
                 created_at=time.time(),
             )
             self.state.channels[info.ssrc] = state
+            self._notify_band_producible(band_name, True)
 
             # Learn radiod's front-end ADC rate from the first live channel so subsequent
             # bands above Nyquist (8m/6m at 64.8 Msps) are skipped rather than thrashed.
@@ -755,6 +772,22 @@ class ReceiverManager:
             ch.frequency_hz for ch in self.state.channels.values()
         }
         missing_freqs = sorted(configured - provisioned)
+        # Bands above the ADC Nyquist cannot be produced; retrying them only
+        # logs noise.  Re-read the front-end rate first so a rate increase
+        # lets them rejoin.
+        if missing_freqs and self._input_samprate_hz and self.state.channels:
+            fresh = self._read_frontend_samprate(
+                next(iter(self.state.channels)), log=False)
+            if fresh and fresh != self._input_samprate_hz:
+                logger.info(
+                    "radiod front-end sample rate changed %d -> %d Hz",
+                    self._input_samprate_hz, fresh,
+                )
+                self._input_samprate_hz = fresh
+        missing_freqs = [
+            f for f in missing_freqs
+            if _band_producible(f, self._input_samprate_hz)
+        ]
         stale = [
             ch for ch in self.state.channels.values()
             if not ch.is_active

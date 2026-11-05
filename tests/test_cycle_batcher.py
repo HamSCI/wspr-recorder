@@ -852,3 +852,61 @@ class TestCycleBatcherBandPrereg(unittest.TestCase):
             )
         finally:
             b.stop()
+
+
+# ── Bands radiod cannot produce (above ADC Nyquist) ───────────────────────
+
+class TestCycleBatcherUnproducibleBands(unittest.TestCase):
+    """A band the receiver manager skipped (above Nyquist) must not be
+    waited for; 17 configured, 2 skipped -> commit when the 15 report."""
+
+    BANDS = [f"b{i}" for i in range(15)]
+
+    def _batcher(self, sink):
+        b = CycleBatcher(sink, deadline_sec=30.0, backstop_sec=30.0)
+        cfg = {name: [120] for name in self.BANDS}
+        cfg["6"] = [120]
+        cfg["8"] = [120]
+        b.set_bands_by_source({"radiod:A": cfg})
+        return b
+
+    def _report(self, b, cycle, bands):
+        for name in bands:
+            b.expect_band(cycle, name, radiod_id="rx-A", rx_source="radiod:A")
+            b.mark_done(cycle, name, rx_source="radiod:A")
+
+    def test_skipped_bands_do_not_hold_cycle_for_backstop(self):
+        sink = _RecordingSink()
+        b = self._batcher(sink)
+        b.set_band_producible("radiod:A", "6", False)
+        b.set_band_producible("radiod:A", "8", False)
+        try:
+            self._report(b, ("260512", "0750"), self.BANDS)
+            time.sleep(0.4)
+            self.assertEqual(len(sink.calls), 1,
+                             "15 producible bands reported -> commit now")
+        finally:
+            b.stop()
+
+    def test_unskipped_bands_still_wait(self):
+        sink = _RecordingSink()
+        b = self._batcher(sink)
+        try:
+            self._report(b, ("260512", "0750"), self.BANDS)
+            time.sleep(0.4)
+            self.assertEqual(len(sink.calls), 0, "6 and 8 still expected")
+        finally:
+            b.stop()
+
+    def test_band_rejoins_when_producible_again(self):
+        sink = _RecordingSink()
+        b = self._batcher(sink)
+        b.set_band_producible("radiod:A", "6", False)
+        b.set_band_producible("radiod:A", "8", False)
+        b.set_band_producible("radiod:A", "6", True)
+        try:
+            self._report(b, ("260512", "0750"), self.BANDS)
+            time.sleep(0.4)
+            self.assertEqual(len(sink.calls), 0, "6 expected again")
+        finally:
+            b.stop()

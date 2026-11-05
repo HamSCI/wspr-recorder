@@ -33,3 +33,27 @@ def test_fail_open_when_front_end_rate_unknown():
     for sr in (None, 0):
         for f in (_F_40M, _F_10M, _F_8M, _F_6M):
             assert _band_producible(f, sr) is True
+
+
+def test_reprovision_quiet_and_callback_for_above_nyquist():
+    """Skipped band reports unproducible to the callback; reprovision does
+    not retry it while the front-end rate is unchanged."""
+    from unittest.mock import MagicMock
+    from wspr_recorder.receiver_manager import ReceiverManager
+
+    cfg = MagicMock()
+    cfg.frequencies = [_F_40M, _F_8M]
+    events = []
+    rm = ReceiverManager(cfg, lambda *a: None, status_address="x.local",
+                         port=5006, source_key="radiod:x",
+                         on_band_producible=lambda s, b, ok: events.append((s, b, ok)))
+    rm._control = MagicMock()
+    rm._input_samprate_hz = 64_800_000
+    assert rm._provision(_F_8M) is False
+    assert events == [("radiod:x", "8", False)]
+    rm._provision = MagicMock(return_value=True)
+    rm._read_frontend_samprate = MagicMock(return_value=64_800_000)
+    rm._verify_and_retry_provisioned = MagicMock()
+    # 40 m has no channel, 8 m is above Nyquist: only 40 m is retried.
+    rm.reprovision_stale()
+    rm._provision.assert_called_once_with(_F_40M)
