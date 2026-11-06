@@ -1433,9 +1433,21 @@ class WsprRecorder:
                     # configured count means a partial-provision shows
                     # as 9/17 — degraded → ``reprovision_stale`` now
                     # picks up the missing bands.
-                    total = len(rm.config.frequencies or [])
+                    freqs = rm.config.frequencies or []
+                    total = len(freqs)
+                    # Bands above the ADC Nyquist are skipped by the
+                    # manager and flagged unproducible on the cycle
+                    # batcher (one source of truth).  They never
+                    # provision, so they must not count as missing.
+                    skipped = (
+                        self.cycle_batcher.unproducible_bands(src_key)
+                        if self.cycle_batcher is not None else set())
+                    if skipped:
+                        total -= sum(
+                            1 for f in freqs
+                            if freq_to_band_name(f) in skipped)
                     provisioned = len(rm.state.channels)
-                    if total == 0 or provisioned == 0:
+                    if not freqs or provisioned == 0:
                         # Source has NO provisioned channels — startup
                         # connect() failed (radiod was in trouble at
                         # boot, channel SSRCs not verified within 5 s).

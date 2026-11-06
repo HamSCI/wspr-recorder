@@ -965,6 +965,11 @@ class CycleBatcher:
             else:
                 skipped.add(band)
 
+    def unproducible_bands(self, rx_source: str) -> set:
+        """Bands radiod cannot produce for ``rx_source`` (a copy)."""
+        with self._lock:
+            return set(self._unproducible_bands.get(rx_source, ()))
+
     def _expected_bands_for_cycle(
         self,
         cycle_key: Tuple[str, str],
