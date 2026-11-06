@@ -298,7 +298,8 @@ class ReceiverManager:
         self.config = config
         # Called (source_key, band_name, producible) when a band is skipped
         # above Nyquist (False) or provisioned (True), so the cycle batcher
-        # stops or resumes waiting for it.
+        # drops or restores it in its own expected set.  The channel-health
+        # check asks this manager directly (unproducible_freqs).
         self._on_band_producible = on_band_producible
         self.sink_factory = sink_factory
         # Per-source overrides; default to the legacy config.radiod
@@ -401,6 +402,16 @@ class ReceiverManager:
                 f"Failed to connect to radiod: {e}")
             self.state.connected = False
             return False
+
+    def unproducible_freqs(self) -> set:
+        """Configured frequencies above the radiod ADC Nyquist.
+
+        Fails open (empty set) while the front-end rate is unknown.
+        """
+        return {
+            f for f in (self.config.frequencies or [])
+            if not _band_producible(f, self._input_samprate_hz)
+        }
 
     def _notify_band_producible(self, band_name: str, producible: bool) -> None:
         cb = getattr(self, "_on_band_producible", None)
@@ -773,11 +784,18 @@ class ReceiverManager:
         }
         missing_freqs = sorted(configured - provisioned)
         # Bands above the ADC Nyquist cannot be produced; retrying them only
-        # logs noise.  Re-read the front-end rate first so a rate increase
-        # lets them rejoin.
+        # logs noise.  Re-read the front-end rate first (polling an active
+        # channel when one exists) in case it changed.  A radiod sample-rate
+        # change restarts radiod, and the stream-restore path then restarts
+        # this process (os._exit(75)), so a fresh process re-learns the rate;
+        # full_reset re-learns it too.  This re-read is a backstop, reached
+        # only when the source is degraded.
         if missing_freqs and self._input_samprate_hz and self.state.channels:
-            fresh = self._read_frontend_samprate(
-                next(iter(self.state.channels)), log=False)
+            probe = next(
+                (ssrc for ssrc, ch in self.state.channels.items()
+                 if ch.is_active),
+                next(iter(self.state.channels)))
+            fresh = self._read_frontend_samprate(probe, log=False)
             if fresh and fresh != self._input_samprate_hz:
                 logger.info(
                     "radiod front-end sample rate changed %d -> %d Hz",
@@ -863,6 +881,8 @@ class ReceiverManager:
         # from a clean slate (otherwise stale ChannelState entries
         # with bad SSRCs would confuse the post-restart sweep).
         self.state.channels.clear()
+        # Re-learn radiod's front-end rate: it may have changed.
+        self._input_samprate_hz = None
         self._multi_by_group.clear()
         self._lifetime_entries.clear()
         ok = self.connect()

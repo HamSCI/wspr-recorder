@@ -955,8 +955,9 @@ class CycleBatcher:
 
         The receiver manager skips bands above the ADC Nyquist; those
         bands never report, so they must not count toward the cycle's
-        expected set.  ``producible=True`` restores a band (for example
-        after the sample rate rises and it gets provisioned).
+        expected set.  ``producible=True`` restores a band once the
+        manager provisions it (after a process restart or full_reset
+        re-learns a higher sample rate).
         """
         with self._lock:
             skipped = self._unproducible_bands.setdefault(rx_source, set())

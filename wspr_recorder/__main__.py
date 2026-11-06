@@ -1413,6 +1413,8 @@ class WsprRecorder:
 
         # source_key -> consecutive degraded-check count
         degraded_count: Dict[str, int] = {}
+        # source_key -> front-end rate at which "all above Nyquist" was logged
+        allabove_logged: Dict[str, Optional[int]] = {}
 
         while self._running:
             try:
@@ -1436,17 +1438,23 @@ class WsprRecorder:
                     freqs = rm.config.frequencies or []
                     total = len(freqs)
                     # Bands above the ADC Nyquist are skipped by the
-                    # manager and flagged unproducible on the cycle
-                    # batcher (one source of truth).  They never
+                    # manager, which owns producibility.  They never
                     # provision, so they must not count as missing.
-                    skipped = (
-                        self.cycle_batcher.unproducible_bands(src_key)
-                        if self.cycle_batcher is not None else set())
-                    if skipped:
-                        total -= sum(
-                            1 for f in freqs
-                            if freq_to_band_name(f) in skipped)
+                    skipped = rm.unproducible_freqs()
+                    total -= len(skipped & set(freqs))
                     provisioned = len(rm.state.channels)
+                    if freqs and total == 0:
+                        rate = getattr(rm, "_input_samprate_hz", None)
+                        if allabove_logged.get(src_key) != rate:
+                            allabove_logged[src_key] = rate
+                            logger.error(
+                                "Channel health (%s): all configured "
+                                "bands above the radiod Nyquist at %s Hz "
+                                "— nothing to record, skipping recovery",
+                                src_key, rate,
+                            )
+                        continue
+                    allabove_logged.pop(src_key, None)
                     if not freqs or provisioned == 0:
                         # Source has NO provisioned channels — startup
                         # connect() failed (radiod was in trouble at
