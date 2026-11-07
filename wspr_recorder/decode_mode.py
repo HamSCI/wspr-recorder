@@ -22,6 +22,8 @@ DecodeRequest per distinct period, each with its own WAV.
 
 from enum import Enum
 
+from hs_uploader import wspr_modes
+
 
 class DecodeMode(Enum):
     """WSPR and FST4W decode modes."""
@@ -32,32 +34,16 @@ class DecodeMode(Enum):
     F30 = "F30"    # FST4W-1800, 1800s, decoded by jt9 --fst4w
 
 
-# Period in seconds for each decode mode
+# The modes themselves -- period, wsprnet code, wsprdaemon code -- are
+# defined once, in hs_uploader.wspr_modes; these views follow it.
 DECODE_MODE_PERIODS: dict[DecodeMode, int] = {
-    DecodeMode.W2:  120,
-    DecodeMode.F2:  120,
-    DecodeMode.F5:  300,
-    DecodeMode.F15: 900,
-    DecodeMode.F30: 1800,
-}
+    m: wspr_modes.BY_NAME[m.value].period_s for m in DecodeMode}
 
-# Packet mode values used in ALL_WSPR.TXT and upload formats
+# wsprdaemon pkt_mode (2, 3, 6, 16, 31): the legacy code ALL_WSPR.TXT
+# and the wsprdaemon tar carry.  wsprnet.org's code differs; the wsprnet
+# transport translates by name.
 DECODE_MODE_PKT_MODES: dict[DecodeMode, int] = {
-    DecodeMode.W2:  2,
-    DecodeMode.F2:  3,
-    DecodeMode.F5:  6,
-    DecodeMode.F15: 16,
-    DecodeMode.F30: 31,
-}
-
-# wsprnet.org mode translation (wsprdaemon pkt_mode -> wsprnet mode)
-WSPRNET_MODE_MAP: dict[int, int] = {
-    2: 2,     # WSPR-2
-    3: 3,     # FST4W-120
-    6: 5,     # FST4W-300
-    16: 15,   # FST4W-900
-    31: 30,   # FST4W-1800
-}
+    m: wspr_modes.BY_NAME[m.value].wsprdaemon_code for m in DecodeMode}
 
 # Valid mode strings for config validation
 VALID_MODE_STRINGS = frozenset(m.value for m in DecodeMode)

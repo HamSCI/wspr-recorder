@@ -4,7 +4,6 @@ from wspr_recorder.decode_mode import (
     DecodeMode,
     DECODE_MODE_PERIODS,
     DECODE_MODE_PKT_MODES,
-    WSPRNET_MODE_MAP,
     VALID_MODE_STRINGS,
     modes_completing_at_minute,
     max_period_seconds,
@@ -22,9 +21,9 @@ class TestDecodeModeConstants:
         for mode in DecodeMode:
             assert mode in DECODE_MODE_PKT_MODES
 
-    def test_all_pkt_modes_have_wsprnet_mapping(self):
-        for pkt_mode in DECODE_MODE_PKT_MODES.values():
-            assert pkt_mode in WSPRNET_MODE_MAP
+    def test_pkt_modes_are_wsprdaemons_codes(self):
+        assert {m.value: c for m, c in DECODE_MODE_PKT_MODES.items()} == {
+            "W2": 2, "F2": 3, "F5": 6, "F15": 16, "F30": 31}
 
     def test_valid_mode_strings(self):
         assert VALID_MODE_STRINGS == {"W2", "F2", "F5", "F15", "F30"}

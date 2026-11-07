@@ -112,6 +112,18 @@ class TestSpotToRow(unittest.TestCase):
         self.assertEqual(row["mode"], "F2")
         self.assertEqual(row["decoder_kind"], "jt9")
 
+    def test_every_mode_stores_its_name(self):
+        """F15/F30 were stored as PKT16/PKT31 while spot_sink kept its own
+        table listing them as 7/8."""
+        for pkt_mode, name in ((2, "W2"), (3, "F2"), (6, "F5"),
+                               (16, "F15"), (31, "F30")):
+            row = spot_to_row(
+                _make_spot(pkt_mode=pkt_mode), band="40", radiod_id="rx",
+                rx_call="A", rx_grid="EM",
+            )
+            self.assertEqual(row["mode"], name)
+            self.assertEqual(row["pkt_mode"], pkt_mode)
+
     def test_unknown_pkt_mode_does_not_crash(self):
         """An unrecognized pkt_mode produces a stable token rather
         than dropping the spot — observability over data loss."""

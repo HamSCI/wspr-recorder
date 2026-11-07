@@ -65,7 +65,7 @@ class RawSpot:
     nhardmin: int = 0
     cycles: int = 0
     metric: float = 0.0
-    pkt_mode: int = 2       # 2=W2, 3=F2, 5=F5, 15=F15, 30=F30
+    pkt_mode: int = 2       # wsprdaemon code: 2=W2, 3=F2, 6=F5, 16=F15, 31=F30
     spreading: Optional[float] = None
     hash22: Optional[int] = None  # numeric hash if unresolved type-3
 

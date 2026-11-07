@@ -26,6 +26,8 @@ import time
 from datetime import datetime, timezone
 from typing import Any, Callable, Iterable, List, Optional, Tuple
 
+from hs_uploader import wspr_modes
+
 from .decoder import RawSpot
 from .noise import NoiseMeasurement
 
@@ -42,17 +44,6 @@ NOISE_SCHEMA_VERSION = 1  # wspr.noise rows (rms+fft+overload per cycle)
 # hs-uploader's wsprdaemon transport from grid pairs — no need
 # to denormalise it here.
 
-# Map wsprd-style pkt_mode → wsprdaemon mode token.  Keep this aligned
-# with decode_mode.DECODE_MODE_PKT_MODES; we keep our own table so this
-# module doesn't import DecodeMode (which is overkill for a serializer).
-_PKT_MODE_TO_TOKEN = {
-    2:  "W2",     # WSPR-2 (wsprd)
-    3:  "F2",     # FST4W-120 (jt9)
-    6:  "F5",     # FST4W-300 (jt9)
-    7:  "F15",    # FST4W-900
-    8:  "F30",    # FST4W-1800
-    15: "W15",    # WSPR-15
-}
 
 
 def _enabled() -> bool:
@@ -247,7 +238,11 @@ def spot_to_row(
 
     grid = spot.grid if spot.grid and spot.grid != "none" else ""
 
-    mode = _PKT_MODE_TO_TOKEN.get(spot.pkt_mode, f"PKT{spot.pkt_mode}")
+    # The mode's name, from the one table (hs_uploader.wspr_modes).  A
+    # private copy here once listed F15/F30 as 7/8, so their rows were
+    # named PKT16/PKT31.
+    known = wspr_modes.BY_WSPRDAEMON_CODE.get(spot.pkt_mode)
+    mode = known.name if known is not None else f"PKT{spot.pkt_mode}"
     decoder_kind = "wsprd" if spot.pkt_mode == 2 else "jt9"
 
     callsign = _strip_resolved_brackets(spot.call)

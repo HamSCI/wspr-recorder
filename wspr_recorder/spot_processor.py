@@ -12,7 +12,7 @@ from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
 from .decoder import RawSpot
-from .decode_mode import WSPRNET_MODE_MAP
+from hs_uploader import wspr_modes
 
 logger = logging.getLogger(__name__)
 
@@ -123,7 +123,8 @@ class EnhancedSpot:
 
     def to_wsprnet_line(self) -> str:
         """Format as an 11-field wsprnet.org MEPT line."""
-        wn_mode = WSPRNET_MODE_MAP.get(self.pkt_mode, self.pkt_mode)
+        known = wspr_modes.BY_WSPRDAEMON_CODE.get(self.pkt_mode)
+        wn_mode = known.wsprnet_code if known is not None else self.pkt_mode
         grid_out = self.grid if self.grid and self.grid != "none" else "    "
         return (
             f"{self.date} {self.time} {self.sync_quality:.2f} {self.snr} "
