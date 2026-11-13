@@ -1,28 +1,28 @@
 """hs-uploader-driven wspr upload shim.
 
-In-process uploader for wspr-recorder.  Owns the same three output
-pipelines the standalone ``wd-upload-hs@.service`` used to own;
-lifted in-process for v3 Phase A (wsprdaemon-client dissolution).
+In-process uploader for wspr-recorder.  It took over the role of the
+standalone ``wd-upload-hs@.service`` in v3 Phase A (wsprdaemon-client
+dissolution).
 
-Pipelines run inside one ``Uploader``:
+One pipeline runs inside one ``Uploader``:
 
   * **wsprdaemon-tar (cycle)** — ``WsprCycleSource`` on
-    ``(wspr.spots, wspr.noise)`` → ``WsprdaemonTarSftp`` →
-    wsprdaemon.org via SFTP.  Yields one tar per WSPR 2-min cycle
-    containing parallel ``wsprdaemon/spots/...`` and
+    ``(wspr.spots, wspr.noise)`` plus the cycle's ``psk.spots`` rows →
+    ``WsprdaemonTarSftp`` → wsprdaemon.org via SFTP.  Yields one tar per
+    WSPR 2-min cycle containing parallel ``wsprdaemon/spots/...`` and
     ``wsprdaemon/noise/...`` subtrees, matching the legacy v3 server's
     expected tar layout.  Tar filename is cycle-time-derived
     (``YYMMDD_HHMM``) so concurrent pumps can't race on rename.
-  * **wsprnet** — ``SqliteSource`` on ``wspr.spots`` → ``WsprNet`` →
-    wsprnet.org via HTTP multipart POST.  Identical MEPT line format
-    to the legacy uploader.
 
-Why two pipelines: wsprdaemon.org wants one cycle-aligned tar (spots
-+ noise bundled), wsprnet.org wants individual spot rows posted as
-they decode.  Each pipeline has its own watermark.  The previous
-three-pipeline design (separate spots-tar + noise-tar + wsprnet)
-violated wsprdaemon.org's one-tar-per-cycle ingest model and caused
-intermittent rename collisions on the gateway side.
+Uniform routing (sigmond, 2026-11-13): every spot goes only to
+wsprdaemon.org, which stores it and forwards copies to wsprnet.org and
+pskreporter.info under the spot's own reporter id.  The tar transport
+therefore sets ``forward_to_wsprnet=True``, and each psk row carries its
+own ``forward_to_pskreporter`` flag (True unless the producer opted
+out), which the tar builder collects into ``routing.json``.  The shim
+sends no reporter identity, and it builds no pipeline that posts to
+wsprnet.org itself.  sigmond's ``uploader_manifest.apply_proxying`` does
+the same for the standalone hs-uploader daemon.
 
 Feature flag ``WSPR_USE_HS_UPLOADER=1`` gates the uploader.  Off (or
 unset) → uploader does not start; the operator is presumably running a
@@ -44,9 +44,10 @@ operational symmetry):
                 waiting out a PUMP_INTERVAL_SEC polling tick.
 
 WD_VERIFY_FLUSH: optional verify-and-flush thread polls wsprnet for
-this reporter's accepted spots and deletes confirmed rows from
-``pending_uploads``.  Off by default; opt in with WD_VERIFY_FLUSH=1.
-See ``wsprnet_verifier.py`` for the full rationale.
+this reporter's spots (which wsprdaemon.org forwarded there) and deletes
+confirmed rows from the local ``pending_uploads`` queue.  It only reads
+wsprnet.  Off by default; opt in with WD_VERIFY_FLUSH=1.  See
+``wsprnet_verifier.py`` for the full rationale.
 """
 from __future__ import annotations
 
@@ -80,14 +81,12 @@ PUMP_INTERVAL_SEC = float(
 # Default sigmond sink location (matches storage_migrate.SINK_DB_PATH).
 DEFAULT_SINK_DB = "/var/lib/sigmond/sink.db"
 
-# wsprnet async upload API (W1GJM) — now the DEFAULT.  Override with
-# WSPRNET_API_BASE: another base URL to point elsewhere, or
-# "legacy"/"off"/"" to fall back to the blocking meptspots.php POST.
-WSPRNET_ASYNC_API_DEFAULT = "https://wsprnet.org/api/upload/v1"
-
 
 class WsprUploaderHs:
-    """Pump wspr spools → wsprdaemon.org + wsprnet.org via hs-uploader.
+    """Pump the wspr sink → wsprdaemon.org via hs-uploader.
+
+    wsprdaemon.org forwards the spots to wsprnet.org and
+    pskreporter.info; this class posts to neither.
 
     Constructed from environment variables already set by wd-ctl in
     /etc/wsprdaemon/env/wd-upload-*.env — same identity inputs the
@@ -102,7 +101,6 @@ class WsprUploaderHs:
         call: str,
         grid: str,
         wsprdaemon_dir: Optional[Path],
-        wsprnet_dir: Optional[Path],
         sftp_servers: list[str],
         sftp_user: Optional[str] = None,
         upload_id: Optional[str] = None,
@@ -121,7 +119,6 @@ class WsprUploaderHs:
         self._merge_reporters = set(merge_reporters or ())
         self._merge_backstop_sec = float(merge_backstop_sec)
         self._wsprdaemon_dir = Path(wsprdaemon_dir) if wsprdaemon_dir else None
-        self._wsprnet_dir = Path(wsprnet_dir) if wsprnet_dir else None
         self._sftp_servers = list(sftp_servers)
         self._sftp_user = sftp_user
         self._upload_id = upload_id
@@ -134,25 +131,13 @@ class WsprUploaderHs:
         self._verifier = None       # set in start() if WD_VERIFY_FLUSH=1
         self._wd_verifier = None    # set in start() if WSPRDAEMON_VERIFY=1
         self._wake_listener = None  # cross-process wake datagram listener
-        # Per-spot wsprnet upload audit: feeds the `smd verifier
-        # report` command's "uploaded but never appeared in wspr.rx"
-        # cohort.  Default off; opt in with WSPRNET_AUDIT=1.
-        # When enabled, ``ensure_schema`` is called from start() so
-        # the audit table exists by the time the first batch ships.
-        self._wsprnet_audit_enabled = os.environ.get(
-            "WSPRNET_AUDIT", "",
-        ).strip().lower() in ("1", "true", "yes", "on")
         self._transports: list = []
         # Per-pump per-pipeline tallies; the on_batch_outcome callback
         # populates these so the journal log line reflects what
         # actually shipped this cycle.  Reset at the top of each loop
         # iteration.
         self._pump_wsprdaemon_records = 0
-        self._pump_wsprnet_records = 0
-        self._pump_wsprnet_accepted = 0    # what wsprnet actually added (parsed from response body)
         self._total_wsprdaemon_records = 0
-        self._total_wsprnet_records = 0
-        self._total_wsprnet_accepted = 0
         self._pump_count = 0
         self._work_count = 0
         # PSK (FT8/FT4) counts now ride in the per-cycle wsprdaemon tar.
@@ -174,13 +159,8 @@ class WsprUploaderHs:
         Required:
             WD_RECEIVER_CALL           e.g. AC0G/B1
             WD_RECEIVER_GRID           e.g. EM38ww
-        Optional (each pipeline is skipped if its dir is unset):
+        Optional:
             WD_UPLOAD_WSPRDAEMON_DIR   wsprdaemon.org spool root
-            WD_UPLOAD_WSPRNET_DIR      wsprnet.org spool root (legacy
-                                        path; we ignore in favor of
-                                        SqliteSource — but keeping
-                                        the read for diagnostics
-                                        when SQLite is absent)
             WD_SFTP_SERVERS            user@host,user@host,...
             WD_SFTP_SERVER             single user@host (legacy fallback)
             WD_SFTP_USER               override SFTP user
@@ -204,7 +184,6 @@ class WsprUploaderHs:
                 "WD_RECEIVER_GRID are required"
             )
         wsprdaemon_dir = e.get("WD_UPLOAD_WSPRDAEMON_DIR") or None
-        wsprnet_dir = e.get("WD_UPLOAD_WSPRNET_DIR") or None
         # SFTP servers: WD_SFTP_SERVERS preferred, WD_SFTP_SERVER as
         # legacy single-entry fallback — matches wd-upload-wsprdaemon.
         servers_raw = e.get("WD_SFTP_SERVERS") or e.get("WD_SFTP_SERVER") or ""
@@ -226,7 +205,6 @@ class WsprUploaderHs:
         return cls(
             call=call, grid=grid,
             wsprdaemon_dir=wsprdaemon_dir,
-            wsprnet_dir=wsprnet_dir,
             sftp_servers=sftp_servers,
             sftp_user=e.get("WD_SFTP_USER") or None,
             upload_id=e.get("WD_UPLOAD_ID") or None,
@@ -243,9 +221,9 @@ class WsprUploaderHs:
         # empty/unset, so WSPR_USE_HS_UPLOADER=0 (the obvious way to turn
         # the uploader OFF) was read as a non-empty string → ENABLED.
         # That made decode-only instances in a multi-RX merge fleet each
-        # run their own uploader, posting un-merged spots to wsprnet
-        # under their per-receiver call — defeating the single-merge-
-        # uploader design.  Observed on B4-100 2026-05-30: bee1/bee2
+        # run their own uploader, shipping un-merged spots under their
+        # per-receiver call — defeating the single-merge-uploader
+        # design.  Observed on B4-100 2026-05-30: bee1/bee2
         # (set =0) were posting as AC0G/B5 and AC0G/B6 alongside B4's
         # bare-AC0G merge, three POSTs per cycle.
         if os.environ.get(
@@ -260,8 +238,6 @@ class WsprUploaderHs:
 
         try:
             from hs_uploader import Pipeline, RetryPolicy, StationIdentity, Uploader
-            from hs_uploader.transports.wsprdaemon import WsprdaemonTarSftp
-            from hs_uploader.transports.wsprnet import WsprNet
             from hs_uploader.watermark.sqlite import (
                 SqliteWatermarkStore, default_path,
             )
@@ -270,22 +246,6 @@ class WsprUploaderHs:
                 "wspr-uploader-hs: hs-uploader import failed: %s", exc,
             )
             return
-
-        # Ensure the wsprnet audit table exists before the first batch
-        # ships, so its INSERT in _on_batch_outcome doesn't race with
-        # schema creation in the verifier thread.  No-op if WSPRNET_AUDIT
-        # is off — the audit module's own writes are gated on the
-        # ``_wsprnet_audit_enabled`` flag.
-        if self._wsprnet_audit_enabled:
-            try:
-                from . import wsprnet_audit
-                wsprnet_audit.ensure_schema(str(self._sink_db))
-            except Exception:
-                logger.exception(
-                    "wsprnet-audit: ensure_schema raised (continuing "
-                    "with audit disabled)"
-                )
-                self._wsprnet_audit_enabled = False
 
         watermark = SqliteWatermarkStore(default_path())
         # Pick up HS_UPLOADER_SSH_KEY_FILE (and any other identity env
@@ -325,20 +285,17 @@ class WsprUploaderHs:
         # WsprCycleSource(include_psk=True); no separate psk pipeline.
         # The _build_psk_tar_pipeline method is left defined (dead but
         # harmless) in case the separate path is ever needed again.
-
-        # --- pipeline 3: wsprnet.org via HTTP MEPT ---
-        wsprnet_pipe = self._build_wsprnet_pipeline(
-            identity=identity, watermark=watermark,
-        )
-        if wsprnet_pipe is not None:
-            pipelines.append(wsprnet_pipe[0])
-            self._transports.append(wsprnet_pipe[1])
+        #
+        # No wsprnet.org pipeline.  Under uniform routing (sigmond,
+        # 2026-11-13) wsprdaemon.org forwards every spot to wsprnet.org;
+        # the tar above carries forward_to_wsprnet=True.  A direct post
+        # here as well would double-post.
 
         if not pipelines:
             logger.warning(
                 "wspr-uploader-hs: no pipelines could be constructed "
-                "(check WD_UPLOAD_WSPRDAEMON_DIR / WD_SFTP_SERVERS / "
-                "SIGMOND_SQLITE_PATH); shim will exit"
+                "(check WD_SFTP_SERVERS / SIGMOND_SQLITE_PATH); "
+                "shim will exit"
             )
             return
 
@@ -357,8 +314,10 @@ class WsprUploaderHs:
         self._wake = threading.Event()
 
         # Optional: verify-and-flush thread polls wsprnet for our
-        # reporter's accepted spots and deletes confirmed rows from
-        # pending_uploads.  Off by default; opt in with WD_VERIFY_FLUSH=1.
+        # reporter's spots (forwarded there by wsprdaemon.org) and
+        # deletes confirmed rows from the local pending_uploads queue.
+        # It only reads wsprnet.  Off by default; opt in with
+        # WD_VERIFY_FLUSH=1.
         # See wsprnet_verifier.py for the full rationale.
         # (Note: in the upstream wsprdaemon-client shim this block had
         # landed after a return statement inside _pid_file_path() — dead
@@ -379,8 +338,7 @@ class WsprUploaderHs:
 
         # Sibling verifier for the wsprdaemon.org SFTP path.  Observe-only
         # (no DELETEs from pending_uploads — the wsprdaemon transport
-        # commits via the gateway SFTP ack, unlike wsprnet's stateless
-        # HTTP post).  Queries wd10/wd20/wd30 ClickHouse in parallel and
+        # commits via the gateway SFTP ack).  Queries wd10/wd20/wd30 ClickHouse in parallel and
         # logs per-server status + an aggregate pass-complete line.
         # Off by default; opt in with WSPRDAEMON_VERIFY=1.
         try:
@@ -469,10 +427,9 @@ class WsprUploaderHs:
         if self._pump_count:
             logger.info(
                 "wspr-uploader-hs stopped after %d pump(s), %d with work "
-                "(total: wsprdaemon=%d, wsprnet=%d records)",
+                "(total: wsprdaemon=%d, wsprnet=0 records)",
                 self._pump_count, self._work_count,
                 self._total_wsprdaemon_records,
-                self._total_wsprnet_records,
             )
 
     @property
@@ -494,8 +451,6 @@ class WsprUploaderHs:
             try:
                 self._pump_count += 1
                 self._pump_wsprdaemon_records = 0
-                self._pump_wsprnet_records = 0
-                self._pump_wsprnet_accepted = 0
                 # Per-pump scratch (NOT the psk accumulators — those
                 # span pumps until a cycle line is emitted).
                 self._pump_tar_bytes = 0
@@ -503,39 +458,27 @@ class WsprUploaderHs:
                 if self._uploader is not None and self._uploader.pump():
                     self._work_count += 1
                     self._total_wsprdaemon_records += self._pump_wsprdaemon_records
-                    self._total_wsprnet_records += self._pump_wsprnet_records
-                    self._total_wsprnet_accepted += self._pump_wsprnet_accepted
                     # Only emit a per-cycle line when a WSPR cycle
-                    # actually shipped this pump (wsprdaemon and/or
-                    # wsprnet had rows).  A psk-only pump (which should
-                    # no longer happen now that psk rides in the cycle
-                    # tar) does NOT log and does NOT reset the psk
+                    # actually shipped this pump.  A psk-only pump (which
+                    # should no longer happen now that psk rides in the
+                    # cycle tar) does NOT log and does NOT reset the psk
                     # accumulators — they keep accruing for the cycle
                     # that does ship.
-                    if (self._pump_wsprdaemon_records > 0
-                            or self._pump_wsprnet_records > 0):
-                        # wsprnet acceptance disclosure: server may add
-                        # fewer spots than we POSTed (duplicates, MAX_SPOTS
-                        # truncation, malformed lines).  Show posted AND
-                        # added when they differ; else stay compact.
-                        if self._pump_wsprnet_records != self._pump_wsprnet_accepted:
-                            wsprnet_field = (
-                                f"wsprnet=posted:{self._pump_wsprnet_records}"
-                                f"/added:{self._pump_wsprnet_accepted}"
-                            )
-                        else:
-                            wsprnet_field = f"wsprnet={self._pump_wsprnet_records}"
+                    if self._pump_wsprdaemon_records > 0:
                         cycle_str = (
                             self._pump_wspr_cycle.strftime("%H:%M")
                             if self._pump_wspr_cycle else "?"
                         )
                         tar_human = _human_bytes(self._pump_tar_bytes)
+                        # wsprnet=0: this shim posts nothing to
+                        # wsprnet.org; wsprdaemon.org forwards the spots.
+                        # The field stays because `smd watch uploads`
+                        # parses the line with a regex that needs it.
                         logger.info(
                             "wspr-uploader-hs: cycle=%s shipped "
-                            "wsprdaemon=%d %s ft8=%d ft4=%d tar=%s",
+                            "wsprdaemon=%d wsprnet=0 ft8=%d ft4=%d tar=%s",
                             cycle_str,
                             self._pump_wsprdaemon_records,
-                            wsprnet_field,
                             self._psk_ft8_pending,
                             self._psk_ft4_pending,
                             tar_human,
@@ -550,14 +493,9 @@ class WsprUploaderHs:
                 )
 
     def _on_batch_outcome(self, pipeline, batch, outcome) -> None:
-        """Tally per-pipeline ship counts; outcomes other than acked /
-        partial_ack are skipped (those records will retry next pass).
-
-        For wsprnet, outcome.reason carries "N/M added" parsed from
-        the server response body — see WsprNet._post().  We tally both
-        the posted count (batch.records) AND the actual accepted count
-        so the journal can report the true server-side acceptance rate.
-        """
+        """Tally the wsprdaemon tar's ship counts; outcomes other than
+        acked / partial_ack are skipped (those records will retry next
+        pass)."""
         if outcome.kind not in ("acked", "partial_ack"):
             return
         if pipeline.name.startswith("wsprdaemon-tar"):
@@ -583,84 +521,6 @@ class WsprUploaderHs:
                             self._pump_wspr_cycle = rt
             # Tar wire size (0 when the transport didn't carry it).
             self._pump_tar_bytes += getattr(outcome, "n_bytes", 0)
-        elif pipeline.name.startswith("wsprnet"):
-            self._pump_wsprnet_records += len(batch.records)
-            if self._pump_wspr_cycle is None and batch.records:
-                rt = getattr(batch.records[0], "time", None)
-                if rt is not None:
-                    self._pump_wspr_cycle = rt
-            # Parse "N/M added" from outcome.reason if present.
-            import re
-            m = re.match(r"(\d+)/(\d+) added", outcome.reason or "")
-            if m:
-                n_added = int(m.group(1))
-                n_posted = int(m.group(2))
-            else:
-                # No diagnostic — assume all posted records were accepted
-                # (older transport version without the parse).
-                n_added = len(batch.records)
-                n_posted = len(batch.records)
-            self._pump_wsprnet_accepted += n_added
-
-            # Per-spot audit so the operator can later run
-            # ``smd verifier report`` and see exactly which spots fell
-            # into the "uploaded but never appeared in wspr.rx"
-            # bucket.  Best-effort: failures here never block uploads.
-            # Off by default; opt in with WSPRNET_AUDIT=1 (typically
-            # set alongside WD_VERIFY_FLUSH=1).
-            if self._wsprnet_audit_enabled:
-                try:
-                    from . import wsprnet_audit
-                    spot_keys = [
-                        _record_to_spot_key(r)
-                        for r in batch.records
-                    ]
-                    spot_keys = [k for k in spot_keys if k is not None]
-                    wsprnet_audit.record_batch(
-                        rx_call=self._call,
-                        spots=spot_keys,
-                        n_posted=n_posted,
-                        n_added=n_added,
-                    )
-                except Exception:
-                    logger.exception(
-                        "wsprnet-audit: record_batch raised (ignored)"
-                    )
-
-                # Negative-cache update — feeds CallsignDB's filter
-                # so wsprd stops emitting stale Type-2 compound calls
-                # that wsprnet has consistently rejected.  See
-                # /tmp/wsprnet-negative-cache-design.md.
-                #
-                # We extract callsigns from the records that ACTUALLY
-                # went on the wire by re-applying the transport's own
-                # dedup helper — multi-source spots collapse to one
-                # entry per (cycle, call, freq) and only the winner
-                # gets counted.  This keeps the audit's view of "what
-                # wsprnet saw" consistent with what was rendered into
-                # MEPT lines.
-                try:
-                    from hs_uploader.transports.wsprnet import (
-                        dedup_records_for_wsprnet,
-                    )
-                    deduped = dedup_records_for_wsprnet(batch.records)
-                    calls_on_wire: list = []
-                    for r in deduped:
-                        cols = r.columns or {}
-                        c = (cols.get("tx_sign") or cols.get("tx_call")
-                             or cols.get("callsign") or "").strip()
-                        if c:
-                            calls_on_wire.append(c)
-                    wsprnet_audit.update_reject_cache(
-                        rx_call=self._call,
-                        calls_in_batch=calls_on_wire,
-                        n_posted=n_posted,
-                        n_added=n_added,
-                    )
-                except Exception:
-                    logger.exception(
-                        "wsprnet-reject-cache: update raised (ignored)"
-                    )
 
     # ----- pipeline construction -----
 
@@ -692,6 +552,9 @@ class WsprUploaderHs:
         ftp_password_file = os.environ.get("WD_FTP_PASSWORD_FILE") or None
         return WsprdaemonTarFtp(
             servers=ftp_servers,
+            # The FTP fallback rebuilds the tar itself, so it carries
+            # the same forward flag as the SFTP transport.
+            forward_to_wsprnet=True,
             spool_root=spool_root,
             ftp_user=os.environ.get("WD_FTP_USER", "noisegraphs"),
             ftp_password=os.environ.get("WD_FTP_PASSWORD", "xahFie6g"),
@@ -788,12 +651,22 @@ class WsprUploaderHs:
             receiver=receiver,
             fallback_ftp=fallback_ftp,
             # Cycle-aligned source — give the watermark its own key
-            # so it doesn't collide with raw-table pipelines (wsprnet
-            # still uses SqliteSource on wspr.spots, watermark key
-            # "wspr.spots").
+            # so it doesn't collide with raw-table pipelines (the old
+            # wsprnet pipeline used watermark key "wspr.spots").
             primary_table_name="wspr.cycle",
             compression=tar_compression,
             tar_root=tar_root,
+            # Uniform routing: wsprdaemon.org forwards this station's
+            # WSPR spots to wsprnet.org.  Same flag sigmond's
+            # uploader_manifest.apply_proxying sets for the daemon.
+            # pskreporter forwarding needs no keyword: each psk row
+            # carries forward_to_pskreporter (default True), and the
+            # tar builder writes it into routing.json.
+            #
+            # ⛔ No wsprnet_reporter / psk_reporter.  The server posts
+            # under each spot's own rx_sign; only a merge rewrites the
+            # reporter id, and it does so on the server.
+            forward_to_wsprnet=True,
         )
         pipeline = Pipeline(
             name=f"wsprdaemon-tar-{self._instance_name}",
@@ -936,227 +809,6 @@ class WsprUploaderHs:
         )
         return (pipeline, transport)
 
-    def _build_wsprnet_pipeline(self, *, identity, watermark):
-        # WsprNet reads record.columns — natural fit for SqliteSource
-        # on the local wspr.spots queue (already populated by
-        # wd-ch-write).  Falls back to FileTreeSource over the
-        # legacy _spots.txt files if SQLite isn't available.
-        from hs_uploader import Pipeline, RetryPolicy
-        from hs_uploader.transports.wsprnet import WsprNet
-        source = self._build_wsprnet_source()
-        if source is None:
-            logger.info(
-                "wspr-uploader-hs: no usable wsprnet source — skipping "
-                "wsprnet.org pipeline"
-            )
-            return None
-        # WSPRNET_BATCH_SIZE lets the operator opt into smaller POSTs
-        # so the audit can identify which individual spots wsprnet
-        # rejected.  Default = 999 (legacy behavior).  Set to 1 for
-        # per-spot tracking — costs ~30-50× more HTTP requests per
-        # cycle but lets ``smd verifier report --rejected`` name the
-        # rejected spots instead of just counting them.
-        try:
-            batch_size = int(
-                os.environ.get("WSPRNET_BATCH_SIZE", "999").strip() or "999"
-            )
-        except ValueError:
-            logger.warning(
-                "wspr-uploader-hs: WSPRNET_BATCH_SIZE not an int "
-                "(env=%r); using default 999",
-                os.environ.get("WSPRNET_BATCH_SIZE"),
-            )
-            batch_size = 999
-        # WsprNet clamps to its hard MAX_SPOTS_PER_UPLOAD (999) but
-        # we mirror the bound here so the log line reads honestly.
-        if batch_size < 1:
-            batch_size = 1
-        if batch_size > 999:
-            batch_size = 999
-        # wsprnet async upload API (W1GJM) — DEFAULT.  Submits to
-        # <base>/upload (immediate nonce) and polls <base>/status/<nonce>.
-        # WSPRNET_API_BASE overrides: a different base URL, or
-        # "legacy"/"off"/"" for the blocking meptspots.php POST.
-        _api = os.environ.get("WSPRNET_API_BASE")
-        if _api is None:
-            wsprnet_api_base = WSPRNET_ASYNC_API_DEFAULT
-        elif _api.strip().lower() in ("", "legacy", "off", "0", "none"):
-            wsprnet_api_base = None
-        else:
-            wsprnet_api_base = _api.strip()
-        # WSPRNET_POLL_INTERVAL_SEC: seconds between async status polls of
-        # <base>/status/<nonce>.  Default 5.0 — server processing is ~3-6s
-        # so the 1st-2nd poll still catches "done" with no practical latency
-        # cost, while easing poll load on wsprnet.org vs. the old 1s.
-        try:
-            poll_interval = float(
-                os.environ.get("WSPRNET_POLL_INTERVAL_SEC", "5").strip() or "5"
-            )
-        except ValueError:
-            logger.warning(
-                "wspr-uploader-hs: WSPRNET_POLL_INTERVAL_SEC not a float "
-                "(env=%r); using default 5.0",
-                os.environ.get("WSPRNET_POLL_INTERVAL_SEC"),
-            )
-            poll_interval = 5.0
-        transport = WsprNet(
-            max_spots_per_upload=batch_size,
-            api_base_url=wsprnet_api_base,
-            poll_interval_sec=poll_interval,
-            # Carry the configured WD version (default "4.0") so wsprnet's
-            # `version` field reads "WD_4.0" instead of the transport's
-            # default "WD_hs-uploader/0.1" (shown truncated as WD_hs-uplo).
-            version=self._version,
-        )
-        logger.info(
-            "wspr-uploader-hs: wsprnet upload via %s",
-            f"async API ({wsprnet_api_base})" if wsprnet_api_base
-            else "legacy meptspots.php",
-        )
-        if batch_size != 999:
-            logger.info(
-                "wspr-uploader-hs: wsprnet batch size capped at %d "
-                "(per-spot diagnostic mode)" if batch_size == 1 else
-                "wspr-uploader-hs: wsprnet batch size capped at %d",
-                batch_size,
-            )
-        # When batches are tiny (per-spot diagnostic mode), unblock
-        # the orchestrator's default "one batch per pump-pass" cap —
-        # otherwise we'd ship one spot per ~60 s pump while decoding
-        # ~25 spots/min, and the local queue would grow without
-        # bound.  Budget = 200 records lets the pump drain a typical
-        # 2-min cycle's worth (~50 spots/instance) plus the next
-        # cycle's lookahead while staying bounded.
-        if batch_size < 50:
-            max_per_pump = 200
-        else:
-            max_per_pump = None  # historical one-batch-per-pump
-        pipeline = Pipeline(
-            name=f"wsprnet-{self._instance_name}",
-            source=source,
-            transport=transport,
-            watermark=watermark,
-            identity=identity,
-            retry=RetryPolicy.exponential(base=2.0, cap_sec=900.0),
-            # Orchestrator-side per-pump cap.  Never exceed the
-            # transport's POST cap (the per-batch chunker handles
-            # smaller, but a higher orchestrator cap is pointless).
-            batch_limit=max(1, min(900, batch_size)),
-            max_records_per_pump=max_per_pump,
-        )
-        return (pipeline, transport)
-
-    def _wsprnet_ship_ceiling(self, conn):
-        """Ceiling provider for the wsprnet SqliteSource: newest WSPR
-        cycle complete across all expected receivers (or past backstop).
-
-        Bounds the completion walk to the last 10 min of cycles — older
-        cycles are always past the ~3.5 min backstop, so the blocking
-        (incomplete) cycle, if any, is always recent.  Returns an ISO
-        cycle string or None when nothing is shippable yet.
-        """
-        from hs_uploader.sources.wspr_completion import shippable_ceiling
-        from datetime import datetime as _dt, timedelta as _td, timezone as _tz
-        now = _dt.now(_tz.utc)
-        lower = (now - _td(seconds=600)).strftime("%Y-%m-%dT%H:%M:%SZ")
-        return shippable_ceiling(
-            conn,
-            cursor_iso=lower,
-            expected=self._merge_reporters,
-            backstop_sec=self._merge_backstop_sec,
-            now=now,
-        )
-
-    def _build_wsprnet_source(self):
-        """Pick SqliteSource when sigmond's sink is available; else
-        fall back to FileTreeSource over the legacy ``_spots.txt``
-        spool.  Matches psk-recorder's source dispatch shape so
-        operators see the same pattern in both shims.
-        """
-        try:
-            from hs_uploader.sources.sqlite import SqliteSource, HEALTH_NOOP
-        except ImportError as exc:
-            logger.warning(
-                "wspr-uploader-hs: SqliteSource import failed: %s", exc,
-            )
-            return None
-        if self._sink_db.exists():
-            sqlite_source = SqliteSource.from_env(
-                database="wspr",
-                table="spots",
-                accepted_schema_versions=[1, 2],  # v2 = 2026-05-14 wsprd-internal fields
-                start_at="now",
-                # FIRST-pump anchor — `start_at="now"` skips the existing
-                # backlog so a fresh deploy doesn't re-ship every
-                # historical row already SqRipped by wsprnet (would
-                # likely be filtered server-side, but the noise is
-                # avoidable).  Once the watermark exists, restarts
-                # resume from it and start_at is ignored.
-                #
-                # Don't delete on ack — the wsprdaemon pipeline shares
-                # this same (database, table) queue (since 2026-05-14
-                # Phase 4 cutover).  Race-delete would starve the other
-                # pipeline.  `smd storage trim` (24h wspr retention)
-                # is the cleanup mechanism.
-                delete_on_commit=False,
-                # Multi-RX888 dedup: when two receivers see the same
-                # spot, ship only the max-SNR version to wsprnet (its
-                # central database doesn't want duplicates and silently
-                # rejects them).  The same rows stay in the queue for
-                # the wsprdaemon-tar pipeline below, whose SqliteSource
-                # does NOT set these dedup params and therefore sees
-                # every receiver's row (diversity tier).
-                #
-                # Partition by ``band``, not ``frequency_hz``: two
-                # receivers with slightly different oscillator
-                # references report the same WSPR transmission at
-                # frequencies differing by 1-few Hz, and wsprnet's
-                # own dedup considers them the same spot.  Empirical
-                # 2026-05-20 finding: cycle 00:10 W9VW arrived at
-                # 14097098 (bee1, snr=-13) and 14097099 (B4-100,
-                # snr=-11) — the exact-freq partition kept both,
-                # wsprnet accepted one and rejected the other as
-                # duplicate.  Partitioning by band collapses them
-                # to one max-SNR winner while still keeping
-                # legitimately-distinct same-call multi-band spots
-                # (e.g. NI5F on 40m + 15m in the same cycle).
-                dedup_partition_by=('time', 'callsign', 'band'),
-                dedup_order_by_desc='snr_db',
-                # Event-driven cross-RX gate: hold back rows from WSPR
-                # cycles that aren't yet complete across all expected
-                # receivers (or past the backstop).  Keeping incomplete
-                # cycles OUT of the dedup CTE is what makes the cross-RX
-                # best-SNR pick correct — see wspr_completion.py.  No-op
-                # (None provider) for single-receiver deployments.
-                ceiling_column='time' if self._merge_reporters else None,
-                ceiling_provider=self._wsprnet_ship_ceiling
-                    if self._merge_reporters else None,
-            )
-            if sqlite_source.health() != HEALTH_NOOP:
-                logger.info(
-                    "wspr-uploader-hs: using SqliteSource for wsprnet "
-                    "(sink at %s)", self._sink_db,
-                )
-                return sqlite_source
-        # SQLite unavailable — fall back to spool files if configured.
-        if self._wsprnet_dir is None:
-            logger.warning(
-                "wspr-uploader-hs: SqliteSource unavailable AND no "
-                "WD_UPLOAD_WSPRNET_DIR — wsprnet pipeline cannot run"
-            )
-            return None
-        from hs_uploader.sources.files import FileSpec, FileTreeSource
-        return FileTreeSource(
-            root=self._wsprnet_dir,
-            specs=[FileSpec(
-                pattern="*_spots.txt",
-                parser=_parse_short_spots_file,
-                table="wspr.spots",
-            )],
-            retention=FileTreeSource.DELETE_ON_ACK,
-            source_id=f"wsprnet-spool:{self._instance_name}",
-        )
-
 
 def _human_bytes(n: int) -> str:
     """Format a byte count as a compact ``{kb:.1f}kB`` string (bytes/1024).
@@ -1178,129 +830,3 @@ def _server_host(server_spec: str) -> str:
     if "@" in server_spec:
         return server_spec.split("@", 1)[1]
     return server_spec
-
-
-_HASH_UNRESOLVED = "<...>"
-
-
-def _record_to_spot_key(record):
-    """Render an hs-uploader ``Record`` into the audit table's SpotKey
-    tuple ``(time_iso, tx_sign_upper, freq_hz_int)``.
-
-    Returns ``None`` if the record is missing fields the audit can't
-    work without — caller filters those out so we don't pollute the
-    table with rows whose primary key can't be reconstructed.
-
-    Also returns ``None`` for records the wsprnet transport itself
-    filters out (the hash-unresolved ``<...>`` placeholder).  Without
-    this the audit would record them as "uploaded" — they'd sit
-    ``in_flight`` forever and eventually flip to ``lost`` — even
-    though wsprnet never actually received them.  The transport's
-    ``_record_to_mept`` returns ``None`` for the same callsigns
-    (hs-uploader/transports/wsprnet.py around the
-    ``_HASH_UNRESOLVED`` check), so we mirror that filter here.
-
-    Two row shapes appear in practice:
-      * v2 sink.db rows: ``columns['callsign']``, ``columns['frequency_hz']``
-      * legacy: ``columns['tx_sign']``, ``columns['frequency']``
-    Falls back gracefully across both so the audit works on hosts
-    mid-migration.
-    """
-    cols = getattr(record, "columns", None) or {}
-    tx = cols.get("callsign") or cols.get("tx_sign")
-    freq = cols.get("frequency_hz")
-    if freq is None:
-        freq = cols.get("frequency")
-    if not tx or freq is None:
-        return None
-    if str(tx).strip() == _HASH_UNRESOLVED:
-        # Mirror the transport's filter — the spot never crosses the
-        # wire to wsprnet, so it'd be a lie to call it "uploaded".
-        return None
-    try:
-        freq_hz = int(freq)
-    except (TypeError, ValueError):
-        return None
-    rec_time = getattr(record, "time", None)
-    if rec_time is None:
-        return None
-    # WsprnetVerifier's canonical SpotKey time format is
-    # ``YYYY-MM-DDTHH:MM:00Z`` (minute precision, literal ``:00Z``
-    # suffix — see wsprnet_verifier.parse_wsprnet_spots).  Match
-    # exactly so the audit's spot_key strings collide cleanly with
-    # the verifier's mark_verified/mark_dropped calls.
-    rec_min = rec_time.replace(second=0, microsecond=0)
-    time_str = rec_min.strftime("%Y-%m-%dT%H:%M:00Z")
-    return (time_str, str(tx).upper(), freq_hz)
-
-
-# ----- short spots-file parser (wsprnet fallback) -----
-
-
-def _parse_short_spots_file(path: Path, raw: bytes):
-    """Parse a wsprnet-format ``_spots.txt`` file into per-spot dicts.
-
-    Each non-empty line is a wsprd-style MEPT record:
-        YYMMDD HHMM SNR DT FREQ TX_CALL TX_GRID PWR DRIFT ...
-    Returns a list of dicts shaped so ``WsprNet._record_to_mept``
-    finds the fields it needs (``tx_sign`` / ``tx_call``,
-    ``frequency_mhz`` or ``frequency``, ``time``, ``snr_db``, ``dt``,
-    ``drift``).  Used as the wsprnet-source fallback when SQLite
-    is absent.
-
-    Returns ``None`` per malformed line so FileTreeSource skips it
-    without aborting the whole file.
-    """
-    from datetime import datetime, timezone
-    out = []
-    try:
-        text = raw.decode("utf-8", errors="replace")
-    except Exception:
-        return out
-    for line in text.splitlines():
-        line = line.strip()
-        if not line or line.startswith("#"):
-            continue
-        parts = line.split()
-        if len(parts) < 6:
-            continue
-        try:
-            yymmdd, hhmm = parts[0], parts[1]
-            snr = float(parts[2])
-            dt = float(parts[3])
-            freq_mhz = float(parts[4])
-            tx_call = parts[5]
-        except (ValueError, IndexError):
-            continue
-        tx_grid = parts[6] if len(parts) >= 7 else ""
-        try:
-            pwr = int(parts[7]) if len(parts) >= 8 else 0
-        except ValueError:
-            pwr = 0
-        try:
-            drift = int(parts[8]) if len(parts) >= 9 else 0
-        except ValueError:
-            drift = 0
-        # Build the canonical decode time from YYMMDD + HHMM.
-        try:
-            year = 2000 + int(yymmdd[:2])
-            month = int(yymmdd[2:4])
-            day = int(yymmdd[4:6])
-            hour = int(hhmm[:2])
-            minute = int(hhmm[2:4])
-            t = datetime(
-                year, month, day, hour, minute, tzinfo=timezone.utc,
-            )
-        except (ValueError, IndexError):
-            continue
-        out.append({
-            "time": t,
-            "tx_call": tx_call,
-            "tx_grid": tx_grid,
-            "snr_db": snr,
-            "dt": dt,
-            "frequency_mhz": freq_mhz,
-            "pwr": pwr,
-            "drift": drift,
-        })
-    return out

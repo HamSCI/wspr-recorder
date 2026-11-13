@@ -7,8 +7,8 @@ decode-period boundaries (120 s, 300 s, 900 s, 1800 s), and — when the
 pipeline-v2 feature flags are enabled — decodes those WAVs in-process
 with `wsprd` / `jt9`, writes spots and per-cycle noise into sigmond's
 local SQLite sink, and ships them upstream to wsprdaemon.org, which
-forwards them to wsprnet.org.  The in-process uploader still posts to
-wsprnet.org directly as well; see **Uploads** below.
+forwards them to wsprnet.org and pskreporter.info.  The station posts to
+neither itself; see **Uploads** below.
 
 wspr-recorder now supersedes `wsprdaemon-client`'s WSPR recording,
 decoding, and uploading role: with `WD_DECODE_VIA_DB=1` and
@@ -33,7 +33,7 @@ wspr-recorder daemon (one per radiod)
   └─ upload (WSPR_USE_HS_UPLOADER=1): in-process hs-uploader
                 → wsprdaemon.org (cycle-aligned tar via SFTP)
                      → wsprnet.org, forwarded by the server
-                → wsprnet.org   (HTTP MEPT, direct; still built here)
+                     → pskreporter.info, forwarded by the server
 ```
 
 One `wspr-recorder@<radiod_id>.service` instance per radiod. The
@@ -125,14 +125,16 @@ host's psk-recorder and meteor-scatter rows (FT8/FT4, MSK144).
 
 HamSCI's standard since 2026-11-13: every spot goes only to
 wsprdaemon.org, which forwards copies to wsprnet.org and
-pskreporter.info under each spot's own reporter id.  Sigmond carries
-this out for the single-host `hs-uploader` daemon: its rendered
-manifest flags the `wspr-wsprdaemon` tar `forward_to_wsprnet` and
-leaves out the `wspr-wsprnet` pipeline that `deploy.toml` declares.
-This repo's own pump (`hs_uploader_shim.py`) builds its pipelines from
-the environment, not from that manifest, and still posts each spot to
-wsprnet.org by HTTP MEPT whenever the sink exists.  Until it changes,
-a host that runs it posts WSPR to wsprnet.org itself as well.
+pskreporter.info under each spot's own reporter id.  This repo's pump
+(`hs_uploader_shim.py`) follows it.  The pump builds no wsprnet.org
+pipeline.  Its tar transport sets `forward_to_wsprnet`, and each FT8/FT4
+row carries its own `forward_to_pskreporter` flag, which the tar's
+`routing.json` collects.  The pump sends no reporter identity, so the
+server posts under each spot's own call.  Sigmond does the same for the
+single-host `hs-uploader` daemon: its rendered manifest flags the
+`wspr-wsprdaemon` tar and leaves out the `wspr-wsprnet` pipeline that
+`deploy.toml` declares.  The per-cycle journal line reports
+`wsprnet=0`, since the station posts nothing there itself.
 
 The uploader can also run on its own.  A single recorder can keep it
 in process.  A merge fleet, with several receivers writing one sink,

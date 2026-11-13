@@ -253,8 +253,9 @@ class WsprRecorder:
         self._wallclock_guard_cfg = WallClockGuardConfig.from_env()
         self._wallclock_guard_strikes: Dict[str, int] = {}
         self._wallclock_guard_lock = threading.Lock()
-        # hs-uploader pumps wspr.spots + wspr.noise → wsprdaemon.org +
-        # wsprnet.org from in-process.  v3 Phase A absorbed this from
+        # hs-uploader pumps wspr.spots + wspr.noise → wsprdaemon.org
+        # from in-process; the server forwards the spots to wsprnet.org
+        # and pskreporter.info.  v3 Phase A absorbed this from
         # the standalone wd-upload-hs@.service; gated on
         # WSPR_USE_HS_UPLOADER=1 so operators opt in alongside
         # stopping the legacy unit.  None until run() builds it.

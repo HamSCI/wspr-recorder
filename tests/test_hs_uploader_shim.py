@@ -10,7 +10,9 @@ Focused on the bits the shim itself owns:
   - start() gating on WSPR_USE_HS_UPLOADER feature flag
   - pipeline construction wiring (which transports + sources end up
     in the Uploader, given which env signals)
-  - _parse_short_spots_file: wsprnet-fallback line parser
+  - routing: no direct wsprnet.org pipeline; the wsprdaemon tar
+    carries the forward flags instead
+  - the per-cycle journal line
 
 Transport / source internals (SFTP, HTTP POST, FileTreeSource
 delete-on-ack) are covered in hs-uploader's own test suite; we
@@ -36,7 +38,6 @@ def _hs_available() -> bool:
 
 from wspr_recorder.hs_uploader_shim import (
     WsprUploaderHs,
-    _parse_short_spots_file,
     _server_host,
 )
 
@@ -86,7 +87,6 @@ class TestFromEnv(unittest.TestCase):
         env = {"WD_RECEIVER_CALL": "AC0G/B1", "WD_RECEIVER_GRID": "EM38ww"}
         u = WsprUploaderHs.from_env(env)
         self.assertIsNone(u._wsprdaemon_dir)
-        self.assertIsNone(u._wsprnet_dir)
         self.assertEqual(u._sftp_servers, [])
 
     def test_instance_name_default_is_call_with_slash_replaced(self):
@@ -217,22 +217,120 @@ class TestPipelineWiring(unittest.TestCase):
             u.start()
         return u
 
-    def test_both_pipelines_constructed_when_env_complete(self):
+    def _wsprd_pipe(self, u):
+        return next(
+            (p for p in u._uploader.pipelines
+             if p.name.startswith("wsprdaemon-tar")),
+            None,
+        )
+
+    def test_full_env_builds_no_wsprnet_pipeline(self):
+        """Uniform routing: every WSPR spot goes only to wsprdaemon.org,
+        which forwards a copy to wsprnet.org.  The shim must build no
+        pipeline and no transport that posts to wsprnet.org itself."""
         u = self._start()
         try:
             self.assertTrue(u.is_active)
             names = [p.name for p in u._uploader.pipelines]
             self.assertTrue(any(n.startswith("wsprdaemon-tar") for n in names))
-            self.assertTrue(any(n.startswith("wsprnet") for n in names))
+            self.assertFalse(
+                any("wsprnet" in n for n in names),
+                f"no wsprnet pipeline expected, got {names}",
+            )
+            from hs_uploader.transports.wsprnet import WsprNet
+            transports = [p.transport for p in u._uploader.pipelines]
+            self.assertFalse(
+                any(isinstance(t, WsprNet) for t in transports),
+                "the shim must construct no WsprNet transport",
+            )
+        finally:
+            u.stop(timeout=2.0)
+
+    def test_no_env_knob_brings_direct_posting_back(self):
+        """The old wsprnet knobs no longer reach a WsprNet transport."""
+        u = self._start(
+            WSPRNET_API_BASE="legacy",
+            WSPRNET_BATCH_SIZE="1",
+            WSPRNET_POLL_INTERVAL_SEC="5",
+            WSPRNET_AUDIT="1",
+        )
+        try:
+            names = [p.name for p in u._uploader.pipelines]
+            self.assertEqual(
+                [n for n in names if "wsprnet" in n], [],
+            )
+        finally:
+            u.stop(timeout=2.0)
+
+    def test_wsprdaemon_tar_carries_forward_flag_and_no_identity(self):
+        """The tar transport asks the server to forward to wsprnet.org
+        and names no reporter: the server posts under each spot's own
+        rx_sign (sigmond uploader_manifest.apply_proxying semantics)."""
+        u = self._start()
+        try:
+            pipe = self._wsprd_pipe(u)
+            self.assertIsNotNone(pipe)
+            t = pipe.transport
+            self.assertIs(t.forward_to_wsprnet, True)
+            self.assertIsNone(t.wsprnet_reporter)
+            self.assertIsNone(t.psk_reporter)
+            # The FTP fallback rebuilds the tar itself, so it must carry
+            # the same flag, or a cycle shipped by FTP would not forward.
+            ftp = t.fallback_ftp
+            self.assertIsNotNone(ftp)
+            self.assertIs(ftp.forward_to_wsprnet, True)
+            self.assertIsNone(ftp.wsprnet_reporter)
+            self.assertIsNone(ftp.psk_reporter)
+        finally:
+            u.stop(timeout=2.0)
+
+    def test_built_tar_routing_json_forwards_wsprnet_and_psk(self):
+        """End to end through the real tar builder: routing.json flags
+        forward_to_wsprnet and forward_to_pskreporter, with no reporter
+        identity, for a cycle that carries an FT8 row."""
+        import io
+        import json
+        import tarfile
+        from datetime import datetime, timezone
+        from hs_uploader import StationIdentity
+        from hs_uploader.core import Record, RecordBatch
+        u = self._start()
+        try:
+            t = self._wsprd_pipe(u).transport
+            when = datetime(2026, 11, 13, 12, 0, tzinfo=timezone.utc)
+            rec = Record(
+                table="psk.spots", time=when,
+                columns={
+                    "time": "2026-11-13T12:00:00Z", "mode": "FT8",
+                    "frequency": 14074000, "snr_db": -10, "dt": 0.1,
+                    "tx_call": "K1ABC", "grid": "FN42",
+                    "host_call": "AC0G/B1", "host_grid": "EM38ww",
+                    "radiod_id": "rx1",
+                },
+            )
+            ident = StationIdentity.load()
+            ident.call, ident.grid = "AC0G/B1", "EM38ww"
+            raw = t._build_tar(RecordBatch(records=[rec], cursor_after=b""),
+                               ident)
+            self.assertIsNotNone(raw)
+            with tarfile.open(fileobj=io.BytesIO(raw), mode="r:*") as tf:
+                routing = json.loads(tf.extractfile("routing.json").read())
+            default = routing["default"]
+            self.assertIs(default.get("forward_to_wsprnet"), True)
+            self.assertIs(default.get("forward_to_pskreporter"), True)
+            self.assertNotIn("wsprnet_reporter", default)
+            self.assertNotIn("psk_reporter", default)
         finally:
             u.stop(timeout=2.0)
 
     def test_wsprdaemon_pipeline_skipped_when_no_sftp(self):
+        """No SFTP target leaves nothing to build: the shim has no
+        direct wsprnet pipeline to fall back on."""
         u = self._start(WD_SFTP_SERVERS="")
         try:
             names = [p.name for p in (u._uploader.pipelines if u._uploader else [])]
-            self.assertFalse(any(n.startswith("wsprdaemon-tar") for n in names))
-            self.assertTrue(any(n.startswith("wsprnet") for n in names))
+            self.assertEqual(names, [])
+            self.assertFalse(u.is_active)
         finally:
             u.stop(timeout=2.0)
 
@@ -276,44 +374,65 @@ class TestPipelineWiring(unittest.TestCase):
             u.stop(timeout=2.0)
 
 
-# ---- short-spots-file parser --------------------------------------------
+# ---- per-cycle journal line ------------------------------------------
 
 
-class TestParseShortSpotsFile(unittest.TestCase):
-    """The wsprnet-fallback parser reads classic wsprd `_spots.txt`
-    text lines and emits dicts keyed for ``WsprNet._record_to_mept``.
-    """
+class TestCycleLogLine(unittest.TestCase):
+    """The per-cycle line reports wsprnet=0: the shim posts nothing to
+    wsprnet.org; wsprdaemon.org forwards the spots.  ``smd watch
+    uploads`` parses the line with a regex that needs the field."""
 
-    def test_parses_well_formed_line(self):
-        raw = b"260512 1430 -15 -0.3 14.097150 KK7ABC EM38 30 0\n"
-        rows = _parse_short_spots_file(Path("/dev/null"), raw)
-        self.assertEqual(len(rows), 1)
-        r = rows[0]
-        self.assertEqual(r["tx_call"], "KK7ABC")
-        self.assertEqual(r["tx_grid"], "EM38")
-        self.assertEqual(r["snr_db"], -15.0)
-        self.assertEqual(r["dt"], -0.3)
-        self.assertEqual(r["frequency_mhz"], 14.097150)
-        self.assertEqual(r["pwr"], 30)
-        self.assertEqual(r["drift"], 0)
-        self.assertEqual(r["time"].year, 2026)
-        self.assertEqual(r["time"].month, 5)
-        self.assertEqual(r["time"].day, 12)
-        self.assertEqual(r["time"].hour, 14)
-        self.assertEqual(r["time"].minute, 30)
+    SMD_RE = (
+        r"wspr-uploader-hs:\s+cycle=(\S+)\s+shipped\s+"
+        r"wsprdaemon=(\d+)\s+wsprnet=(\S+)\s+ft8=(\d+)\s+ft4=(\d+)\s+tar=(\S+)"
+    )
 
-    def test_skips_blank_and_comment_lines(self):
-        raw = b"# header\n\n260512 1430 -15 -0.3 14.097150 K1ABC EM38 30 0\n"
-        rows = _parse_short_spots_file(Path("/dev/null"), raw)
-        self.assertEqual(len(rows), 1)
+    def _pump_once(self, u, pipeline_names):
+        import re
+        import threading
+        from datetime import datetime, timezone
+        from types import SimpleNamespace as NS
+        when = datetime(2026, 11, 13, 12, 0, tzinfo=timezone.utc)
+        rec = NS(table="wspr.spots", time=when, columns={})
+        outcome = NS(kind="acked", reason="1/1 added", n_bytes=2048)
 
-    def test_skips_malformed_lines(self):
-        raw = b"too short\n260512 1430 -15 -0.3 14.097150 K1ABC EM38 30 0\n"
-        rows = _parse_short_spots_file(Path("/dev/null"), raw)
-        self.assertEqual(len(rows), 1)
+        class FakeUploader:
+            def pump(inner):
+                for name in pipeline_names:
+                    u._on_batch_outcome(
+                        NS(name=name), NS(records=[rec, rec]), outcome,
+                    )
+                u._stop.set()
+                return True
 
-    def test_empty_input_returns_empty(self):
-        self.assertEqual(_parse_short_spots_file(Path("/dev/null"), b""), [])
+        u._uploader = FakeUploader()
+        u._wake = threading.Event()
+        u._wake.set()
+        with self.assertLogs("wspr_recorder.hs_uploader_shim", "INFO") as cm:
+            u._run()
+        lines = [m for m in cm.output if "shipped" in m]
+        self.assertEqual(len(lines), 1, cm.output)
+        m = re.search(self.SMD_RE, lines[0])
+        self.assertIsNotNone(m, lines[0])
+        return m
+
+    def _shim(self):
+        return WsprUploaderHs.from_env({
+            "WD_RECEIVER_CALL": "AC0G", "WD_RECEIVER_GRID": "EM38ww",
+        })
+
+    def test_cycle_line_reports_wsprnet_zero(self):
+        m = self._pump_once(self._shim(), ["wsprdaemon-tar-AC0G"])
+        self.assertEqual(m.group(2), "2")
+        self.assertEqual(m.group(3), "0")
+
+    def test_wsprnet_named_outcome_is_not_counted(self):
+        """Even an outcome from a pipeline named wsprnet-* cannot raise
+        the count: the shim has no wsprnet tally left to raise."""
+        m = self._pump_once(
+            self._shim(), ["wsprdaemon-tar-AC0G", "wsprnet-AC0G"],
+        )
+        self.assertEqual(m.group(3), "0")
 
 
 # ---- _server_host utility ----------------------------------------------

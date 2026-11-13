@@ -33,8 +33,8 @@ keeps a per-band float32 ring buffer, slices it at the five WSPR/FST4W decode
 cadences (120/300/900/1800 s), peak-normalizes each slice to an int16 WAV, and
 — when the pipeline-v2 feature flags are set — decodes in-process, writes
 `wspr.spots`/`wspr.noise` rows into sigmond's local SQLite sink, and uploads
-them via an in-process `hs-uploader` to wsprnet.org (HTTP MEPT) and
-wsprdaemon.org (cycle-aligned tar over SFTP).
+them via an in-process `hs-uploader` to wsprdaemon.org (cycle-aligned tar
+over SFTP), which forwards them to wsprnet.org and pskreporter.info.
 
 Its defining design choice is that **decode and upload are additive,
 env-flag-gated layers over a recorder that always runs**: with no flags it
@@ -56,7 +56,8 @@ done — coordinated by a stateless cross-process upload-wake datagram socket.
 - **Decode** every cycle (wsprd 2-pass + `jt9 --fst4w`), resolving type-3
   callsign hashes across decoders and bands, and measure per-cycle noise.
 - Write **`wspr.spots` + `wspr.noise`** rows into the shared SQLite sink, and
-  **upload** them to wsprnet.org and wsprdaemon.org with at-least-once delivery.
+  **upload** them to wsprdaemon.org with at-least-once delivery; the server
+  forwards them to wsprnet.org and pskreporter.info.
 - Run a **multi-receiver merge fleet** correctly: one shared sink, one
   uploader, per-cycle completion derived from durable state, no double-uploads
   and no lost cycles across process restarts.
@@ -188,17 +189,20 @@ audit consumers (`smd verifier`, `smd watch wspr`).
   is read-only — the recorder path is unaffected.
 
 ### 6.5 Upload (`WSPR_USE_HS_UPLOADER=1`)
-- `WSP-F-040` `[DOC]` ✅ SHALL run an in-process `hs-uploader` pump with two
-  pipelines: **wsprdaemon-tar** (`WsprCycleSource` over `(wspr.spots, wspr.noise)`
-  → `WsprdaemonTarSftp`, one cycle-aligned `{UPLOAD_ID}_YYMMDD_HHMM.tbz` per
-  cycle, parallel `spots/`+`noise/` subtrees) and **wsprnet** (`SqliteSource`
-  over `wspr.spots` → `WsprNet` HTTP MEPT).
+- `WSP-F-040` `[CODE]` ✅ SHALL run an in-process `hs-uploader` pump with one
+  pipeline: **wsprdaemon-tar** (`WsprCycleSource` over `(wspr.spots, wspr.noise)`
+  plus the cycle's `psk.spots` → `WsprdaemonTarSftp`, one cycle-aligned
+  `{UPLOAD_ID}_YYMMDD_HHMM.tbz` per cycle, parallel `spots/`+`noise/` subtrees).
+  The transport SHALL set `forward_to_wsprnet=True` and send no reporter
+  identity; the shim SHALL build no wsprnet.org pipeline (uniform routing,
+  2026-11-13). Tests: `tests/test_hs_uploader_shim.py::TestPipelineWiring`.
 - `WSP-F-041` `[CODE]` ✅ The pump SHALL wake on a `CycleBatcher` commit Event or a
   `WSPR_PUMP_INTERVAL_SEC` polling backstop (default 300 s), cutting decode→ship
   latency to a few hundred ms while the backstop covers missed wakes.
 - `WSP-F-042` `[CODE]` 🟡 With `WD_VERIFY_FLUSH=1` SHALL run a verify-and-flush
-  thread (`wsprnet_verifier.py`) that polls wsprnet for accepted spots and
-  deletes confirmed rows from `pending_uploads`.
+  thread (`wsprnet_verifier.py`) that polls wsprnet for this reporter's spots
+  (forwarded there by wsprdaemon.org) and deletes confirmed rows from the local
+  `pending_uploads` queue.
 - `WSP-F-043` `[CODE]` 🟡 SHALL tag rows `forward_to_pskreporter` for a downstream
   gateway-elected forwarder; wspr-recorder itself does not post to PSKReporter.
 - `WSP-F-044` `[CODE]` ✅ The uploader SHALL run **either** in-process **or** as a
@@ -321,8 +325,9 @@ audit consumers (`smd verifier`, `smd watch wspr`).
   - `wspr.noise` (schema 1): `time, band, radiod_id, rx_source, reporter_id,
     host_id, rx_call, rx_grid, rms_noise_dbm, fft_noise_dbm, overload_count,
     schema_version, uploaded_at`.
-- **Uploads**: wsprnet.org (HTTP MEPT, per-spot) and wsprdaemon.org
-  (cycle-aligned `.tbz` tar over SFTP, spots+noise subtrees).
+- **Uploads**: wsprdaemon.org only (cycle-aligned `.tbz` tar over SFTP,
+  spots+noise subtrees, `forward_to_wsprnet` set); the server forwards to
+  wsprnet.org and pskreporter.info.
 - **Inventory/validate JSON** (per-instance resource view), **journal** logs
   (`StandardOutput=journal`; no per-instance file), `wspr-ctl` control socket,
   `upload-wake.sock`, callhash JSON at `/var/lib/wspr-recorder/callhash/`.

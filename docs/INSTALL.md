@@ -135,7 +135,7 @@ not the TOML config. Set them in a per-instance env file
 ```ini
 # /etc/wspr-recorder/env/bee3.env
 WD_DECODE_VIA_DB=1                # decode in-process → SQLite sink
-WSPR_USE_HS_UPLOADER=1            # ship spots to wsprnet + wsprdaemon
+WSPR_USE_HS_UPLOADER=1            # ship spots to wsprdaemon.org (it forwards to wsprnet)
 WD_RECEIVER_CALL=AC0G/B1
 WD_RECEIVER_GRID=EM38ww
 WD_UPLOAD_WSPRDAEMON_DIR=/var/spool/wsprdaemon

@@ -10,7 +10,8 @@ bands into a per-band ring buffer, and produces period-length WAV
 files. When the pipeline-v2 feature flags are set it also decodes
 those WAVs in-process with `wsprd` / `jt9`, writes `wspr.spots` and
 `wspr.noise` rows into sigmond's local SQLite sink, and uploads them to
-wsprnet.org and wsprdaemon.org via an in-process `hs-uploader`. It
+wsprdaemon.org via an in-process `hs-uploader`; wsprdaemon.org forwards
+them to wsprnet.org and pskreporter.info. It
 runs as a sigmond client — one `wspr-recorder@<radiod_id>.service`
 per radiod, `Type=notify` with a watchdog.
 
@@ -113,8 +114,8 @@ radiod RTP stream (12kHz, wire encoding configurable — default f32)
                                                        │
               ── WSPR_USE_HS_UPLOADER=1: in-process uploader ──
                     → WsprUploaderHs (hs_uploader_shim.py)
-                        → wsprnet.org   (HTTP MEPT)
                         → wsprdaemon.org (cycle-aligned spots+noise tar / SFTP)
+                            → wsprnet.org, pskreporter.info (forwarded by the server)
 ```
 
 The `spot_processor.py` module (a separate 34-field enhancer) is not on this path; the SpotSink writes `RawSpot` instances straight to the canonical `hamsci_sink` row shape, and downstream geodesy is computed by the uploader's wsprdaemon transport.
@@ -167,9 +168,9 @@ The +120 s headroom above the longest period exists so that the W2 cycle that st
 
 **Spot Sink** (`spot_sink.py`): The producer side of the pipeline-v2 DB-direct path. Gated on `WD_DECODE_VIA_DB=1`. `SpotSink` adapts in-process `RawSpot` instances to the canonical `hamsci_sink` row shape (`SCHEMA_VERSION = 2`) and writes them via `sigmond.hamsci_sink.Writer(mode="wspr", table="spots")`. `CycleBatcher` collects per-band spots into one per-cycle `wspr.spots` write on a dedicated writer thread — this sidesteps SQLite's thread-affinity check (decodes run on per-band worker threads, but only the batcher thread touches the DB) and yields one `Writer.insert()` per cycle instead of one per band. Lazy-imports `hamsci_sink`, so kiwi-only / CI installs with no sigmond run identically with all sink operations no-op'd. `resolve_reporter_identity()` resolves `(rx_call, rx_grid)` from `WD_RX_CALL`/`WD_RX_GRID` or `WD_RECEIVER_CALL`/`WD_RECEIVER_GRID`.
 
-**HS Uploader Shim** (`hs_uploader_shim.py`): In-process uploader, gated on `WSPR_USE_HS_UPLOADER=1`. `WsprUploaderHs` owns two `hs-uploader` pipelines inside one pump thread: (1) **wsprdaemon-tar** — `WsprCycleSource` on `(wspr.spots, wspr.noise)` → `WsprdaemonTarSftp`, one cycle-aligned tar per WSPR 2-min cycle (parallel `wsprdaemon/spots/...` + `wsprdaemon/noise/...` subtrees) shipped to wsprdaemon.org by SFTP; (2) **wsprnet** — `SqliteSource` on `wspr.spots` → `WsprNet`, individual MEPT rows posted to wsprnet.org by HTTP. Each pipeline has its own watermark stored under `/var/lib/hs-uploader`. The pump waits on a wake `Event` or a 60 s `PUMP_INTERVAL_SEC` timeout. Built from env (`WD_RECEIVER_CALL/GRID`, `WD_SFTP_SERVERS`, `WD_UPLOAD_WSPRDAEMON_DIR`, …) via `from_env()`. This absorbs the role of the standalone `wd-upload-hs@.service` (v3 Phase A). Optional `WD_VERIFY_FLUSH=1` runs a verify-and-flush thread (`wsprnet_verifier.py`) that polls wsprnet for accepted spots and deletes confirmed rows from `pending_uploads`.
+**HS Uploader Shim** (`hs_uploader_shim.py`): In-process uploader, gated on `WSPR_USE_HS_UPLOADER=1`. `WsprUploaderHs` owns one `hs-uploader` pipeline inside one pump thread: **wsprdaemon-tar** — `WsprCycleSource` on `(wspr.spots, wspr.noise)` plus the cycle's `psk.spots` rows → `WsprdaemonTarSftp`, one cycle-aligned tar per WSPR 2-min cycle (parallel `wsprdaemon/spots/...` + `wsprdaemon/noise/...` subtrees) shipped to wsprdaemon.org by SFTP. Its watermark lives under `/var/lib/hs-uploader`. The pump waits on a wake `Event` or a 60 s `PUMP_INTERVAL_SEC` timeout. Built from env (`WD_RECEIVER_CALL/GRID`, `WD_SFTP_SERVERS`, `WD_UPLOAD_WSPRDAEMON_DIR`, …) via `from_env()`. This absorbs the role of the standalone `wd-upload-hs@.service` (v3 Phase A). Optional `WD_VERIFY_FLUSH=1` runs a verify-and-flush thread (`wsprnet_verifier.py`) that reads wsprnet for this reporter's spots and deletes confirmed rows from the local `pending_uploads` queue.
 
-⚠ **The direct wsprnet pipeline predates HamSCI's routing standard (sigmond, 2026-11-13):** every spot goes only to wsprdaemon.org, which forwards copies to wsprnet.org and pskreporter.info under each spot's own reporter id. Sigmond carries this out for the single-host `hs-uploader` daemon, whose rendered manifest flags the `wspr-wsprdaemon` tar `forward_to_wsprnet` and leaves out the `wspr-wsprnet` pipeline declared in `deploy.toml`. This shim reads no manifest and still builds pipeline (2), so a host running it still posts WSPR to wsprnet.org itself. Retiring pipeline (2) closes the last direct route.
+**Uniform routing (sigmond, 2026-11-13):** every spot goes only to wsprdaemon.org, which forwards copies to wsprnet.org and pskreporter.info under each spot's own reporter id. The shim builds no wsprnet.org pipeline, and no env var brings one back. Its `WsprdaemonTarSftp` (and the FTP fallback, which rebuilds the tar) passes `forward_to_wsprnet=True`. FT8/FT4 rows carry their own `forward_to_pskreporter` flag (default true), which the tar builder collects into `routing.json`. The shim passes no `wsprnet_reporter` / `psk_reporter`; only a merge rewrites the reporter id, on the server. Sigmond's `uploader_manifest.apply_proxying` sets the same flag for the single-host `hs-uploader` daemon. The per-cycle line reports `wsprnet=0`; `smd watch uploads` parses that field. A merge member (`WSPR_USE_HS_UPLOADER` off) decodes into the shared sink and uploads nothing.
 
 **Timing**: `TimingService` plays two roles: (1) it attaches quality metadata (source, uncertainty, tier) to each WAV sidecar, and (2) it creates a `SyncStrategy` per BandRecorder that determines how minute boundaries are detected. See `sync_strategy.py` — `RtpSyncStrategy` (L5/L6), `ClockSyncStrategy` (L2-L4), `FallbackSyncStrategy` (L1).
 
@@ -191,7 +192,7 @@ The +120 s headroom above the longest period exists so that the W2 cycle that st
 - **Standard ka9q-python stream infrastructure**: Uses `MultiStream` (one per multicast group, shared socket) for all RTP reception, packet resequencing, S16BE decoding, and stream health monitoring — the same infrastructure as psk-recorder and hf-timestd. No custom UDP socket code.
 - **DB-direct decode is feature-flagged and additive**: With `WD_DECODE_VIA_DB` unset/`0`, `_on_period_complete` behaves exactly as it did pre-pipeline-v2 (write WAV, return) — the legacy `wd-decode@*` bash chain is unaffected. With `WD_DECODE_VIA_DB=1` the same process also decodes and writes `wspr.spots`/`wspr.noise` rows. The two pipelines can run side-by-side during a dual-write observation window: the in-process decoder uses a separate per-band `.phase2/` work_dir so its `ALL_WSPR.TXT` / hashtable artefacts don't collide with the bash chain's.
 - **Per-cycle batching for SQLite thread-affinity**: `BandRecorder` dispatches decodes across a per-band thread pool, but SQLite connections are thread-bound. `CycleBatcher` collects each cycle's per-band spots under a mutex and a single dedicated writer thread does all `Writer.insert()` calls — one transaction per WSPR cycle (the natural atomic unit) instead of one per band.
-- **In-process uploader replaces standalone units**: `WSPR_USE_HS_UPLOADER=1` runs the `hs-uploader` pump inside the recorder process (v3 Phase A), absorbing the standalone `wd-upload-hs@.service`. wsprdaemon.org gets one cycle-aligned tar per cycle (spots + noise bundled — its ingest model is one-tar-per-cycle); wsprnet.org gets individual MEPT rows from this pump, the direct route the routing standard retires (see the shim note above). The `CycleBatcher` wake callback nudges the pump on each commit, cutting decode→ship latency from a 60 s polling tick to a few hundred ms.
+- **In-process uploader replaces standalone units**: `WSPR_USE_HS_UPLOADER=1` runs the `hs-uploader` pump inside the recorder process (v3 Phase A), absorbing the standalone `wd-upload-hs@.service`. wsprdaemon.org gets one cycle-aligned tar per cycle (spots + noise bundled — its ingest model is one-tar-per-cycle); wsprdaemon.org forwards the spots to wsprnet.org and pskreporter.info, so the pump posts to neither (see the shim note above). The `CycleBatcher` wake callback nudges the pump on each commit, cutting decode→ship latency from a 60 s polling tick to a few hundred ms.
 - **sd_notify without a dependency**: The unit is `Type=notify` with `WatchdogSec`. `_sd_notify()` sends `READY=1` / `WATCHDOG=1` datagrams over the `NOTIFY_SOCKET` `AF_UNIX` socket using only stdlib — no `sdnotify`/`systemd` package. Until `READY=1` the unit sits in `activating` and systemd would time it out at `TimeoutStartSec` (180 s); the watchdog ping at `WATCHDOG_USEC/2` lets systemd restart a wedged daemon. Both calls no-op when the env vars are absent, so standalone runs are unaffected. This is the same pattern psk-recorder / hfdl-recorder use. (Before this was implemented, the daemon never notified and systemd crash-looped it.)
 - **Restart-on-stream-restore**: After a real radiod outage, an in-place `BandRecorder` reset leaves ring-buffer minute alignment off by an unknowable offset and wsprd decodes zero spots. `on_stream_restored` instead `os._exit(75)`s so systemd's `Restart=always` brings the process back for a clean re-sync on the next minute boundary.
 
@@ -242,8 +243,8 @@ The feature flags and identity inputs come from the unit's `EnvironmentFile`s (`
 | `WD_RECEIVER_CALL` / `WD_RECEIVER_GRID` | Reporter identity. Required by the uploader; used as sink rx fields. |
 | `WD_RX_CALL` / `WD_RX_GRID` | Override pair for reporter identity (test rigs). |
 | `WD_SFTP_SERVERS` / `WD_SFTP_SERVER` / `WD_SFTP_USER` | wsprdaemon.org SFTP targets. |
-| `WD_UPLOAD_WSPRDAEMON_DIR` / `WD_UPLOAD_WSPRNET_DIR` | Upload spool roots (pipeline skipped if unset). |
-| `WD_VERIFY_FLUSH` | `=1` runs the wsprnet verify-and-flush thread. |
+| `WD_UPLOAD_WSPRDAEMON_DIR` | Legacy wsprdaemon.org spool root. The shim reads it but ships from the sink. |
+| `WD_VERIFY_FLUSH` | `=1` runs the wsprnet verify-and-flush thread (reads wsprnet only). |
 | `SIGMOND_SQLITE_PATH` | Sink DB path (default `/var/lib/sigmond/sink.db`). |
 | `NOTIFY_SOCKET` / `WATCHDOG_USEC` | Set by systemd `Type=notify`; consumed by `_sd_notify` / `_watchdog_loop`. |
 | `MALLOC_ARENA_MAX` | Set to `2` by the unit to suppress glibc arena fragmentation. |
@@ -330,11 +331,11 @@ operational sigmond client covering record → decode → sink → upload.
   `/var/lib/sigmond/sink.db` via `sigmond.hamsci_sink`. Per-cycle batched
   through `CycleBatcher`.
 - **In-process hs-uploader** (`hs_uploader_shim.py`,
-  `WSPR_USE_HS_UPLOADER=1`). Ships spots to wsprnet.org (HTTP MEPT) and
-  a cycle-aligned spots+noise tar to wsprdaemon.org (SFTP), absorbing
-  the standalone `wd-upload-*` units (v3 Phase A). Under the routing
-  standard of 2026-11-13, wsprdaemon.org forwards the spots to
-  wsprnet.org, and the direct post here remains the one gap.
+  `WSPR_USE_HS_UPLOADER=1`). Ships a cycle-aligned spots+noise tar to
+  wsprdaemon.org (SFTP), absorbing the standalone `wd-upload-*` units
+  (v3 Phase A). It once also posted to wsprnet.org by HTTP MEPT; under
+  the routing standard of 2026-11-13 that pipeline went away, and
+  wsprdaemon.org forwards the spots to wsprnet.org.
 - **Per-cycle noise** (`noise.py`). RMS + FFT noise measured per cycle
   and shipped alongside spots.
 

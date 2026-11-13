@@ -162,7 +162,6 @@ these come from the unit's `EnvironmentFile`s
 |---|---|
 | `WSPR_USE_HS_UPLOADER` | `=1` enables the in-process `hs-uploader` pump. Unset → no uploads. |
 | `WD_UPLOAD_WSPRDAEMON_DIR` | wsprdaemon.org spool root. Pipeline skipped if unset. |
-| `WD_UPLOAD_WSPRNET_DIR` | wsprnet.org spool root (legacy; SqliteSource used in preference). |
 | `WD_SFTP_SERVERS` / `WD_SFTP_SERVER` | wsprdaemon.org SFTP target(s), `user@host[,user@host…]`. |
 | `WD_SFTP_USER` | Override the SFTP user. |
 | `WD_UPLOAD_ID` | Tar name prefix. |

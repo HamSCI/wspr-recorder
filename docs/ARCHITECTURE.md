@@ -33,7 +33,8 @@ wspr-recorder daemon (one per radiod)
   │
   ├── upload  (only when WSPR_USE_HS_UPLOADER=1)
   │     └─ WsprUploaderHs: in-process hs-uploader pump →
-  │          wsprnet.org (HTTP) + wsprdaemon.org (cycle tar / SFTP)
+  │          wsprdaemon.org (cycle tar / SFTP), which forwards
+  │          to wsprnet.org and pskreporter.info
   │
   ├── TimingService: quality metadata + SyncStrategy factory
   │
@@ -100,7 +101,7 @@ wspr_recorder/
 
   # upload path (active when WSPR_USE_HS_UPLOADER=1)
   hs_uploader_shim.py  # WsprUploaderHs: in-process hs-uploader pump
-  wsprnet_verifier.py  # optional verify-and-flush of accepted wsprnet spots
+  wsprnet_verifier.py  # optional verify-and-flush of spots seen on wsprnet
 ```
 
 `spot_processor.py` (the standalone 34-field enhancer) is not on the
@@ -258,12 +259,14 @@ callback nudges the uploader pump on each commit.
 ### `hs_uploader_shim.py` — `WsprUploaderHs`
 
 In-process uploader; gated on `WSPR_USE_HS_UPLOADER=1`. Built from env
-via `from_env()`. Runs two `hs-uploader` pipelines in one pump thread:
-(1) **wsprdaemon-tar** — `WsprCycleSource` on `(wspr.spots,
-wspr.noise)` → `WsprdaemonTarSftp`, one cycle-aligned spots+noise tar
-per WSPR cycle to wsprdaemon.org via SFTP; (2) **wsprnet** —
-`SqliteSource` on `wspr.spots` → `WsprNet`, MEPT rows to wsprnet.org
-via HTTP. Per-pipeline watermarks live under `/var/lib/hs-uploader`.
+via `from_env()`. Runs one `hs-uploader` pipeline in one pump thread:
+**wsprdaemon-tar** — `WsprCycleSource` on `(wspr.spots, wspr.noise)`
+plus the cycle's `psk.spots` rows → `WsprdaemonTarSftp`, one
+cycle-aligned tar per WSPR cycle to wsprdaemon.org via SFTP. The
+transport sets `forward_to_wsprnet=True` and sends no reporter
+identity; wsprdaemon.org forwards the spots to wsprnet.org and
+pskreporter.info. The shim posts to neither. The watermark lives under
+`/var/lib/hs-uploader`.
 The pump waits on a wake `Event` or a 60 s timeout. Optional
 `WD_VERIFY_FLUSH=1` runs a verify-and-flush thread
 (`wsprnet_verifier.py`) that deletes wsprnet-confirmed rows from
@@ -363,8 +366,8 @@ Socket mode 0660.
    thread later flushes the cycle's spots + noise to the sink as
    `wspr.spots` / `wspr.noise` rows.
 9. **If `WSPR_USE_HS_UPLOADER=1`**, the cycle commit wakes the
-   `WsprUploaderHs` pump, which ships the new rows to wsprnet.org and
-   wsprdaemon.org.
+   `WsprUploaderHs` pump, which ships the new rows to wsprdaemon.org;
+   the server forwards them to wsprnet.org and pskreporter.info.
 10. Cleanup loop (every 5 min) deletes WAVs older than
     `max_file_age_minutes` and enforces `max_files_per_band`.
 
