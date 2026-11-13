@@ -6,8 +6,9 @@ float32 ring buffer, emits peak-normalized int16 WAVs at epoch-aligned
 decode-period boundaries (120 s, 300 s, 900 s, 1800 s), and — when the
 pipeline-v2 feature flags are enabled — decodes those WAVs in-process
 with `wsprd` / `jt9`, writes spots and per-cycle noise into sigmond's
-local SQLite sink, and ships them upstream to wsprnet.org and
-wsprdaemon.org.
+local SQLite sink, and ships them upstream to wsprdaemon.org, which
+forwards them to wsprnet.org.  The in-process uploader still posts to
+wsprnet.org directly as well; see **Uploads** below.
 
 wspr-recorder now supersedes `wsprdaemon-client`'s WSPR recording,
 decoding, and uploading role: with `WD_DECODE_VIA_DB=1` and
@@ -30,8 +31,9 @@ wspr-recorder daemon (one per radiod)
   │             → /var/lib/sigmond/sink.db  (hs_uploader.sink)
   │
   └─ upload (WSPR_USE_HS_UPLOADER=1): in-process hs-uploader
-                → wsprnet.org   (HTTP MEPT)
                 → wsprdaemon.org (cycle-aligned tar via SFTP)
+                     → wsprnet.org, forwarded by the server
+                → wsprnet.org   (HTTP MEPT, direct; still built here)
 ```
 
 One `wspr-recorder@<radiod_id>.service` instance per radiod. The
@@ -117,9 +119,20 @@ sigmond's local SQLite sink (`/var/lib/sigmond/sink.db`) through
 lacks it.
 
 **Uploads** (when `WSPR_USE_HS_UPLOADER=1`): runs an in-process
-`hs-uploader` pump that reads the sink and ships spots to wsprnet.org
-(HTTP MEPT) and a cycle-aligned spots+noise tar to wsprdaemon.org via
-SFTP.
+`hs-uploader` pump that reads the sink and ships a cycle-aligned
+spots+noise tar to wsprdaemon.org via SFTP.  The tar also carries the
+host's psk-recorder and meteor-scatter rows (FT8/FT4, MSK144).
+
+HamSCI's standard since 2026-11-13: every spot goes only to
+wsprdaemon.org, which forwards copies to wsprnet.org and
+pskreporter.info under each spot's own reporter id.  Sigmond carries
+this out for the single-host `hs-uploader` daemon: its rendered
+manifest flags the `wspr-wsprdaemon` tar `forward_to_wsprnet` and
+leaves out the `wspr-wsprnet` pipeline that `deploy.toml` declares.
+This repo's own pump (`hs_uploader_shim.py`) builds its pipelines from
+the environment, not from that manifest, and still posts each spot to
+wsprnet.org by HTTP MEPT whenever the sink exists.  Until it changes,
+a host that runs it posts WSPR to wsprnet.org itself as well.
 
 The uploader can also run on its own.  A single recorder can keep it
 in process.  A merge fleet, with several receivers writing one sink,
