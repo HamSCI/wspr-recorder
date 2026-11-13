@@ -121,6 +121,12 @@ lacks it.
 (HTTP MEPT) and a cycle-aligned spots+noise tar to wsprdaemon.org via
 SFTP.
 
+The uploader can also run on its own.  A single recorder can keep it
+in process.  A merge fleet, with several receivers writing one sink,
+runs exactly one standalone `wspr-uploader.service` for all of them.
+Each recorder sends that unit a wake datagram on `upload-wake.sock`
+after every commit.
+
 **Does not:** choose multicast destinations — radiod advertises those
 via its status stream — and does not apply chain-delay correction
 (WSPR is minute-quantized, far outside that regime; the value is
