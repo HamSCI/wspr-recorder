@@ -27,7 +27,7 @@ wspr-recorder daemon (one per radiod)
   │
   ├─ decode (WD_DECODE_VIA_DB=1): wsprd + jt9 --fst4w per cycle
   │             → wspr.spots + wspr.noise rows
-  │             → /var/lib/sigmond/sink.db  (sigmond.hamsci_sink)
+  │             → /var/lib/sigmond/sink.db  (hs_uploader.sink)
   │
   └─ upload (WSPR_USE_HS_UPLOADER=1): in-process hs-uploader
                 → wsprnet.org   (HTTP MEPT)
@@ -69,8 +69,10 @@ journalctl -fu wspr-recorder@<radiod_id>
 wspr-ctl health
 ```
 
-`radiod@<id>.service` must already be running on the LAN; wspr-recorder
-resolves its status multicast via mDNS. Decoders (`wsprd`, `jt9`) are
+wspr-recorder resolves the status multicast of a `radiod` on the LAN via
+mDNS.  When it cannot find that radiod, it tells systemd it has started
+and keeps trying, 5 s after the first miss and then up to every 60 s,
+rather than exiting. Decoders (`wsprd`, `jt9`) are
 only needed when running the full pipeline — see
 [docs/INSTALL.md](docs/INSTALL.md).
 
@@ -101,14 +103,18 @@ timing-aware sync strategy (RTP-clock, wall-clock, or fallback), slices
 the ring at epoch-aligned period boundaries (W2, F2, F5, F15, F30),
 peak-normalizes float32 → int16 at WAV-write time, and emits `.wav` +
 `.json` sidecar pairs under `/dev/shm/wspr-recorder/<band>/`
-atomically.
+atomically.  The recorder skips a band that lies above the radiod's
+Nyquist frequency (8 m and 6 m on a 64.8 Msps radiod).  Neither the cycle
+commit nor the channel-health check waits for a skipped band; it rejoins
+once the radiod's rate lets it.
 
 **Decodes** (when `WD_DECODE_VIA_DB=1`): runs `wsprd` (2-pass) and
 `jt9 --fst4w` on each cycle's WAV, resolves type-3 callsign hashes
 across decoders via a persistent `CallsignDB`, measures per-cycle RMS
 and FFT noise, and writes `wspr.spots` + `wspr.noise` rows into
-sigmond's local SQLite sink (`/var/lib/sigmond/sink.db`) via
-`sigmond.hamsci_sink`.
+sigmond's local SQLite sink (`/var/lib/sigmond/sink.db`) through
+`hs_uploader.sink.Writer`, or `sigmond.hamsci_sink` when hs-uploader
+lacks it.
 
 **Uploads** (when `WSPR_USE_HS_UPLOADER=1`): runs an in-process
 `hs-uploader` pump that reads the sink and ships spots to wsprnet.org
