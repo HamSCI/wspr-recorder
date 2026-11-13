@@ -337,8 +337,7 @@ class TestPipelineWiring(unittest.TestCase):
     def test_psk_rides_in_wsprdaemon_cycle_tar_not_a_separate_pipeline(self):
         """PSK (FT8/FT4) ships inside the per-cycle wsprdaemon tar via
         ``WsprCycleSource(include_psk=True)`` — there is NO separate
-        psk-tar pipeline (the ``_build_psk_tar_pipeline`` method is left
-        defined but dead; see hs_uploader_shim.py).  The multi-rx tags
+        psk-tar pipeline.  The multi-rx tags
         that Phase D Cut 4 pins (``rx_source`` + ``frequency_bucket_hz``,
         stamped on every psk spot by psk-recorder in Phase A / Cut 2)
         reach wsprdaemon-server because WsprCycleSource ships each
