@@ -22,7 +22,7 @@ Two things this module is here to confirm:
       would otherwise only show up when wd10 dies and traffic fails
       over.
 
-Unlike :mod:`wsprnet_verifier`, this is **observe-only** — there is no
+This is **observe-only** — there is no
 ``DELETE`` from ``pending_uploads``.  The wsprdaemon transport commits
 via the gateway's SFTP ack, not via a deferred verification.  We just
 read the central DB and tell the operator what we found.
@@ -53,7 +53,7 @@ The ``[<rx_sign>]`` tag matters on multi-receiver hosts where two
 ``smd watch verifier`` couldn't tell whose pass each line belongs to.
 
 The ``pass complete`` line shares its shape with
-:mod:`wsprnet_verifier` so ``smd watch verifier`` picks it up via the
+the retired wsprnet verifier's so ``smd watch verifier`` picks it up via the
 same regex.  ``dropped_old`` is always 0 (no rows deleted by this
 verifier — observe-only).  Headline ``verified`` reports the wsprdaemon
 count because wsprdaemon.spots has 1:1 correspondence to our uploads;
@@ -113,7 +113,7 @@ DEFAULT_WINDOW_MIN   = 30    # 15 was too tight against wd20's
                              # wsprdaemon.spots lag (2026-05-17).
                              # 30 covers the lag with headroom while
                              # staying well under the 60-min wsprnet
-                             # window the WsprnetVerifier uses.
+                             # window the retired wsprnet verifier used.
 DEFAULT_TIMEOUT_SEC  = 5     # per-server HTTP timeout; 3 parallel
                              # queries finish in ~max(per-host RTT),
                              # capped at this value for unreachables
@@ -399,7 +399,7 @@ class WsprdaemonVerifier:
         # ... later ...
         v.stop()
 
-    Idempotent ``start()`` / ``stop()`` like :class:`WsprnetVerifier`.
+    Idempotent ``start()`` / ``stop()`` like :class:`WsprnetMirrorBackstop`.
     """
 
     def __init__(

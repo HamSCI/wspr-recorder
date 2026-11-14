@@ -70,7 +70,9 @@ class CallsignDB:
                 wsprnet has decided that hash slot belongs to bare
                 ``W4UK``) are filtered out of ``hashtable.txt`` and
                 ``fst4w_calls.txt`` before wsprd / jt9 reads them.
-                See /tmp/wsprnet-negative-cache-design.md.  Empty
+                The wsprnet reject cache behind it gets no new rows
+                now that the station posts nothing to wsprnet (uniform
+                routing); existing entries only age out.  Empty
                 string disables the filter (kept for tests + standalone
                 runs without a sigmond sink.db).
             sink_db_path: Optional override for the sigmond sink.db

@@ -22,14 +22,14 @@ that fell into the bucket, not just a count.
 Two tables in ``/var/lib/sigmond/sink.db``:
 
   * ``wsprnet_audit`` — one row per (rx_call, spot_key), recording
-    uploaded_at, verified_at (when WsprnetVerifier matched in
+    uploaded_at, verified_at (when the mirror backstop matched in
     wspr.rx), dropped_at (when 2 h passed without match).
   * ``wsprnet_audit_batch`` — one row per upload batch, recording
     n_posted and n_added.  Lets the report compute the
     batch-acceptance rate, which is the only "we know SOME were
     rejected, just not which" signal wsprnet gives us.
 
-Retention: rows older than 24 h are pruned on each verifier pass.
+Retention: rows older than 24 h are pruned on each mirror-backstop pass.
 Failures during write are logged but never raised — the audit is
 diagnostics, not data-path.
 """
@@ -43,7 +43,7 @@ from typing import Iterable, Sequence, Set, Tuple
 logger = logging.getLogger(__name__)
 
 
-# Same spot identity tuple shape used by WsprnetVerifier / WsprdaemonVerifier:
+# Same spot identity tuple shape used by the mirror backstop / WsprdaemonVerifier:
 # (utc_minute_iso, tx_call_upper, freq_hz_int).
 SpotKey = Tuple[str, str, int]
 
@@ -157,7 +157,7 @@ def record_batch(
     Called from hs_uploader_shim's on_batch_outcome when a wsprnet
     transport returns "acked"/"partial_ack".  Every spot goes in with
     ``uploaded_at`` set; ``verified_at`` and ``dropped_at`` are
-    populated later by WsprnetVerifier.
+    populated later by the mirror backstop.
 
     ``n_posted`` / ``n_added`` come from wsprnet's "M out of N added"
     response.  Stored separately because the per-spot rows can't

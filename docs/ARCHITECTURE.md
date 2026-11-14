@@ -101,7 +101,6 @@ wspr_recorder/
 
   # upload path (active when WSPR_USE_HS_UPLOADER=1)
   hs_uploader_shim.py  # WsprUploaderHs: in-process hs-uploader pump
-  wsprnet_verifier.py  # optional verify-and-flush of spots seen on wsprnet
 ```
 
 `spot_processor.py` (the standalone 34-field enhancer) is not on the
@@ -267,11 +266,8 @@ transport sets `forward_to_wsprnet=True` and sends no reporter
 identity; wsprdaemon.org forwards the spots to wsprnet.org and
 pskreporter.info. The shim posts to neither. The watermark lives under
 `/var/lib/hs-uploader`.
-The pump waits on a wake `Event` or a 60 s timeout. Optional
-`WD_VERIFY_FLUSH=1` runs a verify-and-flush thread
-(`wsprnet_verifier.py`) that deletes wsprnet-confirmed rows from
-`pending_uploads`. Absorbs the role of the standalone
-`wd-upload-hs@.service`.
+The pump waits on a wake `Event` or a 60 s timeout. Absorbs the role
+of the standalone `wd-upload-hs@.service`.
 
 ### `contract.py`
 

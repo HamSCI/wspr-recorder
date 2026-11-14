@@ -199,10 +199,13 @@ audit consumers (`smd verifier`, `smd watch wspr`).
 - `WSP-F-041` `[CODE]` ✅ The pump SHALL wake on a `CycleBatcher` commit Event or a
   `WSPR_PUMP_INTERVAL_SEC` polling backstop (default 300 s), cutting decode→ship
   latency to a few hundred ms while the backstop covers missed wakes.
-- `WSP-F-042` `[CODE]` 🟡 With `WD_VERIFY_FLUSH=1` SHALL run a verify-and-flush
-  thread (`wsprnet_verifier.py`) that polls wsprnet for this reporter's spots
-  (forwarded there by wsprdaemon.org) and deletes confirmed rows from the local
-  `pending_uploads` queue.
+- `WSP-F-042` `[CODE]` ✅ Retired 2026-11-14: the wsprnet verify-and-flush thread
+  (`wsprnet_verifier.py`, `WD_VERIFY_FLUSH`) is gone. Wsprnet is reached only
+  through wsprdaemon.org's forwarding, so the thread read a destination the
+  station no longer posts to, and its age-based drop could lose spots from a
+  tar that runs behind. Nothing deletes a `pending_uploads` row on wsprnet's say;
+  `smd storage trim` bounds the queue, and `wsprnet_mirror_backstop.py` audits
+  delivery against `wspr.rx`.
 - `WSP-F-043` `[CODE]` 🟡 SHALL tag rows `forward_to_pskreporter` for a downstream
   gateway-elected forwarder; wspr-recorder itself does not post to PSKReporter.
 - `WSP-F-044` `[CODE]` ✅ The uploader SHALL run **either** in-process **or** as a
@@ -303,7 +306,7 @@ audit consumers (`smd verifier`, `smd watch wspr`).
   `/etc/wspr-recorder/env/<id>.env`): `WD_DECODE_VIA_DB`, `WSPR_USE_HS_UPLOADER`,
   `WD_RECEIVER_CALL`/`WD_RECEIVER_GRID` (or `WD_RX_CALL`/`WD_RX_GRID`),
   `WD_SFTP_SERVERS`/`WD_SFTP_SERVER`/`WD_SFTP_USER`, `WD_UPLOAD_WSPRDAEMON_DIR`,
-  `WD_MERGE_REPORTERS`, `WD_MERGE_BACKSTOP_SEC`, `WD_VERIFY_FLUSH`,
+  `WD_MERGE_REPORTERS`, `WD_MERGE_BACKSTOP_SEC`,
   `WSPR_PUMP_INTERVAL_SEC`, `SIGMOND_SQLITE_PATH`, `WSPR_UPLOAD_WAKE_SOCK`,
   `WSPRDAEMON_TAR_COMPRESSION`. Sigmond-seeded `[contract.instance_env]`:
   `WD_DECODE_VIA_DB=1`, `WD_RECEIVER_CALL={reporter_call}`.

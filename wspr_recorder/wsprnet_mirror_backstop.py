@@ -5,10 +5,10 @@ of what wsprnet.org actually indexed).
 
 Why this exists
 ---------------
-:mod:`wsprnet_verifier` stamps ``verified_at`` only when it finds a
-matching ``pending_uploads`` row, and it queries wsprnet.org's ``olddb``
-HTML with a 60-min window, giving up after 2 h
-(``DROP_AFTER_SEC``).  Two real-world gaps leak through:
+The retired ``wsprnet_verifier`` stamped ``verified_at`` only when it
+found a matching ``pending_uploads`` row, and it queried wsprnet.org's
+``olddb`` HTML with a 60-min window.  Two real-world gaps leaked through,
+and the backstop closes them:
 
   * **Audit / pending divergence.**  An audit row can outlive its
     ``pending_uploads`` sibling (the upload path advanced the watermark,
@@ -35,9 +35,8 @@ unverified cohort and:
     never indexed by wsprnet), so the ``smd verifier report`` signal
     becomes trustworthy instead of polluted by "never checked".
 
-This is the only thing stamping the audit when ``WD_VERIFY_FLUSH`` is
-off (the common case — the olddb DELETE path is opt-in and most hosts
-don't run it).  It reuses the same ClickHouse-HTTP endpoints and
+This is the only thing stamping the audit, and it deletes no
+``pending_uploads`` row.  It reuses the same ClickHouse-HTTP endpoints and
 per-URL Basic-Auth convention as :mod:`wsprdaemon_verifier`.
 
 Env knobs
@@ -202,8 +201,7 @@ class WsprnetMirrorBackstop:
     still-unresolved ``wsprnet_audit`` cohort against ``wspr.rx``.
 
     Construct, ``start()``; ``stop()`` on shutdown.  Idempotent, mirrors
-    the :class:`wsprnet_verifier.WsprnetVerifier` /
-    :class:`wsprdaemon_verifier.WsprdaemonVerifier` lifecycle.
+    the :class:`wsprdaemon_verifier.WsprdaemonVerifier` lifecycle.
     """
 
     def __init__(

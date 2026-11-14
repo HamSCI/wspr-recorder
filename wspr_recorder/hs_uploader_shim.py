@@ -42,12 +42,6 @@ operational symmetry):
                 ``CycleBatcher``'s wake callback so every cycle
                 commit fires us within milliseconds instead of
                 waiting out a PUMP_INTERVAL_SEC polling tick.
-
-WD_VERIFY_FLUSH: optional verify-and-flush thread polls wsprnet for
-this reporter's spots (which wsprdaemon.org forwarded there) and deletes
-confirmed rows from the local ``pending_uploads`` queue.  It only reads
-wsprnet.  Off by default; opt in with WD_VERIFY_FLUSH=1.  See
-``wsprnet_verifier.py`` for the full rationale.
 """
 from __future__ import annotations
 
@@ -128,7 +122,6 @@ class WsprUploaderHs:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._uploader = None
-        self._verifier = None       # set in start() if WD_VERIFY_FLUSH=1
         self._wd_verifier = None    # set in start() if WSPRDAEMON_VERIFY=1
         self._wake_listener = None  # cross-process wake datagram listener
         self._transports: list = []
@@ -311,30 +304,7 @@ class WsprUploaderHs:
         # Falls back to plain polling if no callback is registered.
         self._wake = threading.Event()
 
-        # Optional: verify-and-flush thread polls wsprnet for our
-        # reporter's spots (forwarded there by wsprdaemon.org) and
-        # deletes confirmed rows from the local pending_uploads queue.
-        # It only reads wsprnet.  Off by default; opt in with
-        # WD_VERIFY_FLUSH=1.
-        # See wsprnet_verifier.py for the full rationale.
-        # (Note: in the upstream wsprdaemon-client shim this block had
-        # landed after a return statement inside _pid_file_path() — dead
-        # code that never started the verifier.  Phase A relocates it
-        # to its correct home inside start().)
-        if os.environ.get("WD_VERIFY_FLUSH", "").strip().lower() in (
-            "1", "true", "yes", "on",
-        ):
-            try:
-                from .wsprnet_verifier import WsprnetVerifier
-                self._verifier = WsprnetVerifier(reporter=self._call)
-                self._verifier.start()
-            except Exception:
-                logger.exception(
-                    "wspr-uploader-hs: failed to start wsprnet verifier; "
-                    "continuing without it"
-                )
-
-        # Sibling verifier for the wsprdaemon.org SFTP path.  Observe-only
+        # Verifier for the wsprdaemon.org SFTP path.  Observe-only
         # (no DELETEs from pending_uploads — the wsprdaemon transport
         # commits via the gateway SFTP ack).  Queries wd10/wd20/wd30 ClickHouse in parallel and
         # logs per-server status + an aggregate pass-complete line.
@@ -400,11 +370,6 @@ class WsprUploaderHs:
             pass
         if self._thread is not None:
             self._thread.join(timeout=timeout)
-        if self._verifier is not None:
-            try:
-                self._verifier.stop(timeout=timeout)
-            except Exception:
-                logger.exception("wspr-uploader-hs: verifier.stop failed")
         if self._wd_verifier is not None:
             try:
                 self._wd_verifier.stop(timeout=timeout)

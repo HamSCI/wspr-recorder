@@ -167,7 +167,6 @@ these come from the unit's `EnvironmentFile`s
 | `WD_UPLOAD_ID` | Tar name prefix. |
 | `WD_VERSION` | Embedded in the tar config (default `4.0`). |
 | `WD_INSTANCE` | Uploader instance name. |
-| `WD_VERIFY_FLUSH` | `=1` runs the wsprnet verify-and-flush thread (`wsprnet_verifier.py`). |
 | `WD_FTP_FALLBACK` / `WD_FTP_SERVER(S)` / `WD_FTP_USER` / `WD_FTP_PASSWORD[_FILE]` / `WD_FTP_PATH` | FTP fallback for the wsprdaemon.org transport. |
 | `HS_UPLOADER_SSH_KEY_FILE` | SFTP private key (else `hs-uploader`'s default). |
 
