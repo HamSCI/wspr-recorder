@@ -11,6 +11,8 @@ jt9 runs with -Y flag to expose numeric 22-bit hashes for resolution.
 import logging
 import os
 import re
+import shutil
+import struct
 import subprocess
 import time
 from dataclasses import dataclass, field
@@ -38,6 +40,61 @@ def _env_int(name: str, default: int) -> int:
         return int(os.environ.get(name, "") or default)
     except ValueError:
         return default
+
+# ── which WAV formats the installed decoders can read ──────────────────
+#
+# sigmond installs two decoder sets side by side under
+# /usr/local/libexec/sigmond/decoders/{ubersdr,wsjtx}/ and points
+# /usr/local/bin/{wsprd,jt9} at one of them (sigmond bin/smd
+# _select_decoders).  Only the UberSDR build reads IEEE-float WAVs.  Stock
+# WSJT-X wsprd skips a fixed 44-byte header and reads the payload as int16,
+# and jt9 reads int16 too: handed a float WAV they exit 0 with no spots.  A
+# station that fell back to the wsjtx set (parity failure, e.g. Zen 4) went
+# silent that way — WWV-2, 2026-11-16.  So float is opt-in by evidence: a
+# decoder reads float only if it resolves into the ubersdr set; anything
+# else (the wsjtx set, a Debian wsprd, a binary we cannot find) gets int16.
+_FLOAT_DECODER_SET = "/decoders/ubersdr/"
+
+
+class DecoderInputError(RuntimeError):
+    """A decoder was handed a WAV in a format it cannot read."""
+
+
+def decoder_reads_float(path: str) -> bool:
+    """True iff the decoder at `path` (a name on PATH or a path) is the
+    UberSDR build, which reads IEEE-float WAVs."""
+    found = shutil.which(path)
+    if not found:
+        return False
+    return _FLOAT_DECODER_SET in os.path.realpath(found)
+
+
+def decoders_read_float() -> bool:
+    """True iff BOTH wsprd and jt9 on PATH read IEEE-float WAVs.  Evaluated
+    per call so a `smd` decoder-set swap (a symlink flip, no restart) is
+    picked up at the next period."""
+    return decoder_reads_float("wsprd") and decoder_reads_float("jt9")
+
+
+def wav_format_tag(path: Path) -> Optional[int]:
+    """The WAVE fmt-chunk format tag (1 = PCM, 3 = IEEE float), or None if
+    the file has no readable fmt chunk."""
+    try:
+        with open(path, "rb") as f:
+            head = f.read(512)
+    except OSError:
+        return None
+    if head[:4] != b"RIFF" or head[8:12] != b"WAVE":
+        return None
+    pos = 12
+    while pos + 10 <= len(head):
+        cid = head[pos:pos + 4]
+        size = struct.unpack("<I", head[pos + 4:pos + 8])[0]
+        if cid == b"fmt ":
+            return struct.unpack("<H", head[pos + 8:pos + 10])[0]
+        pos += 8 + size + (size & 1)
+    return None
+
 
 # Regex for jt9 -Y numeric hash: <NNNNNNN> (7-digit zero-padded)
 _HASH22_RE = re.compile(r'<(\d{1,7})>')
@@ -103,6 +160,23 @@ class DecoderRunner:
         # Track fst4_decodes.dat line count for diffing
         self._fst4_prev_lines: int = 0
 
+    def _check_input(self, wav_path: Path, decoder: str) -> None:
+        """Refuse, loudly, to hand `decoder` a WAV it cannot read.
+
+        Stock WSJT-X wsprd/jt9 given an IEEE-float WAV do not error: they
+        read the floats as int16 and report no spots, which is
+        indistinguishable from a quiet band.  Raise instead, so the cycle
+        is logged as a failed decode rather than an empty one."""
+        if wav_format_tag(wav_path) == 3 and not decoder_reads_float(decoder):
+            msg = (f"{self.band_name}: {decoder} "
+                   f"({os.path.realpath(shutil.which(decoder) or decoder)}) "
+                   f"cannot read IEEE-float WAV {Path(wav_path).name} — only "
+                   f"the ubersdr decoder set reads float; this cycle is NOT "
+                   f"decoded.  Write int16 (recorder sample_format) or select "
+                   f"the ubersdr decoders.")
+            logger.error(msg)
+            raise DecoderInputError(msg)
+
     def decode_wspr(self, wav_path: Path,
                     cycle_start: Optional[float] = None) -> List[RawSpot]:
         """
@@ -116,6 +190,7 @@ class DecoderRunner:
 
         Returns merged spots with pkt_mode=2 (WSPR-2).
         """
+        self._check_input(wav_path, self.wsprd_path)
         # Per operator decision 2026-05-19: don't feed CallsignDB into
         # wsprd's hashtable.  wsprd maintains its own per-band
         # hashtable.txt across invocations (the working-dir state file
@@ -191,6 +266,7 @@ class DecoderRunner:
 
         Returns spots with appropriate pkt_mode.
         """
+        self._check_input(wav_path, self.jt9_path)
         # Same gate as for wsprd's hashtable.txt — let jt9 manage its
         # own ``fst4w_calls.txt`` across invocations unless the
         # operator opts back into CallsignDB-driven seeding.

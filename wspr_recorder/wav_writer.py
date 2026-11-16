@@ -11,7 +11,7 @@ import wave
 from dataclasses import dataclass, asdict
 from datetime import datetime, timezone
 from pathlib import Path
-from typing import List, Optional
+from typing import Callable, List, Optional
 
 import numpy as np
 
@@ -195,6 +195,7 @@ class WavWriter:
         sample_rate: int = 12000,
         sample_format: str = "int16",
         timing_service: Optional['TimingService'] = None,
+        float_capable: Optional[Callable[[], bool]] = None,
     ):
         """
         Initialize WAV writer.
@@ -204,11 +205,17 @@ class WavWriter:
             sample_rate: Sample rate in Hz
             sample_format: "int16" or "float32"
             timing_service: Optional TimingService for timing metadata
+            float_capable: Asked before each period WAV: can the decoders
+                read IEEE-float?  When it says no, a "float32" writer
+                writes int16 instead (stock WSJT-X wsprd/jt9 read float
+                WAVs as garbage and report nothing).  None = trust config.
         """
         self.output_dir = Path(output_dir)
         self.sample_rate = sample_rate
         self.sample_format = sample_format
         self.timing_service = timing_service
+        self.float_capable = float_capable
+        self._float_refused = False
         
         # Ensure output directory exists
         self.output_dir.mkdir(parents=True, exist_ok=True)
@@ -355,6 +362,27 @@ class WavWriter:
                     pass
             return None
     
+    def _period_sample_format(self) -> str:
+        """The format this period's WAV is written in: the configured one,
+        except that float32 drops to int16 while the decoders on PATH
+        cannot read float (logged once per transition, WARNING)."""
+        if self.sample_format != "float32" or self.float_capable is None:
+            return self.sample_format
+        try:
+            ok = bool(self.float_capable())
+        except Exception as e:                      # noqa: BLE001
+            logger.warning("float_capable probe failed (%s); writing int16", e)
+            ok = False
+        if not ok and not self._float_refused:
+            logger.warning(
+                "sample_format is float32 but the selected wsprd/jt9 cannot "
+                "read IEEE-float WAVs (not the ubersdr decoder set) — writing "
+                "int16 WAVs so the decoders can read them")
+        elif ok and self._float_refused:
+            logger.info("decoders read IEEE-float again — writing float32 WAVs")
+        self._float_refused = not ok
+        return "float32" if ok else "int16"
+
     def write_period(
         self,
         request: DecodeRequest,
@@ -398,7 +426,8 @@ class WavWriter:
             json_path = band_dir / f"{filename[:-4]}.json"
 
             peak = float(np.abs(request.samples).max()) if len(request.samples) else 0.0
-            if self.sample_format == "float32":
+            sample_format = self._period_sample_format()
+            if sample_format == "float32":
                 # Pass the ring's float32 through untouched (IEEE float WAV,
                 # format tag 3).  No normalisation: absolute level survives.
                 scale = 1.0
@@ -452,7 +481,7 @@ class WavWriter:
                 "band_name": request.band_name,
                 "sample_rate": self.sample_rate,
                 "samples": n_samples,
-                "sample_format": self.sample_format,
+                "sample_format": sample_format,
                 "normalization": {
                     "float32_peak": peak,
                     "int16_scale": scale,

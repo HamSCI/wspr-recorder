@@ -33,7 +33,7 @@ from .wav_writer import WavWriter
 from .timing_service import TimingService
 from .ipc_server import IPCServer
 from .decode_mode import DecodeMode
-from .decoder import DecoderRunner
+from .decoder import DecoderRunner, decoders_read_float, wav_format_tag
 from .callsign_db import CallsignDB
 from .spot_sink import SpotSink, CycleBatcher, resolve_reporter_identity
 from .noise import compute_noise, read_wav_mono_float, overload_delta
@@ -1174,7 +1174,9 @@ class WsprRecorder:
             logger.debug(
                 "noise: cannot read WAV %s — skipping rms half", decoder_wav.name,
             )
-        float_wav = getattr(self.wav_writer, "sample_format", "int16") == "float32"
+        # The WAV's own format, not the configured one: a float32 writer
+        # writes int16 while the decoders cannot read float.
+        float_wav = wav_format_tag(decoder_wav) == 3
         # wsprd writes <stem>.c2 next to the input WAV.  Most-recent
         # *.c2 in work_dir is a safe fallback if the naming differs.
         c2_candidate = work_dir / f"{decoder_wav.stem}.c2"
@@ -2049,6 +2051,9 @@ class WsprRecorder:
             sample_rate=self.config.channel_defaults.sample_rate,
             sample_format=self.config.recorder.sample_format,
             timing_service=self.timing_service,
+            # float32 only while the selected wsprd/jt9 read it (the
+            # ubersdr set); the wsjtx fallback set reads int16 only.
+            float_capable=decoders_read_float,
         )
 
         # Pipeline-v2 DB-direct decode bring-up (no-op when
