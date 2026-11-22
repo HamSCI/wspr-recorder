@@ -250,6 +250,14 @@ class SourceConfig:
     status_address: str       # radiod mDNS status name
     label: str = ""           # operator-friendly display name (optional)
     port: int = 5004          # ka9q-radio RTP port; rarely overridden
+    # KiwiSDR sources (Phase 4c): ``kind == "kiwisdr"`` sources are
+    # reached over HTTP/WebSocket at host:http_port, not via radiod;
+    # ``status_address`` stays "" and ``key`` is kiwisdr:<host>:<port>.
+    kind: str = "radiod"      # "radiod" | "kiwisdr"
+    host: str = ""            # kiwisdr only
+    http_port: int = 8073     # kiwisdr only
+    channels: int = 0         # kiwisdr only: concurrent audio channels
+    password: str = ""        # kiwisdr only: optional user password
 
 
 def _derive_radiod_id(status_address: str) -> str:
@@ -470,6 +478,32 @@ class Config:
                 "or a [radiod] status_address"
             )
         for src in self.sources:
+            if src.kind == "kiwisdr":
+                if src.channels <= 0:
+                    errors.append(
+                        f"source {src.key!r}: kiwisdr source needs channels "
+                        f"(a positive integer)"
+                    )
+                elif len(self.bands) > src.channels:
+                    errors.append(
+                        f"source {src.key!r}: {len(self.bands)} bands > "
+                        f"{src.channels} channels"
+                    )
+                if not (1 <= src.http_port <= 65535):
+                    errors.append(
+                        f"source {src.key!r}: http_port out of range "
+                        f"({src.http_port})"
+                    )
+                # Every mode the DecodeMode table knows is WSPR/FST4W;
+                # anything else (FT4/FT8) is rejected on a Kiwi.
+                for bc in self.bands:
+                    for m in bc.modes:
+                        if m not in VALID_MODE_STRINGS:
+                            errors.append(
+                                f"source {src.key!r}: kiwisdr is WSPR only; "
+                                f"band {bc.frequency} has mode {m!r}"
+                            )
+                continue
             if not src.status_address:
                 errors.append(f"source {src.key!r}: status_address is empty")
             if not (1024 <= src.port <= 65535):
@@ -596,6 +630,23 @@ def load_config(config_path: str) -> Config:
             # RADIOD-IDENTIFICATION.md §3.1 — Phase 6 cutover: the
             # canonical field is `status`, matching the singleton
             # [radiod] block and the rest of the suite.
+            if "kiwisdr" in src_entry:
+                spec = str(src_entry["kiwisdr"]).strip()
+                host, sep, port_s = spec.rpartition(":")
+                if not sep:
+                    host, port_s = spec, ""
+                http_port = int(port_s) if port_s else 8073
+                config.sources.append(SourceConfig(
+                    key=src_entry.get("key") or f"kiwisdr:{host}:{http_port}",
+                    status_address="",
+                    label=src_entry.get("label", ""),
+                    kind="kiwisdr",
+                    host=host,
+                    http_port=http_port,
+                    channels=int(src_entry.get("channels", 0)),
+                    password=src_entry.get("password", ""),
+                ))
+                continue
             try:
                 addr = src_entry["status"]
             except KeyError:
