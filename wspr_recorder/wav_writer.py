@@ -470,6 +470,10 @@ class WavWriter:
                         rtp_timestamp_start=request.start_rtp_timestamp,
                         rtp_timestamp_end=request.end_rtp_timestamp,
                         sample_rate=self.sample_rate,
+                        # A Kiwi band is timed by the host clock, never by
+                        # radiod's hf-timestd authority (spec §7b.4).
+                        host_clock_only=(request.rx_source or "").startswith(
+                            "kiwisdr:"),
                     )
                     timing_dict = timing_metadata.to_dict()
                 except Exception as e:

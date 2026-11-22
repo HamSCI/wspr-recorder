@@ -319,6 +319,12 @@ class KiwiSourceManager:
             "channel_count": len(self._bands),
             "active_channels": active,
             "channels": channels,
+            # Whether the Kiwi's own GPS has a fix.  A status field only,
+            # never a timing tier: USB-mode audio is timed by the host
+            # clock (spec §7b.4).
+            # TODO(Task 6): derive it from /status (gps_good=, fixes=)
+            # when that parsing lands; False until then.
+            "kiwi_gps_fix": False,
         }
 
     def record_samples(self, ssrc: int, count: int) -> None:

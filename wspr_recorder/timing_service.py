@@ -420,6 +420,7 @@ class TimingService:
         rtp_timestamp_start: Optional[int] = None,
         rtp_timestamp_end: Optional[int] = None,
         sample_rate: int = 12000,
+        host_clock_only: bool = False,
     ) -> TimingMetadata:
         """
         Get complete timing metadata using best available sources.
@@ -430,13 +431,17 @@ class TimingService:
             rtp_timestamp_start: RTP timestamp at start
             rtp_timestamp_end: RTP timestamp at end
             sample_rate: Sample rate in Hz
+            host_clock_only: The recording is timed by this host's clock
+                (a KiwiSDR source), not by radiod's RTP timebase: describe
+                only the host clock (chrony), never hf-timestd's radiod
+                authority tier, and claim no GPSDO or radiod.
             
         Returns:
             TimingMetadata with best available timing information
         """
         # Query sources
         chrony = self.get_chrony_status()
-        hf = self.get_hf_status()
+        hf = None if host_clock_only else self.get_hf_status()
 
         # Authoritative source: hf-timestd's adjudicated authority.json.
         # This is the unified, canonical timing provenance for ALL sigmond
@@ -449,11 +454,13 @@ class TimingService:
         from hamsci_dsp.timing import (
             AuthorityReader, standalone_timing_authority,
         )
-        try:
-            snap = AuthorityReader().read()
-        except Exception as e:
-            logger.debug(f"authority.json read failed: {e}")
-            snap = None
+        snap = None
+        if not host_clock_only:
+            try:
+                snap = AuthorityReader().read()
+            except Exception as e:
+                logger.debug(f"authority.json read failed: {e}")
+                snap = None
 
         # Determine best timing source and offset
         timing_source = 'SYSTEM'
@@ -560,6 +567,12 @@ class TimingService:
 
         # Radiod attribution + canonical authority block — stamped into
         # sidecars from the single authority.json read above.
+        if host_clock_only:
+            # No radiod, no GPSDO: the host clock alone timed these samples.
+            metadata.gpsdo_locked = False
+            metadata.gpsdo_source = None
+            metadata.timing_authority = standalone_timing_authority(None)
+            return metadata
         metadata.client_radiod = self.client_radiod
         if snap is not None and snap.governor_radiod:
             metadata.fusion_governor_radiod = snap.governor_radiod
@@ -676,9 +689,18 @@ class TimingService:
 
         return 'L1'
 
-    def create_sync_strategy(self, sample_rate: int = 12000, channel_info=None):
+    def create_sync_strategy(self, sample_rate: int = 12000, channel_info=None,
+                             *, host_clock: bool = False):
         """
         Create the appropriate SyncStrategy for the current timing authority.
+
+        ``host_clock=True`` is for a stream radiod does not sample (a
+        KiwiSDR source): an RtpSyncStrategy over the stream's sample count,
+        correlated once to this host's wall clock, with NO authority
+        reader and NO channel_info, whatever ``authority`` says.  hf-timestd
+        adjudicates radiod's RTP timebase, so its offset and tier say
+        nothing about Kiwi audio; the band reports the standalone
+        ``wallclock_fallback`` anchor and never an injected T-tier.
 
         Under the RTP-reference labeling invariant
         (hf-timestd/docs/METROLOGY.md §4.5.1), RtpSyncStrategy is the
@@ -711,6 +733,11 @@ class TimingService:
         )
 
         self.check_clock_health()
+
+        if host_clock:
+            logger.info("Timing: host-clock source, using RtpSyncStrategy "
+                        "correlated to the host wall clock (no authority)")
+            return RtpSyncStrategy(sample_rate)
 
         if self.authority == 'rtp':
             logger.info("Timing: authority=rtp, using RtpSyncStrategy (no authority reader)")

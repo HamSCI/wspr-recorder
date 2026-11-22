@@ -28,6 +28,7 @@ from .config import (
     RADIOD_STATUS_PLACEHOLDER,
 )
 from .receiver_manager import ReceiverManager, ChannelState, ChannelSink
+from .kiwi_source import KiwiSourceManager
 from .band_recorder import BandRecorder, GapEvent, DecodeRequest
 from .wav_writer import WavWriter
 from .timing_service import TimingService
@@ -335,15 +336,26 @@ class WsprRecorder:
         band_config = self.config.get_band_config(channel_state.frequency_hz)
         decode_modes = [DecodeMode(m) for m in band_config.modes]
 
-        sync_strategy = self.timing_service.create_sync_strategy(
-            sample_rate=self.config.channel_defaults.sample_rate,
-            channel_info=channel_state.channel_info,
-        )
-        # Feed ka9q ChannelInfo so RtpSyncStrategy correlates via
-        # rtp_to_wallclock (RTP/GPS timebase) rather than the client wall
-        # clock (S3). No-op for non-RTP strategies. channel_state is
-        # freshly populated from ensure_channel() at this point.
-        sync_strategy.set_channel_info(channel_state.channel_info)
+        if self._is_kiwi_source(source_key):
+            # KiwiSDR audio is timed by this host's clock (Rob, spec
+            # §7b.4): correlate the band's sample counter to the wall
+            # clock once, with no ka9q ChannelInfo and no hf-timestd
+            # authority, so the band never claims an injected T-tier.
+            sync_strategy = self.timing_service.create_sync_strategy(
+                sample_rate=self.config.channel_defaults.sample_rate,
+                channel_info=None,
+                host_clock=True,
+            )
+        else:
+            sync_strategy = self.timing_service.create_sync_strategy(
+                sample_rate=self.config.channel_defaults.sample_rate,
+                channel_info=channel_state.channel_info,
+            )
+            # Feed ka9q ChannelInfo so RtpSyncStrategy correlates via
+            # rtp_to_wallclock (RTP/GPS timebase) rather than the client
+            # wall clock (S3). No-op for non-RTP strategies. channel_state
+            # is freshly populated from ensure_channel() at this point.
+            sync_strategy.set_channel_info(channel_state.channel_info)
         recorder = BandRecorder(
             ssrc=ssrc,
             frequency_hz=channel_state.frequency_hz,
@@ -407,6 +419,8 @@ class WsprRecorder:
                 recorder.reset()
                 # radiod restarted its RTP counter + RTP_TIMESNAP; the
                 # new ChannelInfo must drive the re-correlation (S3).
+                # A Kiwi band passes None, which leaves its host-clock
+                # strategy as it was built (no ChannelInfo).
                 recorder.sync_strategy.set_channel_info(channel_info)
             except Exception:
                 # Fallback to the legacy process-exit path if anything
@@ -426,6 +440,40 @@ class WsprRecorder:
             on_stream_restored=on_stream_restored,
         )
     
+    def _is_kiwi_source(self, source_key: str) -> bool:
+        """True when ``source_key`` names a ``kind = "kiwisdr"`` source."""
+        for src in getattr(self.config, "sources", None) or []:
+            if src.key == source_key:
+                return src.kind == "kiwisdr"
+        return source_key.startswith("kiwisdr:")
+
+    def _make_receiver_manager(self, src):
+        """The source manager for one ``[[source]]``: a KiwiSourceManager
+        for a KiwiSDR, a ReceiverManager for a radiod.  Both feed
+        ``_build_sink`` and report to the cycle batcher."""
+        sink_factory = (
+            lambda ssrc, state, sk=src.key:
+                self._build_sink(ssrc, state, source_key=sk)
+        )
+        on_band_producible = (
+            self.cycle_batcher.set_band_producible
+            if self.cycle_batcher is not None else None)
+        if src.kind == "kiwisdr":
+            return KiwiSourceManager(
+                config=self.config,
+                sink_factory=sink_factory,
+                source=src,
+                on_band_producible=on_band_producible,
+            )
+        return ReceiverManager(
+            config=self.config,
+            sink_factory=sink_factory,
+            status_address=src.status_address,
+            port=src.port,
+            source_key=src.key,
+            on_band_producible=on_band_producible,
+        )
+
     def _on_period_complete(self, request: DecodeRequest) -> None:
         """
         Called when a decode period completes.
@@ -1068,6 +1116,19 @@ class WsprRecorder:
             return next(iter(self.receiver_managers.values()))
         return None
 
+    def _counter_source_for(self, request: 'DecodeRequest', radiod_id: str):
+        """(manager, id) whose front-end counters cover ``request``.
+
+        A KiwiSDR band reads its own KiwiSourceManager, keyed by its
+        rx_source, so it never polls a radiod with a Kiwi's synthetic SSRC
+        and never shares a delta baseline with a radiod band of the same
+        name.  Radiod bands are unchanged: the radiod matching
+        ``radiod_id``."""
+        rm = self.receiver_managers.get(request.rx_source)
+        if isinstance(rm, KiwiSourceManager):
+            return rm, request.rx_source
+        return self._receiver_manager_for(radiod_id), radiod_id
+
     def _ssrc_for_request(self, request: 'DecodeRequest') -> Optional[int]:
         """The real radiod-assigned SSRC for this band's channel.
 
@@ -1091,7 +1152,7 @@ class WsprRecorder:
         on any read failure, and on a counter reset (radiod restart), so a
         missing reading never fabricates a spike.
         """
-        rm = self._receiver_manager_for(radiod_id)
+        rm, counter_id = self._counter_source_for(request, radiod_id)
         if rm is None:
             return 0
         # AD_OVER is front-end wide, so any live channel's status carries the
@@ -1103,7 +1164,7 @@ class WsprRecorder:
         current = rm.read_frontend_ad_over(ssrc)
         if current is None:
             return 0                       # read failed — keep baseline, report 0
-        key = (radiod_id, request.band_name)
+        key = (counter_id, request.band_name)
         last = self._last_ad_over.get(key)
         self._last_ad_over[key] = current
         return overload_delta(last, current)
@@ -1120,7 +1181,7 @@ class WsprRecorder:
         correlated with timing drift.  Per-channel counter (poll the band's
         real SSRC).  Fails open (0) on baseline, read failure, or a counter
         reset (radiod restart)."""
-        rm = self._receiver_manager_for(radiod_id)
+        rm, counter_id = self._counter_source_for(request, radiod_id)
         if rm is None:
             return 0
         ssrc = self._ssrc_for_request(request)
@@ -1129,7 +1190,7 @@ class WsprRecorder:
         current = rm.read_channel_filter_drops(ssrc)
         if current is None:
             return 0
-        key = (radiod_id, request.band_name)
+        key = (counter_id, request.band_name)
         last = self._last_filter_drops.get(key)
         self._last_filter_drops[key] = current
         if last is None or current < last:
@@ -1424,6 +1485,12 @@ class WsprRecorder:
                 await asyncio.sleep(self.HEALTH_CHECK_INTERVAL)
 
                 for src_key, rm in self.receiver_managers.items():
+                    if isinstance(rm, KiwiSourceManager):
+                        # Never the radiod ladder below (reprovision_stale,
+                        # full_reset, diagnose_radiod_side): see
+                        # _kiwi_health_check.
+                        await self._kiwi_health_check(loop, src_key, rm)
+                        continue
                     active = sum(
                         1 for ch in rm.state.channels.values()
                         if ch.is_active
@@ -1542,6 +1609,45 @@ class WsprRecorder:
                 break
             except Exception as e:
                 logger.error(f"Health check error: {e}")
+
+    async def _kiwi_health_check(self, loop, src_key: str,
+                                 rm: KiwiSourceManager) -> None:
+        """One health tick for a KiwiSDR source.
+
+        The radiod recovery ladder does not apply.  A KiwiSourceManager
+        retries refused, dropped and unreachable channels itself, once per
+        2-minute cycle (spec §7b.6), and never retries a rejected password.
+        So a CONNECTED manager is left alone even when check_health() is
+        False (every channel refused or auth_failed): a shutdown()+connect()
+        here would grab Kiwi channels off that cadence and resend a bad
+        password.
+
+        The one case handled here: the Kiwi never answered at startup while
+        a sibling source did, so _connect_with_backoff moved on without
+        starting it and nothing supervises it.  Retry its connect() once per
+        health check until it answers, then start its streams.
+        """
+        if rm.state.connected:
+            return
+        logger.warning(
+            "Channel health (%s): KiwiSDR has not answered since startup "
+            "— retrying connect()", src_key)
+
+        def retry() -> bool:
+            rm.shutdown()           # drop the unanswered attempt's channels
+            if not rm.connect():
+                return False
+            rm.start_streams()
+            return True
+
+        try:
+            if await loop.run_in_executor(None, retry):
+                logger.info("Channel health (%s): KiwiSDR answered; "
+                            "streams started", src_key)
+        except Exception:
+            logger.exception(
+                "Channel health (%s): KiwiSDR reconnect raised — will "
+                "retry next check", src_key)
 
     def _surface_radiod_diagnosis(self, rm: ReceiverManager) -> None:
         """When reset/reconnect fails, log the radiod-side diagnosis.
@@ -1945,6 +2051,22 @@ class WsprRecorder:
             for k in keys:  # a later full_reset() failure must log at ERROR
                 self.receiver_managers[k].quiet_failures = False
 
+    def _kiwi_sources_idle(self) -> bool:
+        """True when every source is a KiwiSDR holding no channel right now
+        (all refused, auth_failed, unreachable or awaiting reconnect).
+
+        No samples is then expected, not a wedge: each KiwiSourceManager
+        retries its channels itself once per 2-minute cycle (and has its
+        own stall watchdog), and a systemd restart would only re-grab Kiwi
+        channels off that cadence and resend a rejected password (spec
+        §7b.6).  A station with any radiod source never qualifies, so the
+        radiod ingestion watchdog is unchanged.
+        """
+        managers = list(self.receiver_managers.values())
+        return bool(managers) and all(
+            isinstance(rm, KiwiSourceManager) and rm.channels_obtained() == 0
+            for rm in managers)
+
     def _total_samples_received(self):
         """Sum of RTP samples ingested across all band recorders.  Advances
         continuously while radiod streams (independent of band activity);
@@ -2001,7 +2123,9 @@ class WsprRecorder:
         # withholds the ping.
         gate = _ProgressGate(stall_sec=90.0)
         while self._running:
-            if gate.update(self._total_samples_received(), time.monotonic()):
+            progressing = gate.update(self._total_samples_received(),
+                                      time.monotonic())
+            if progressing or self._kiwi_sources_idle():
                 self._sd_notify(b"WATCHDOG=1")
             else:
                 logger.error(
@@ -2174,21 +2298,9 @@ class WsprRecorder:
         # disambiguated by (source_key, ssrc) so colliding SSRCs from
         # different radiods don't clobber each other.  Single-source
         # configs produce a one-entry dict (legacy behaviour intact).
+        # A kind = "kiwisdr" source gets a KiwiSourceManager instead.
         for src in self.config.sources:
-            sink_factory = (
-                lambda ssrc, state, sk=src.key:
-                    self._build_sink(ssrc, state, source_key=sk)
-            )
-            self.receiver_managers[src.key] = ReceiverManager(
-                config=self.config,
-                sink_factory=sink_factory,
-                status_address=src.status_address,
-                port=src.port,
-                source_key=src.key,
-                on_band_producible=(
-                    self.cycle_batcher.set_band_producible
-                    if self.cycle_batcher is not None else None),
-            )
+            self.receiver_managers[src.key] = self._make_receiver_manager(src)
         logger.info(
             "Configured %d source(s): %s",
             len(self.receiver_managers),

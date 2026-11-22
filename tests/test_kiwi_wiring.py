@@ -1,0 +1,455 @@
+"""kiwisdr [[source]] wiring in __main__ (Phase 4c, Task 5).
+
+A Kiwi source gets a KiwiSourceManager; each Kiwi band is timed from the
+host clock (never an injected hf-timestd T-tier); the radiod-only recovery
+ladder never touches a Kiwi manager.
+"""
+from __future__ import annotations
+
+import asyncio
+import json
+import logging
+import os
+import tempfile
+from concurrent.futures import ThreadPoolExecutor
+from datetime import datetime, timezone
+from pathlib import Path
+from types import SimpleNamespace
+from unittest import mock
+from unittest.mock import MagicMock
+
+import numpy as np
+import pytest
+
+from wspr_recorder.__main__ import WsprRecorder
+from wspr_recorder.band_recorder import DecodeRequest
+from wspr_recorder.config import Config, load_config
+from wspr_recorder.decode_mode import DecodeMode
+from wspr_recorder.kiwi_source import KiwiSourceManager
+from wspr_recorder.receiver_manager import ReceiverManager
+from wspr_recorder.timing_service import TimingService
+from wspr_recorder.wav_writer import WavWriter
+
+F20, F30 = 14095600, 10138700
+KIWI = "kiwisdr:10.22.23.70:8073"
+RADIOD = "radiod:bee1-hf-status.local"
+
+TOML = f'''
+[[source]]
+status = "bee1-hf-status.local"
+
+[[source]]
+kiwisdr = "10.22.23.70:8073"
+channels = 8
+
+[[band]]
+frequency = {F20}
+modes = ["W2"]
+
+[[band]]
+frequency = {F30}
+modes = ["W2"]
+'''
+
+
+def _config(text=TOML):
+    with tempfile.TemporaryDirectory() as d:
+        p = os.path.join(d, "wspr-recorder.toml")
+        with open(p, "w") as f:
+            f.write(text)
+        with mock.patch.object(Config, "validate", return_value=[]):
+            return load_config(p)
+
+
+@pytest.fixture
+def t6_authority(monkeypatch):
+    """hf-timestd publishes a usable T6 offset for the station's radiod."""
+    snap = SimpleNamespace(
+        offset_usable=True, rtp_to_utc_offset_ns=1_000_000,
+        offset_seconds=0.001, t_level_active="T6", a_level="A3",
+        sigma_ns=50, governor_radiod="bee1-hf-status.local",
+        utc_published=datetime.now(timezone.utc), host_clock=None,
+        to_timing_authority=lambda radiod=None: {
+            "source": "hf-timestd", "t_level_active": "T6"},
+    )
+
+    class FakeReader:
+        def read(self):
+            return snap
+
+    import hamsci_dsp.timing as hdt
+    monkeypatch.setattr(hdt, "AuthorityReader", FakeReader)
+    return snap
+
+
+class FakeChannel:
+    def __init__(self, host, port, freq_hz, *, password, user, on_audio,
+                 on_state, behaviour="connect"):
+        self.freq_hz = freq_hz
+        self.on_audio, self.on_state = on_audio, on_state
+        self.sample_rate = 12000.0
+        self.behaviour = behaviour
+
+    def start(self):
+        if self.behaviour == "connect":
+            self.on_state("connected", "sample_rate=12000")
+        elif self.behaviour == "refuse":
+            self.on_state("refused", "too_busy=1")
+        elif self.behaviour == "badp":
+            self.on_state("auth_failed", "badp=1")
+        else:
+            self.on_state("dropped", "connection refused")
+
+    def stop(self):
+        pass
+
+
+def _recorder(config, executor=None):
+    rec = object.__new__(WsprRecorder)
+    rec.config = config
+    rec.receiver_managers = {}
+    rec.band_recorders = {}
+    rec.cycle_batcher = None
+    rec.executor = executor or MagicMock()
+    rec._on_period_complete = MagicMock()
+    rec.timing_service = TimingService(
+        enable_chrony=False, enable_hf_timestd=False, authority="auto",
+        client_radiod="bee1-hf-status.local")
+    return rec
+
+
+def _kiwi_manager(rec, src, behaviour="connect", channels=None):
+    channels = [] if channels is None else channels
+
+    def factory(*a, **kw):
+        b = behaviour(a[2]) if callable(behaviour) else behaviour
+        ch = FakeChannel(*a, behaviour=b, **kw)
+        channels.append(ch)
+        return ch
+
+    mgr = KiwiSourceManager(
+        rec.config,
+        lambda ssrc, st, sk=src.key: rec._build_sink(ssrc, st, source_key=sk),
+        src, None, channel_factory=factory, start_supervisor=False)
+    rec.receiver_managers[src.key] = mgr
+    return mgr
+
+
+def _feed(ch, seconds, frame=1200):
+    for _ in range(int(seconds * 12000 / frame)):
+        ch.on_audio(np.zeros(frame, np.float32), 0.0)
+
+
+# --- Step 1 tests from the brief ------------------------------------------
+
+def test_kiwisdr_source_builds_kiwi_manager():
+    cfg = _config()
+    rec = _recorder(cfg)
+    managers = {s.key: rec._make_receiver_manager(s) for s in cfg.sources}
+    assert set(managers) == {RADIOD, KIWI}
+    assert type(managers[KIWI]) is KiwiSourceManager
+    assert type(managers[RADIOD]) is ReceiverManager
+    assert managers[KIWI].source_key == KIWI
+
+
+def test_kiwi_band_uses_wallclock_correlation(caplog, t6_authority):
+    cfg = _config()
+    rec = _recorder(cfg)
+    kiwi_src = next(s for s in cfg.sources if s.kind == "kiwisdr")
+    channels = []
+    mgr = _kiwi_manager(rec, kiwi_src, channels=channels)
+    try:
+        with caplog.at_level(logging.INFO):
+            assert mgr.connect()
+            mgr.start_streams()
+            _feed(channels[0], 2.0)
+        rec_kiwi = rec.band_recorders[(KIWI, channels[0].freq_hz)]
+        strat = rec_kiwi.sync_strategy
+        assert strat.channel_info is None
+        assert strat.authority_reader is None
+        assert strat.correlation_source == "wallclock_fallback"
+        assert any("correlated via wall clock" in r.getMessage()
+                   for r in caplog.records)
+    finally:
+        mgr.shutdown()
+
+
+def test_kiwi_rows_tier_is_not_injected(t6_authority, tmp_path):
+    """With hf-timestd publishing T6 for the radiod, a Kiwi band still
+    reports the standalone (no-authority) label everywhere a tier could
+    surface: its anchor, the instance's applied block, the tier alarm and
+    the WAV sidecar.  (Spot and noise rows carry no tier field; the
+    sidecar and the status blocks are where a tier is stated.)"""
+    cfg = _config()
+    rec = _recorder(cfg)
+    kiwi_src = next(s for s in cfg.sources if s.kind == "kiwisdr")
+    channels = []
+    mgr = _kiwi_manager(rec, kiwi_src, channels=channels)
+    try:
+        mgr.connect()
+        mgr.start_streams()
+        _feed(channels[0], 2.0)
+        rec_kiwi = rec.band_recorders[(KIWI, channels[0].freq_hz)]
+        anchor = rec_kiwi.sync_strategy.anchor
+        assert anchor.source == "wallclock_fallback"
+        assert anchor.offset_ns is None
+        assert anchor.timing_authority_applied() is None
+        assert rec._applied_state() is None
+        stats = rec_kiwi.get_stats()
+        assert stats["timing_tier_active"] is None
+        assert stats["timing_tier_best"] is None
+    finally:
+        mgr.shutdown()
+
+    # Contrast: a radiod band built by the same recorder does read the
+    # authority (so the Kiwi result above is the branch, not the fixture).
+    from wspr_recorder.receiver_manager import ChannelState
+    rec._build_sink(1234, ChannelState(frequency_hz=F20, band_name="20"),
+                    source_key=RADIOD)
+    assert rec.band_recorders[(RADIOD, 1234)].sync_strategy \
+        .authority_reader is not None
+
+    # WAV sidecar: the Kiwi slot names no hf-timestd tier and no radiod.
+    writer = WavWriter(output_dir=tmp_path, sample_rate=12000,
+                       sample_format="float32",
+                       timing_service=rec.timing_service)
+
+    def sidecar(rx_source):
+        req = DecodeRequest(
+            frequency_hz=F20, band_name="20",
+            modes=[DecodeMode.W2], period_seconds=120,
+            start_wallclock=datetime(2026, 11, 22, 12, 0,
+                                     tzinfo=timezone.utc),
+            start_rtp_timestamp=0, end_rtp_timestamp=1_440_000,
+            samples=np.zeros(1_440_000, np.float32), gaps=[],
+            rx_source=rx_source)
+        wav = writer.write_period(req)
+        return json.loads(wav.with_suffix(".json").read_text())["timing"]
+
+    kiwi_timing = sidecar(KIWI)
+    assert "T6" not in json.dumps(kiwi_timing)
+    assert not kiwi_timing["timing_source"].startswith("HF_TIMESTD")
+    assert kiwi_timing["gpsdo_source"] is None
+    assert kiwi_timing["gpsdo_locked"] is False
+    assert kiwi_timing["timing_authority"]["source"] == "standalone-fallback"
+    radiod_timing = sidecar(RADIOD)
+    assert radiod_timing["timing_source"] == "HF_TIMESTD_T6"
+
+
+# --- carried-forward constraints ------------------------------------------
+
+def test_stream_restored_none_keeps_host_clock_strategy(t6_authority):
+    """on_stream_restored(None) (a Kiwi reconnect) resets the recorder and
+    re-correlates on the host clock; set_channel_info(None) is harmless."""
+    cfg = _config()
+    rec = _recorder(cfg)
+    kiwi_src = next(s for s in cfg.sources if s.kind == "kiwisdr")
+    channels = []
+    mgr = _kiwi_manager(rec, kiwi_src, channels=channels)
+    try:
+        mgr.connect()
+        mgr.start_streams()
+        ch = channels[0]
+        _feed(ch, 1.0)
+        rec_kiwi = rec.band_recorders[(KIWI, ch.freq_hz)]
+        with mock.patch("os._exit", side_effect=AssertionError("os._exit")):
+            ch.on_state("dropped", "socket closed")     # outage
+            mgr._open(mgr._bands[ch.freq_hz])            # next-cycle retry
+            new_ch = channels[-1]
+            assert new_ch is not ch
+            assert mgr._bands[ch.freq_hz].channel_state.restore_count == 1
+            _feed(new_ch, 1.0)
+        strat = rec_kiwi.sync_strategy
+        assert strat.channel_info is None
+        assert strat.correlation_source == "wallclock_fallback"
+    finally:
+        mgr.shutdown()
+
+
+def _health_recorder(managers):
+    rec = object.__new__(WsprRecorder)
+    rec._running = True
+    rec.STARTUP_GRACE_PERIOD = 0
+    rec.HEALTH_CHECK_INTERVAL = 0
+    rec.receiver_managers = managers
+    rec.cycle_batcher = None
+    return rec
+
+
+def _run_health(rec, seconds=0.3):
+    async def go():
+        t = asyncio.create_task(rec._health_check_loop())
+        await asyncio.sleep(seconds)
+        rec._running = False
+        await asyncio.wait_for(t, 5)
+
+    asyncio.run(go())
+
+
+RADIOD_ONLY = ("reprovision_stale", "full_reset", "diagnose_radiod_side")
+
+
+def _spy_radiod_only(mgr):
+    for name in RADIOD_ONLY:
+        setattr(mgr, name, MagicMock(name=name))
+
+
+@pytest.mark.parametrize("behaviour", ["refuse", "badp"])
+def test_health_tick_leaves_connected_kiwi_alone(behaviour, caplog):
+    """Every channel refused or auth_failed: check_health() is False while
+    state.connected is True.  The health loop must not shutdown()+connect()
+    (off-cadence channel grabs, a resent bad password) and must never reach
+    the radiod-only ladder."""
+    cfg = _config()
+    rec = _recorder(cfg)
+    kiwi_src = next(s for s in cfg.sources if s.kind == "kiwisdr")
+    mgr = _kiwi_manager(rec, kiwi_src, behaviour=behaviour)
+    assert mgr.connect()
+    assert mgr.state.connected and not mgr.check_health()
+    _spy_radiod_only(mgr)
+    mgr.shutdown = MagicMock()
+    mgr.connect = MagicMock()
+    rec = _health_recorder({KIWI: mgr})
+    with caplog.at_level(logging.WARNING):
+        _run_health(rec)
+    # Nothing radiod-flavoured is said about it either (pre-wiring, the
+    # unproducible bands fell into the "above the radiod Nyquist" branch).
+    assert not [r for r in caplog.records
+                if "Channel health" in r.getMessage()]
+    mgr.shutdown.assert_not_called()
+    mgr.connect.assert_not_called()
+    for name in RADIOD_ONLY:
+        getattr(mgr, name).assert_not_called()
+
+
+def test_health_tick_mixed_sources_radiod_ladder_unchanged():
+    """A degraded radiod beside a Kiwi still gets its ladder; the Kiwi gets
+    none of it."""
+    cfg = _config()
+    rec = _recorder(cfg)
+    kiwi_src = next(s for s in cfg.sources if s.kind == "kiwisdr")
+    kiwi = _kiwi_manager(rec, kiwi_src, behaviour="refuse")
+    assert kiwi.connect()
+    _spy_radiod_only(kiwi)
+    radiod = ReceiverManager(cfg, lambda *a: None,
+                             status_address="bee1-hf-status.local",
+                             port=5004, source_key=RADIOD)
+    radiod.state.channels[1] = SimpleNamespace(
+        frequency_hz=F20, band_name="20", is_active=False)
+    radiod.state.channels[2] = SimpleNamespace(
+        frequency_hz=F30, band_name="30", is_active=True)
+    radiod.reprovision_stale = MagicMock()
+    radiod.full_reset = MagicMock()
+    rec = _health_recorder({RADIOD: radiod, KIWI: kiwi})
+    _run_health(rec)
+    assert radiod.reprovision_stale.called or radiod.full_reset.called
+    for name in RADIOD_ONLY:
+        getattr(kiwi, name).assert_not_called()
+
+
+def test_health_tick_reconnects_kiwi_that_never_answered():
+    """A Kiwi unreachable at startup beside a connected radiod was never
+    started; the health check retries its connect() and starts it."""
+    cfg = _config()
+    rec = _recorder(cfg)
+    kiwi_src = next(s for s in cfg.sources if s.kind == "kiwisdr")
+    state = {"b": "unreachable"}
+    mgr = _kiwi_manager(rec, kiwi_src, behaviour=lambda f: state["b"])
+    assert not mgr.connect()
+    _spy_radiod_only(mgr)
+    state["b"] = "connect"
+    rec = _health_recorder({KIWI: mgr})
+    try:
+        _run_health(rec, seconds=0.5)
+        assert mgr.state.connected
+        assert mgr.channels_obtained() == 2
+        assert mgr._streaming
+        for name in RADIOD_ONLY:
+            getattr(mgr, name).assert_not_called()
+    finally:
+        mgr.shutdown()
+
+
+def test_watchdog_exempts_kiwi_only_station_without_channels():
+    cfg = _config()
+    rec = _recorder(cfg)
+    kiwi_src = next(s for s in cfg.sources if s.kind == "kiwisdr")
+    mgr = _kiwi_manager(rec, kiwi_src, behaviour="refuse")
+    mgr.connect()
+    assert rec._kiwi_sources_idle()
+    # With any radiod source the radiod ingestion watchdog stays in force.
+    rec.receiver_managers[RADIOD] = MagicMock(spec=ReceiverManager)
+    assert not rec._kiwi_sources_idle()
+    del rec.receiver_managers[RADIOD]
+    # A Kiwi holding a channel is judged by sample progress as before.
+    mgr.shutdown()
+    mgr2 = _kiwi_manager(rec, kiwi_src, behaviour="connect")
+    mgr2.connect()
+    try:
+        assert not rec._kiwi_sources_idle()
+    finally:
+        mgr2.shutdown()
+
+
+def test_watchdog_loop_pings_while_kiwi_waits(monkeypatch):
+    cfg = _config()
+    rec = _recorder(cfg)
+    kiwi_src = next(s for s in cfg.sources if s.kind == "kiwisdr")
+    mgr = _kiwi_manager(rec, kiwi_src, behaviour="badp")
+    mgr.connect()
+    rec._running = True
+    sent = []
+    rec._sd_notify = sent.append
+    rec._total_samples_received = lambda: 0
+    monkeypatch.setenv("WATCHDOG_USEC", "2000000")
+    import wspr_recorder.__main__ as m
+    monkeypatch.setattr(m, "_ProgressGate",
+                        lambda **kw: SimpleNamespace(
+                            update=lambda p, now: False))
+
+    async def go():
+        t = asyncio.create_task(rec._watchdog_loop())
+        await asyncio.sleep(0.05)
+        rec._running = False
+        t.cancel()
+
+    asyncio.run(go())
+    assert b"WATCHDOG=1" in sent
+
+
+def test_kiwi_overloads_never_poll_the_radiod():
+    cfg = _config()
+    rec = _recorder(cfg)
+    kiwi_src = next(s for s in cfg.sources if s.kind == "kiwisdr")
+    kiwi = _kiwi_manager(rec, kiwi_src)
+    kiwi.read_frontend_ad_over = MagicMock(return_value=7)
+    kiwi.read_channel_filter_drops = MagicMock(return_value=None)
+    radiod = MagicMock()
+    radiod._status_address = "bee1-hf-status.local"
+    rec.receiver_managers = {RADIOD: radiod, KIWI: kiwi}
+    rec.band_recorders = {
+        (KIWI, F20): SimpleNamespace(frequency_hz=F20),
+        (RADIOD, 99): SimpleNamespace(frequency_hz=F20),
+    }
+    rec._last_ad_over = {}
+    rec._last_filter_drops = {}
+    req = SimpleNamespace(rx_source=KIWI, frequency_hz=F20, band_name="20")
+    rec._read_cycle_overloads(req, "bee1-hf-status.local")
+    rec._read_cycle_filter_drops(req, "bee1-hf-status.local")
+    kiwi.read_frontend_ad_over.assert_called_once_with(F20)
+    radiod.read_frontend_ad_over.assert_not_called()
+    radiod.read_channel_filter_drops.assert_not_called()
+    assert (KIWI, "20") in rec._last_ad_over
+
+
+def test_kiwi_status_reports_gps_fix_field():
+    cfg = _config()
+    rec = _recorder(cfg)
+    kiwi_src = next(s for s in cfg.sources if s.kind == "kiwisdr")
+    mgr = _kiwi_manager(rec, kiwi_src)
+    try:
+        mgr.connect()
+        st = mgr.get_status()
+        assert st["kiwi_gps_fix"] is False
+    finally:
+        mgr.shutdown()
