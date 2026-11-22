@@ -229,6 +229,7 @@ def compute_noise(
     overload_count: int = 0,
     band: Optional[str] = None,
     float_wav: bool = False,
+    offset_db: float = 0.0,
 ) -> NoiseMeasurement:
     """One-shot for a decode cycle.  Either side returning None is
     tolerated — wsprdaemon.org accepts spots with a missing noise
@@ -256,6 +257,12 @@ def compute_noise(
             rms += _RMS_CAL_OFFSET.get(band, 0.0)
         if fft is not None:
             fft += _C2_CAL_OFFSET.get(band, 0.0)
+    if offset_db:
+        # Per-source calibration (Kiwi sources only; radiod passes 0.0).
+        if rms is not None:
+            rms += offset_db
+        if fft is not None:
+            fft += offset_db
     return NoiseMeasurement(
         rms_noise_dbm=rms if rms is not None else 0.0,
         fft_noise_dbm=fft if fft is not None else 0.0,

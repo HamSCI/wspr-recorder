@@ -258,6 +258,9 @@ class SourceConfig:
     http_port: int = 8073     # kiwisdr only
     channels: int = 0         # kiwisdr only: concurrent audio channels
     password: str = ""        # kiwisdr only: optional user password
+    # kiwisdr only: dB added to the noise row's levels (calibration against
+    # wsprdaemon on the same Kiwi); 0.0 until measured.
+    noise_offset_db: float = 0.0
 
 
 def _derive_radiod_id(status_address: str) -> str:
@@ -645,6 +648,7 @@ def load_config(config_path: str) -> Config:
                     http_port=http_port,
                     channels=int(src_entry.get("channels", 0)),
                     password=src_entry.get("password", ""),
+                    noise_offset_db=float(src_entry.get("noise_offset_db", 0.0)),
                 ))
                 continue
             try:

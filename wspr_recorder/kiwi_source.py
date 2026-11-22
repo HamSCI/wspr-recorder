@@ -49,6 +49,7 @@ from . import __version__
 from .config import Config, SourceConfig, freq_to_band_name
 from .kiwi_channel import KiwiChannel
 from .kiwi_resample import StreamResampler
+from .kiwi_status import fetch_kiwi_status, status_int
 from .receiver_manager import ChannelSink, ChannelState
 
 logger = logging.getLogger(__name__)
@@ -153,6 +154,7 @@ class KiwiSourceManager:
         *,
         clock: Callable[[], float] = time.time,
         channel_factory: Callable[..., KiwiChannel] = KiwiChannel,
+        status_fetcher: Callable[..., Optional[dict]] = fetch_kiwi_status,
         stall_timeout_s: float = STALL_TIMEOUT_S,
         connect_timeout_s: float = CONNECT_TIMEOUT_S,
         start_supervisor: bool = True,
@@ -164,6 +166,12 @@ class KiwiSourceManager:
         self._on_band_producible = on_band_producible
         self._clock = clock
         self._channel_factory = channel_factory
+        self._status_fetcher = status_fetcher
+        # /status cache: one fetch per cycle per source (failures included).
+        # _status_lock is a leaf lock; the fetch never runs under band.lock.
+        self._status_lock = threading.Lock()
+        self._status_cycle: Optional[int] = None
+        self._status_cache: Optional[dict] = None
         self._stall_timeout_s = stall_timeout_s
         self._connect_timeout_s = connect_timeout_s
         self._start_supervisor = start_supervisor
@@ -322,9 +330,10 @@ class KiwiSourceManager:
             # Whether the Kiwi's own GPS has a fix.  A status field only,
             # never a timing tier: USB-mode audio is timed by the host
             # clock (spec §7b.4).
-            # TODO(Task 6): derive it from /status (gps_good=, fixes=)
-            # when that parsing lands; False until then.
-            "kiwi_gps_fix": False,
+            # From the cached /status (fixes_min > 0: a fix in the last
+            # minute); never fetches here, so False until the first poll.
+            "kiwi_gps_fix": (status_int(self._status_cache, "fixes_min")
+                             or 0) > 0,
         }
 
     def record_samples(self, ssrc: int, count: int) -> None:
@@ -337,8 +346,26 @@ class KiwiSourceManager:
         return {f for f, b in self._bands.items() if b.producible is False}
 
     def read_frontend_ad_over(self, ssrc: int) -> Optional[int]:
-        """Kiwi ADC overload count: unknown until Task 6 reads /status."""
-        return None
+        """Kiwi ADC overload count: ``adc_ov`` from /status.
+
+        Kiwi-wide, so every band's ``ssrc`` gets the same value.  Cumulative
+        since Kiwi boot (it can reset on a Kiwi restart; the caller's
+        overload_delta handles that).  None, never 0, when the Kiwi is
+        unreachable or the key is missing.
+        """
+        return status_int(self._cycle_status(), "adc_ov")
+
+    def _cycle_status(self) -> Optional[dict]:
+        """The Kiwi's /status, fetched at most once per 2-minute cycle (an
+        unreachable Kiwi is cached as None for the cycle too).  Callers
+        must hold no band.lock: the fetch is slow."""
+        cycle = int(self._clock() // CYCLE_S)
+        with self._status_lock:
+            if self._status_cycle != cycle:
+                self._status_cache = self._status_fetcher(
+                    self.source.host, self.source.http_port)
+                self._status_cycle = cycle
+            return self._status_cache
 
     def read_channel_filter_drops(self, ssrc: int) -> Optional[int]:
         return None

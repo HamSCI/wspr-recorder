@@ -1129,6 +1129,13 @@ class WsprRecorder:
             return rm, request.rx_source
         return self._receiver_manager_for(radiod_id), radiod_id
 
+    def _noise_offset_db(self, request: 'DecodeRequest') -> float:
+        """The source's noise_offset_db for a KiwiSDR band; 0.0 for radiod."""
+        rm = self.receiver_managers.get(request.rx_source)
+        if isinstance(rm, KiwiSourceManager):
+            return rm.source.noise_offset_db
+        return 0.0
+
     def _ssrc_for_request(self, request: 'DecodeRequest') -> Optional[int]:
         """The real radiod-assigned SSRC for this band's channel.
 
@@ -1257,6 +1264,7 @@ class WsprRecorder:
                 c2_path=c2_candidate,
                 band=request.band_name,   # per-band KA9Q/RX888 noise calibration
                 overload_count=overload_count,
+                offset_db=self._noise_offset_db(request),
             )
         except Exception as exc:                # noqa: BLE001
             logger.warning(
