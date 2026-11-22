@@ -19,7 +19,7 @@
 - Report "N of M channels obtained" per cycle (§7b.6) in the log, the status/IPC dict, and `inventory`/`validate` JSON.
 - Never claim an injected timing tier (§7b.4).
 - Kiwi audio request matches wsprdaemon's recorder settings (wsprdaemon `kiwi-utils.sh:483-486`): `mod=usb`, passband 1340–1660 Hz, AGC off with manual gain 60 dB, no compression, user string `wsprdaemon_v<WD version>` replaced by `wspr-recorder_v<version>`.
-- Sample rate into BandRecorder: exactly 12000 Hz (resampled; no `SPOT_FREQ_ADJ_HZ` +0.1 Hz fudge on spots).
+- Sample rate into BandRecorder: exactly 12000 Hz, no `SPOT_FREQ_ADJ_HZ` +0.1 Hz fudge on spots. A Kiwi on an external ADC clock (the AI6VN lab Kiwi runs on an external ~66.66 MHz reference — Rob 2026-11-22) reports exactly 12000 Hz: its audio passes straight through, NO resampling. Only a Kiwi on its own crystal (~12001.1 Hz, likely ON5KQ's) is resampled.
 - Spec rule from 2026-11-18 (sigmond decoder_choice): WAV sample format follows the selected decoders (wspr-recorder 528a3bf `decoders_read_float()`); the Kiwi path writes WAVs through the same writer, so it inherits this unchanged.
 
 ## Review Focus
@@ -114,14 +114,14 @@ def test_sequence_gap_fills_zeros(): ...            # skipped seq number → on_
 - [ ] **Step 5: Run** `pytest tests/test_kiwi_channel.py -v` — Expected: PASS.
 - [ ] **Step 6: Commit** `feat(kiwi): WebSocket audio channel with WD-equivalent settings`.
 
-### Task 3: Resample to 12000 Hz
+### Task 3: Pass-through at exactly 12000 Hz, resample otherwise
 
 **Files:**
 - Create: `wspr_recorder/kiwi_resample.py`
 - Test: `tests/test_kiwi_resample.py`
 
 **Interfaces:**
-- Produces: `class StreamResampler(in_rate: float, out_rate: int = 12000)` with `process(x: np.ndarray) -> np.ndarray` (stateful across calls; float32 in/out) and `set_in_rate(in_rate: float)`.
+- Produces: `class StreamResampler(in_rate: float, out_rate: int = 12000)` with `process(x: np.ndarray) -> np.ndarray` (stateful across calls; float32 in/out), `set_in_rate(in_rate: float)`, and property `passthrough: bool` = `abs(in_rate - out_rate) <= EXACT_RATE_TOL_HZ` with `EXACT_RATE_TOL_HZ = 0.001` (external-clock Kiwi). In passthrough `process()` returns its input unchanged (same object or exact copy) — no filtering, no delay.
 
 - [ ] **Step 1: Failing tests**
 
@@ -137,6 +137,10 @@ def test_output_count_tracks_rate():
     n_out = sum(len(r.process(c)) for c in np.array_split(np.zeros(n_in, np.float32), 300))
     assert abs(n_out - round(n_in * 12000 / 12001.135)) <= 2
 def test_chunking_invariant(): ...   # same input in 1 chunk vs 1000 chunks → max abs diff < 1e-4
+def test_exact_12000_is_passthrough():
+    r = StreamResampler(12000.0); x = np.random.randn(5000).astype(np.float32)
+    assert r.passthrough and np.array_equal(r.process(x), x)
+def test_rate_change_switches_mode(): ...  # set_in_rate(12001.135) after 12000.0 → passthrough False and output count follows the new ratio
 ```
 
 - [ ] **Step 2: Run** — FAIL. **Step 3: Implement** with a polyphase/linear-phase approach that carries state between chunks (e.g. `scipy.signal.resample_poly` is not stateful — use a fractional-delay FIR or keep an overlap tail; the chunking test decides). **Step 4: Run** — PASS. **Step 5: Commit** `feat(kiwi): stateful resampler to exactly 12000 Hz`.
