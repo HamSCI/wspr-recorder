@@ -13,7 +13,7 @@
 ## Global Constraints
 
 - Source key format: `kiwisdr:<host>:<port>` (matches sigmond `sources.py`; `wav_writer.source_slug` already strips the `kiwisdr:` prefix).
-- WSPR only (§7b title). FT4/FT8/FST4W on Kiwi sources are out of scope: a `kiwisdr` source with a non-WSPR mode in `[[band]]` modes is a config error.
+- WSPR and FST4W only (§7b title; Rob 2026-11-22): the WSPR channel audio carries WSPR and every FST4W period, decoded from the same recordings; FT8/FT4 sit on other frequencies. Allowed modes on a kiwisdr source: W2, F2, F5, F15, F30 (`VALID_MODE_STRINGS`); FT4/FT8 are a config error.
 - Bands ≤ channels (§7b.2): more bands than `channels` is a config error, not a silent truncation.
 - Never fight web listeners for channels (§7b.6): a refused channel is retried once per 2-minute cycle, never in a tight loop.
 - Report "N of M channels obtained" per cycle (§7b.6) in the log, the status/IPC dict, and `inventory`/`validate` JSON.
