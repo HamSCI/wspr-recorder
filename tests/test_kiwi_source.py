@@ -5,6 +5,7 @@ import logging
 from types import SimpleNamespace
 
 import numpy as np
+import pytest
 
 from wspr_recorder.config import SourceConfig
 from wspr_recorder.kiwi_source import KiwiSourceManager, STALL_TIMEOUT_S
@@ -55,8 +56,20 @@ class FakeChannel:
         self.connected = False
 
 
+_RIGS = []
+
+
+@pytest.fixture(autouse=True)
+def _shutdown_rigs():
+    yield
+    while _RIGS:
+        _RIGS.pop().mgr.shutdown()
+
+
 class Rig:
-    def __init__(self, freqs, behaviour=None, rate=None, clock=None):
+    def __init__(self, freqs, behaviour=None, rate=None, clock=None, **kw):
+        _RIGS.append(self)
+        self.events = []        # ("dropped"|"restored"|"samples", ssrc)
         self.behaviour = dict(behaviour or {})
         self.rate = dict(rate or {})
         self.clock = clock or FakeClock()
@@ -72,7 +85,8 @@ class Rig:
                            channels=8)
         self.mgr = KiwiSourceManager(
             cfg, self.sink_factory, src, self.on_producible,
-            clock=self.clock, channel_factory=self.make_channel)
+            clock=self.clock, channel_factory=self.make_channel,
+            start_supervisor=False, **kw)
 
     def make_channel(self, *a, **kw):
         ch = FakeChannel(self.behaviour, self.rate, *a, **kw)
@@ -84,14 +98,19 @@ class Rig:
 
         def on_samples(samples, quality):
             self.qualities[ssrc] = quality
+            self.events.append(("samples", ssrc))
             self.received[ssrc].append(
                 (np.asarray(samples), list(quality.batch_gaps),
                  quality.total_samples_delivered))
 
         return ChannelSink(
             on_samples=on_samples,
-            on_stream_dropped=lambda reason: self.dropped.append(ssrc),
-            on_stream_restored=lambda info: self.restored.append(ssrc))
+            on_stream_dropped=lambda reason: (
+                self.dropped.append(ssrc),
+                self.events.append(("dropped", ssrc))),
+            on_stream_restored=lambda info: (
+                self.restored.append(ssrc),
+                self.events.append(("restored", ssrc))))
 
     def on_producible(self, source_key, band, producible):
         self.producible.append((source_key, band, producible))
@@ -288,3 +307,68 @@ def test_unreachable_kiwi_connect_returns_false():
     assert rig.mgr.connect() is False
     assert not rig.mgr.state.connected
     assert rig.mgr.check_health() is False
+
+
+def test_bad_rate_mid_stream_is_an_outage():
+    clock = FakeClock(1_000_080.0)
+    rig = Rig([F20], clock=clock)
+    rig.mgr.connect()
+    rig.mgr.start_streams()
+    rig.feed(F20, 2.0)
+    ch = rig.live(F20)
+    ch.connected = False
+    ch.on_state("bad_rate", "20250.0")
+    assert rig.dropped == [F20]
+    assert rig.producible[-1] == (rig.mgr.source_key, "20", False)
+    assert rig.mgr.get_status()["channels"][F20]["state"] == "bad_rate"
+    mark = len(rig.events)
+    rig.advance(1_000_201.0 - clock.t, audio=False)
+    assert rig.starts(F20) == 2
+    rig.feed(F20, 0.5)
+    # The recorder is reset before any post-reconnect audio reaches it.
+    after = rig.events[mark:]
+    assert after[0] == ("restored", F20)
+    assert after[1:] and all(e == ("samples", F20) for e in after[1:])
+    _, gaps, _ = [b for b in rig.received[F20] if b[1]][0]
+    assert len(gaps) == 1 and gaps[0].duration_samples > 100 * 12000
+
+
+def test_refused_mid_stream_is_an_outage():
+    clock = FakeClock(1_000_080.0)
+    rig = Rig([F20], clock=clock)
+    rig.mgr.connect()
+    rig.mgr.start_streams()
+    rig.feed(F20, 2.0)
+    rig.live(F20).connected = False
+    rig.live(F20).on_state("refused", "down")
+    assert rig.dropped == [F20]
+    assert rig.mgr.get_status()["channels"][F20]["state"] == "refused"
+    rig.advance(1_000_201.0 - clock.t, audio=False)
+    assert rig.restored == [F20]
+
+
+def test_connecting_channel_that_never_answers_is_retried():
+    rig = Rig([F20, F30], behaviour={F30: "silent"}, connect_timeout_s=0.01)
+    assert rig.mgr.connect() is True
+    rig.mgr.start_streams()
+    silent = rig.live(F30)
+    assert rig.mgr.get_status()["channels"][F30]["state"] == "connecting"
+    rig.advance(2.0)
+    assert silent.stopped
+    st = rig.mgr.get_status()["channels"][F30]
+    assert st["state"] == "unreachable"
+    assert (rig.mgr.source_key, "30", False) in rig.producible
+    # Retried once at the next cycle boundary (t=1_000_080), not before.
+    assert rig.starts(F30) == 1
+    rig.advance(1_000_081.0 - rig.clock.t)
+    assert rig.starts(F30) == 2
+
+
+def test_no_channel_opened_after_shutdown():
+    rig = Rig([F20, F30], behaviour={F30: "refuse"})
+    rig.mgr.connect()
+    band = rig.mgr._bands[F30]          # an in-flight tick holds this
+    rig.mgr.shutdown()
+    n = len(rig.channels)
+    rig.mgr._open(band)
+    assert len(rig.channels) == n

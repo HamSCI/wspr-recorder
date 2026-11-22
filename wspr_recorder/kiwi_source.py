@@ -22,6 +22,15 @@ Channel policy (spec §7b.6, never fight web listeners for channels):
 Every cycle the manager logs ``kiwisdr:<host>:<port>: N of M channels
 obtained``; ``get_status()`` carries the same two numbers.
 
+Locking: each band has its own ``band.lock``; the sink callbacks
+(``on_samples``, ``on_stream_dropped``/``restored``) and
+``on_band_producible`` run under it, so the lock order is band.lock ->
+whatever those callbacks take (BandRecorder, the cycle batcher's lock).
+Nothing here takes band.lock while holding a lock of the callee's.  The
+manager lock ``_lock`` guards the cycle check-and-set and the ``_closed``
+flag; it is never held while a band lock is taken.  ``KiwiChannel.stop()``
+joins the channel's threads, so it is only called with no lock held.
+
 KiwiChannel objects are single-use: every connection attempt builds a new
 one through ``channel_factory``.  ``clock`` (wall-clock seconds) and
 ``channel_factory`` are injectable so tests run on fake time.
@@ -116,6 +125,7 @@ class _Band:
     gap_from: Optional[float] = None      # last audio before an outage
     awaiting_restore: bool = False        # an outage happened; reset on reconnect
     retry_cycle: Optional[int] = None
+    opened_at: Optional[float] = None     # when the current attempt started
     producible: Optional[bool] = None
     detail: str = ""
 
@@ -145,6 +155,7 @@ class KiwiSourceManager:
         channel_factory: Callable[..., KiwiChannel] = KiwiChannel,
         stall_timeout_s: float = STALL_TIMEOUT_S,
         connect_timeout_s: float = CONNECT_TIMEOUT_S,
+        start_supervisor: bool = True,
     ):
         self.config = config
         self.sink_factory = sink_factory
@@ -155,6 +166,7 @@ class KiwiSourceManager:
         self._channel_factory = channel_factory
         self._stall_timeout_s = stall_timeout_s
         self._connect_timeout_s = connect_timeout_s
+        self._start_supervisor = start_supervisor
         self.state = _KiwiManagerState(source.key, source.host,
                                        source.http_port)
         self._bands: Dict[int, _Band] = {}
@@ -165,7 +177,9 @@ class KiwiSourceManager:
         self._log_pending_since: Optional[float] = None
         self._settled = threading.Condition()
         self._supervisor: Optional[threading.Thread] = None
-        self._stop_supervisor = threading.Event()
+        self._stop_supervisor = threading.Event()   # the current supervisor's
+        self._lock = threading.Lock()
+        self._closed = False   # set by shutdown(): _open starts nothing
 
     # ---- ReceiverManager surface ---------------------------------------
 
@@ -179,7 +193,9 @@ class KiwiSourceManager:
         retried here, once per cycle.
         """
         now = self._clock()
-        self._cycle = int(now // CYCLE_S)
+        with self._lock:
+            self._closed = False
+            self._cycle = int(now // CYCLE_S)
         for freq_hz in self.config.frequencies:
             if freq_hz in self._bands:
                 continue
@@ -219,11 +235,17 @@ class KiwiSourceManager:
     def start_streams(self) -> None:
         """Begin delivering audio to the sinks and start the supervisor."""
         self._streaming = True
+        if not self._start_supervisor:
+            return
         if self._supervisor is None or not self._supervisor.is_alive():
-            self._stop_supervisor.clear()
+            # Each supervisor gets its own stop Event, so one that outlived
+            # a stop_streams() join timeout still exits and never runs
+            # alongside its successor.
+            stop = threading.Event()
+            self._stop_supervisor = stop
             self._supervisor = threading.Thread(
-                target=self._supervise, name=f"kiwi-supervisor-{self.source_key}",
-                daemon=True)
+                target=self._supervise, args=(stop,),
+                name=f"kiwi-supervisor-{self.source_key}", daemon=True)
             self._supervisor.start()
 
     def stop_streams(self) -> None:
@@ -232,9 +254,12 @@ class KiwiSourceManager:
         sup = self._supervisor
         if sup is not None and sup is not threading.current_thread():
             sup.join(timeout=5)
-        self._supervisor = None
+        if sup is None or not sup.is_alive():
+            self._supervisor = None
 
     def shutdown(self) -> None:
+        with self._lock:
+            self._closed = True
         self.stop_streams()
         for band in list(self._bands.values()):
             with band.lock:
@@ -249,6 +274,8 @@ class KiwiSourceManager:
         self.state.connected = False
 
     def check_health(self) -> bool:
+        # Lock-free reads of per-band fields: each is a single attribute
+        # read (atomic under the GIL); a momentarily stale answer is fine.
         now = self._clock()
         return any(
             b.status == _CONNECTED and b.last_audio_t is not None
@@ -259,6 +286,8 @@ class KiwiSourceManager:
         return sum(1 for b in self._bands.values() if b.status == _CONNECTED)
 
     def get_status(self) -> dict:
+        # Lock-free snapshot, as in check_health(): fields may be from
+        # adjacent moments, which a status report tolerates.
         now = self._clock()
         channels = {}
         active = 0
@@ -310,8 +339,8 @@ class KiwiSourceManager:
 
     # ---- supervision ---------------------------------------------------
 
-    def _supervise(self) -> None:
-        while not self._stop_supervisor.wait(SUPERVISOR_PERIOD_S):
+    def _supervise(self, stop: threading.Event) -> None:
+        while not stop.wait(SUPERVISOR_PERIOD_S):
             try:
                 self.tick()
             except Exception:
@@ -324,20 +353,26 @@ class KiwiSourceManager:
         now = self._clock()
         cycle = int(now // CYCLE_S)
 
+        bands = list(self._bands.values())
+        for band in bands:
+            self._check_connecting(band, now, cycle)
         if self._streaming:
-            for band in list(self._bands.values()):
+            for band in bands:
                 self._check_stall(band, now)
 
-        if self._cycle is None or cycle != self._cycle:
-            self._cycle = cycle
-            for band in list(self._bands.values()):
+        with self._lock:
+            new_cycle = self._cycle is None or cycle != self._cycle
+            if new_cycle:
+                self._cycle = cycle
+                self._log_pending_since = now
+        if new_cycle:
+            for band in bands:
                 with band.lock:
                     due = (band.status in _RETRY_STATES
                            and band.retry_cycle is not None
                            and band.retry_cycle <= cycle)
                 if due:
                     self._open(band)
-            self._log_pending_since = now
 
         if self._log_pending_since is not None:
             settling = any(b.status == _CONNECTING
@@ -350,6 +385,27 @@ class KiwiSourceManager:
         self._log_pending_since = None
         logger.info("%s: %d of %d channels obtained", self.source_key,
                     self.channels_obtained(), len(self.config.frequencies))
+
+    def _check_connecting(self, band: _Band, now: float, cycle: int) -> None:
+        """A channel that opened but never finished its handshake (no
+        sample_rate/audio_init, no terminal state) is abandoned after
+        connect_timeout_s and retried next cycle."""
+        with band.lock:
+            if (band.status != _CONNECTING or band.opened_at is None
+                    or now - band.opened_at <= self._connect_timeout_s):
+                return
+            ch = band.channel
+            band.generation += 1
+            band.channel = None
+            band.status = _UNREACHABLE
+            band.detail = (f"no handshake within "
+                           f"{self._connect_timeout_s:g} s")
+            band.retry_cycle = cycle + 1
+            logger.warning("%s %s: %s; retrying next cycle", self.source_key,
+                           band.band_name, band.detail)
+            self._set_producible(band, False)
+        if ch is not None:
+            ch.stop()
 
     def _check_stall(self, band: _Band, now: float) -> None:
         with band.lock:
@@ -365,7 +421,14 @@ class KiwiSourceManager:
     # ---- channel lifecycle ---------------------------------------------
 
     def _open(self, band: _Band) -> None:
+        # start() runs under band.lock so shutdown(), which stops channels
+        # under the same lock after setting _closed, either sees this
+        # channel already started or makes us see _closed: no leaked slot.
+        # (A real start() only spawns its thread; a callback from it waits
+        # for the lock.)
         with band.lock:
+            if self._closed:
+                return
             band.generation += 1
             gen = band.generation
             band.status = _CONNECTING
@@ -376,7 +439,8 @@ class KiwiSourceManager:
                 on_audio=lambda s, t: self._on_audio(band, gen, s),
                 on_state=lambda st, d: self._on_state(band, gen, st, d))
             band.channel = ch
-        ch.start()
+            band.opened_at = self._clock()
+            ch.start()
 
     def _on_state(self, band: _Band, gen: int, state: str, detail: str) -> None:
         now = self._clock()
@@ -406,8 +470,19 @@ class KiwiSourceManager:
                         "password in the [[source]] entry. Not retrying.",
                         self.source_key, detail)
                 self._set_producible(band, False)
-            elif state == "dropped" and was == _CONNECTED:
-                self._mark_dropped(band, detail or "connection closed", now)
+            elif was == _CONNECTED:
+                # Any end of a streaming channel is an outage: the recorder
+                # must be reset on reconnect and the gap recorded.
+                self._mark_dropped(band, f"{state} {detail}".strip(), now)
+                if state == "refused":
+                    band.status = _REFUSED
+                    self._set_producible(band, False)
+                elif state == "bad_rate":
+                    band.status = _BAD_RATE
+                    logger.error("%s %s: Kiwi audio rate %s Hz is not "
+                                 "~12000 Hz; channel refused", self.source_key,
+                                 band.band_name, detail)
+                    self._set_producible(band, False)
             else:
                 # refused, bad_rate, or a drop before we ever connected.
                 band.status = {"refused": _REFUSED,
