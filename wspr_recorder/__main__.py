@@ -441,11 +441,14 @@ class WsprRecorder:
         )
     
     def _is_kiwi_source(self, source_key: str) -> bool:
-        """True when ``source_key`` names a ``kind = "kiwisdr"`` source."""
+        """True when ``source_key`` names a ``kind = "kiwisdr"`` source.
+
+        Decided by the configured kind only (a custom ``key =`` need not
+        start with ``kiwisdr:``); an unknown key is not a Kiwi."""
         for src in getattr(self.config, "sources", None) or []:
             if src.key == source_key:
                 return src.kind == "kiwisdr"
-        return source_key.startswith("kiwisdr:")
+        return False
 
     def _make_receiver_manager(self, src):
         """The source manager for one ``[[source]]``: a KiwiSourceManager
@@ -1624,7 +1627,7 @@ class WsprRecorder:
 
         The radiod recovery ladder does not apply.  A KiwiSourceManager
         retries refused, dropped and unreachable channels itself, once per
-        2-minute cycle (spec §7b.6), and never retries a rejected password.
+        2-minute cycle (spec §7b.6), and a rejected password only hourly.
         So a CONNECTED manager is left alone even when check_health() is
         False (every channel refused or auth_failed): a shutdown()+connect()
         here would grab Kiwi channels off that cadence and resend a bad
@@ -2069,11 +2072,23 @@ class WsprRecorder:
         channels off that cadence and resend a rejected password (spec
         §7b.6).  A station with any radiod source never qualifies, so the
         radiod ingestion watchdog is unchanged.
+
+        That trust needs someone retrying: each manager's supervisor
+        thread must be alive, or (a Kiwi that never answered, so never
+        started) the health loop's connect() retry owns it.  A connected
+        manager with a dead supervisor does not qualify, so systemd
+        restarts the station.  Managers changing under us (shutdown or
+        rebuild on another thread) read as not idle.
         """
-        managers = list(self.receiver_managers.values())
-        return bool(managers) and all(
-            isinstance(rm, KiwiSourceManager) and rm.channels_obtained() == 0
-            for rm in managers)
+        try:
+            managers = list(self.receiver_managers.values())
+            return bool(managers) and all(
+                isinstance(rm, KiwiSourceManager)
+                and rm.channels_obtained() == 0
+                and (rm.supervisor_alive() or not rm.state.connected)
+                for rm in managers)
+        except Exception:  # noqa: BLE001 — fail safe: no exemption
+            return False
 
     def _total_samples_received(self):
         """Sum of RTP samples ingested across all band recorders.  Advances
@@ -2186,6 +2201,9 @@ class WsprRecorder:
             # float32 only while the selected wsprd/jt9 read it (the
             # ubersdr set); the wsjtx fallback set reads int16 only.
             float_capable=decoders_read_float,
+            # Kiwi slots are timed by the host clock (spec §7b.4); decided
+            # by the source's kind, so a custom key= still qualifies.
+            host_clock_only=self._is_kiwi_source,
         )
 
         # Pipeline-v2 DB-direct decode bring-up (no-op when

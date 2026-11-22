@@ -9,15 +9,22 @@ counter stands in for the RTP timestamp.
 
 Channel policy (spec §7b.6, never fight web listeners for channels):
 
-* a refused (``too_busy``) or unreachable channel is retried once per
-  2-minute WSPR cycle, at the even-minute boundary, never in a tight loop;
-* a rejected password (``badp``) is a configuration fault: logged once,
-  never retried;
+* a refused (``too_busy``, a non-password ``badp``) or unreachable channel
+  is retried once per 2-minute WSPR cycle, never in a tight loop;
+* a rejected password (``badp=1``) is a configuration fault: logged as
+  one and retried only every ``AUTH_RETRY_S``;
 * a channel that drops mid-cycle (or goes silent for ``stall_timeout_s``)
-  is reported to the sink as dropped and reconnected at the next even
-  minute.  On reconnect the sink's ``on_stream_restored`` resets the
-  recorder so no stale samples are stitched across the outage, and the
-  first batch afterwards carries one gap of the missing wall-clock length.
+  is reported to the sink as dropped and reconnected for the next cycle.
+  On reconnect the sink's ``on_stream_restored`` resets the recorder so no
+  stale samples are stitched across the outage, and the first batch
+  afterwards carries one gap of the missing wall-clock length.
+
+Every retry is for one cycle, the one starting at the next even minute,
+and opens ``RECONNECT_LEAD_S`` before that boundary so its first audio
+anchors on it; a band gets at most one attempt per cycle.  A band is
+unproducible (the cycle batcher stops waiting for it) from the moment it
+loses its channel, and producible again from the minute boundary its
+first post-reconnect audio anchors on, never for the cycle it joined.
 
 Every cycle the manager logs ``kiwisdr:<host>:<port>: N of M channels
 obtained``; ``get_status()`` carries the same two numbers.
@@ -38,6 +45,7 @@ one through ``channel_factory``.  ``clock`` (wall-clock seconds) and
 from __future__ import annotations
 
 import logging
+import math
 import threading
 import time
 from dataclasses import dataclass, field
@@ -63,6 +71,14 @@ STALL_TIMEOUT_S = 10.0
 # after a cycle boundary the "N of M" line waits for retries to settle.
 CONNECT_TIMEOUT_S = 10.0
 SUPERVISOR_PERIOD_S = 1.0
+# A due band is (re)opened this long before the next even minute, so its
+# first audio arrives before the boundary and the recorder anchors on it
+# (a channel opened just after the boundary anchors a minute late and
+# loses that cycle too).
+RECONNECT_LEAD_S = 10.0
+# A rejected password (badp=1) is retried this rarely: it is a config
+# fault, but the operator may fix the Kiwi's password without a restart.
+AUTH_RETRY_S = 3600
 
 USER_AGENT = f"wspr-recorder_v{__version__}"
 
@@ -73,10 +89,11 @@ _REFUSED = "refused"          # too_busy / down / redirect: retry next cycle
 _UNREACHABLE = "unreachable"  # never connected: retry next cycle
 _BAD_RATE = "bad_rate"        # rate outside 11990..12010: retry next cycle
 _DROPPED = "dropped"          # lost after connecting: reconnect next cycle
-_AUTH_FAILED = "auth_failed"  # wrong password: never retried
+_AUTH_FAILED = "auth_failed"  # wrong password: retried every AUTH_RETRY_S
 _STOPPED = "stopped"
 
-_RETRY_STATES = (_REFUSED, _UNREACHABLE, _BAD_RATE, _DROPPED)
+_RETRY_STATES = (_REFUSED, _UNREACHABLE, _BAD_RATE, _DROPPED, _AUTH_FAILED)
+_AUTH_RETRY_CYCLES = max(1, AUTH_RETRY_S // CYCLE_S)
 
 
 @dataclass
@@ -125,7 +142,9 @@ class _Band:
     last_audio_t: Optional[float] = None
     gap_from: Optional[float] = None      # last audio before an outage
     awaiting_restore: bool = False        # an outage happened; reset on reconnect
-    retry_cycle: Optional[int] = None
+    retry_cycle: Optional[int] = None     # next cycle to attempt (see tick)
+    attempt_cycle: Optional[int] = None   # the cycle the last _open was for
+    awaiting_producible: bool = False     # connected; producible on 1st audio
     opened_at: Optional[float] = None     # when the current attempt started
     producible: Optional[bool] = None
     detail: str = ""
@@ -157,6 +176,7 @@ class KiwiSourceManager:
         status_fetcher: Callable[..., Optional[dict]] = fetch_kiwi_status,
         stall_timeout_s: float = STALL_TIMEOUT_S,
         connect_timeout_s: float = CONNECT_TIMEOUT_S,
+        reconnect_lead_s: float = RECONNECT_LEAD_S,
         start_supervisor: bool = True,
     ):
         self.config = config
@@ -174,13 +194,14 @@ class KiwiSourceManager:
         self._status_cache: Optional[dict] = None
         self._stall_timeout_s = stall_timeout_s
         self._connect_timeout_s = connect_timeout_s
+        self._reconnect_lead_s = reconnect_lead_s
         self._start_supervisor = start_supervisor
         self.state = _KiwiManagerState(source.key, source.host,
                                        source.http_port)
         self._bands: Dict[int, _Band] = {}
         self._lifetime_entries: list = []   # radiod-only; kept for __main__
         self._streaming = False
-        self._auth_logged = False
+        self._auth_logged_at: Optional[float] = None
         self._cycle: Optional[int] = None
         self._log_pending_since: Optional[float] = None
         self._settled = threading.Condition()
@@ -281,6 +302,12 @@ class KiwiSourceManager:
         self.state.channels.clear()
         self.state.connected = False
 
+    def supervisor_alive(self) -> bool:
+        """True while the supervisor thread (the retries, the stall
+        watchdog) is running."""
+        sup = self._supervisor
+        return sup is not None and sup.is_alive()
+
     def check_health(self) -> bool:
         # Lock-free reads of per-band fields: each is a single attribute
         # read (atomic under the GIL); a momentarily stale answer is fine.
@@ -380,7 +407,7 @@ class KiwiSourceManager:
                 logger.exception("%s: supervisor tick failed", self.source_key)
 
     def tick(self) -> None:
-        """One supervision pass: stall watchdog, cycle-boundary retries and
+        """One supervision pass: stall watchdog, pre-boundary retries and
         the per-cycle "N of M" line.  Called every second by the supervisor
         thread (and directly by tests on fake time)."""
         now = self._clock()
@@ -388,7 +415,7 @@ class KiwiSourceManager:
 
         bands = list(self._bands.values())
         for band in bands:
-            self._check_connecting(band, now, cycle)
+            self._check_connecting(band, now)
         if self._streaming:
             for band in bands:
                 self._check_stall(band, now)
@@ -398,14 +425,14 @@ class KiwiSourceManager:
             if new_cycle:
                 self._cycle = cycle
                 self._log_pending_since = now
-        if new_cycle:
-            for band in bands:
-                with band.lock:
-                    due = (band.status in _RETRY_STATES
-                           and band.retry_cycle is not None
-                           and band.retry_cycle <= cycle)
-                if due:
-                    self._open(band)
+        target = self._target_cycle(now)
+        for band in bands:
+            with band.lock:
+                due = (band.status in _RETRY_STATES
+                       and band.retry_cycle is not None
+                       and band.retry_cycle <= target)
+            if due:
+                self._open(band)
 
         if self._log_pending_since is not None:
             settling = any(b.status == _CONNECTING
@@ -414,12 +441,26 @@ class KiwiSourceManager:
                     or now - self._log_pending_since >= self._connect_timeout_s):
                 self._log_counts()
 
+    def _target_cycle(self, now: float) -> int:
+        """The cycle an attempt opened at ``now`` is for: the current one
+        until ``reconnect_lead_s`` before its end, then the next."""
+        return int((now + self._reconnect_lead_s) // CYCLE_S)
+
+    def _next_retry_cycle(self, band: _Band, now: float) -> int:
+        """The cycle to retry ``band`` for after a failure or drop at
+        ``now``: the next one, unless this band already had its attempt
+        for that cycle (one attempt per cycle).  Caller holds band.lock."""
+        nxt = int(now // CYCLE_S) + 1
+        if band.attempt_cycle is not None:
+            nxt = max(nxt, band.attempt_cycle + 1)
+        return nxt
+
     def _log_counts(self) -> None:
         self._log_pending_since = None
         logger.info("%s: %d of %d channels obtained", self.source_key,
                     self.channels_obtained(), len(self.config.frequencies))
 
-    def _check_connecting(self, band: _Band, now: float, cycle: int) -> None:
+    def _check_connecting(self, band: _Band, now: float) -> None:
         """A channel that opened but never finished its handshake (no
         sample_rate/audio_init, no terminal state) is abandoned after
         connect_timeout_s and retried next cycle."""
@@ -433,7 +474,7 @@ class KiwiSourceManager:
             band.status = _UNREACHABLE
             band.detail = (f"no handshake within "
                            f"{self._connect_timeout_s:g} s")
-            band.retry_cycle = cycle + 1
+            band.retry_cycle = self._next_retry_cycle(band, now)
             logger.warning("%s %s: %s; retrying next cycle", self.source_key,
                            band.band_name, band.detail)
             self._set_producible(band, False)
@@ -466,6 +507,8 @@ class KiwiSourceManager:
             gen = band.generation
             band.status = _CONNECTING
             band.retry_cycle = None
+            band.attempt_cycle = self._target_cycle(self._clock())
+            band.awaiting_producible = False
             ch = self._channel_factory(
                 self.source.host, self.source.http_port, band.freq_hz,
                 password=self.source.password, user=USER_AGENT,
@@ -492,16 +535,21 @@ class KiwiSourceManager:
                 if band.awaiting_restore:
                     band.awaiting_restore = False
                     band.sink.on_stream_restored(None)
-                self._set_producible(band, True)
+                # Producible once audio flows: see _on_audio.
+                band.awaiting_producible = True
             elif state == "auth_failed":
                 band.status = _AUTH_FAILED
                 band.channel = None
-                if not self._auth_logged:
-                    self._auth_logged = True
+                band.retry_cycle = int(now // CYCLE_S) + _AUTH_RETRY_CYCLES
+                # One line per retry round, however many bands failed.
+                if (self._auth_logged_at is None
+                        or now - self._auth_logged_at >= AUTH_RETRY_S / 2):
+                    self._auth_logged_at = now
                     logger.error(
                         "%s: the KiwiSDR rejected the password (%s); check "
-                        "password in the [[source]] entry. Not retrying.",
-                        self.source_key, detail)
+                        "password in the [[source]] entry. Retrying in "
+                        "%d min.", self.source_key, detail,
+                        AUTH_RETRY_S // 60)
                 self._set_producible(band, False)
             elif was == _CONNECTED:
                 # Any end of a streaming channel is an outage: the recorder
@@ -521,7 +569,7 @@ class KiwiSourceManager:
                 band.status = {"refused": _REFUSED,
                                "bad_rate": _BAD_RATE}.get(state, _UNREACHABLE)
                 band.channel = None
-                band.retry_cycle = int(now // CYCLE_S) + 1
+                band.retry_cycle = self._next_retry_cycle(band, now)
                 log = logger.error if state == "bad_rate" else logger.warning
                 if state == "bad_rate":
                     msg = "Kiwi audio rate %s Hz is not ~12000 Hz; channel refused"
@@ -539,13 +587,17 @@ class KiwiSourceManager:
         band.generation += 1          # ignore anything the old channel sends
         band.channel = None
         band.status = _DROPPED
-        band.retry_cycle = int(now // CYCLE_S) + 1
+        band.retry_cycle = self._next_retry_cycle(band, now)
         if band.gap_from is None:
             band.gap_from = band.last_audio_t
         band.awaiting_restore = True
-        logger.warning("%s %s: channel dropped (%s); reconnecting at the next "
-                       "even minute", self.source_key, band.band_name, reason)
+        band.awaiting_producible = False
+        logger.warning("%s %s: channel dropped (%s); reconnecting before the "
+                       "next even minute", self.source_key, band.band_name,
+                       reason)
         band.sink.on_stream_dropped(reason)
+        # The cycle in progress is lost (the recorder resets on reconnect).
+        self._set_producible(band, False)
 
     def _on_audio(self, band: _Band, gen: int, samples: np.ndarray) -> None:
         now = self._clock()
@@ -575,12 +627,19 @@ class KiwiSourceManager:
                 return
             q.total_samples_delivered += len(out)
             band.sink.on_samples(out, q)
+            if band.awaiting_producible:
+                # The recorder anchors this first audio on the next minute
+                # boundary; the band produces cycles from there on.
+                band.awaiting_producible = False
+                self._set_producible(band, True,
+                                     from_epoch=math.ceil(now / 60.0) * 60.0)
 
     def _rate_of(self, band: _Band) -> float:
         rate = band.channel.sample_rate if band.channel is not None else None
         return float(rate) if rate else float(OUT_RATE)
 
-    def _set_producible(self, band: _Band, producible: bool) -> None:
+    def _set_producible(self, band: _Band, producible: bool,
+                        from_epoch: Optional[float] = None) -> None:
         if band.producible is producible:
             return
         band.producible = producible
@@ -588,6 +647,10 @@ class KiwiSourceManager:
         if cb is None:
             return
         try:
-            cb(self.source_key, band.band_name, producible)
+            if from_epoch is None:
+                cb(self.source_key, band.band_name, producible)
+            else:
+                cb(self.source_key, band.band_name, producible,
+                   from_epoch=from_epoch)
         except Exception:  # noqa: BLE001
             logger.exception("on_band_producible callback failed")

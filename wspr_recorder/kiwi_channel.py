@@ -5,7 +5,8 @@ tests/fixtures/kiwi/, recorded by scripts/kiwi_capture.py):
 
 * open ``ws://host:port/<epoch_ms>/SND`` and send ``SET auth t=kiwi p=<pw>``;
 * the server answers with ``MSG name=value ...`` frames.  ``badp=0`` means
-  the password was accepted, ``badp`` non-zero means it was not;
+  the password was accepted and ``badp=1`` that it was wrong; the other
+  non-zero codes are transient or policy refusals (see ``BADP_MEANINGS``);
   ``too_busy``/``down``/``redirect`` mean no channel for us;
 * ``sample_rate=<float>`` is the true audio rate (crystal-dependent);
   ``audio_rate=<int>`` (with ``audio_init``) is answered with ``SET AR OK``;
@@ -37,6 +38,21 @@ _SND_FLAG_LITTLE_ENDIAN = 0x80
 
 _SND_HEADER = 10  # tag(3) + flags(1) + seq(4) + smeter(2)
 
+# badp codes (Beagle_SDR_GPS web/kiwi/kiwi.js, kiwi.BADP_*).  Only
+# BADP_WRONG_PASSWORD is a password fault; the rest are refusals worth
+# retrying (3, 4 and 7 concern admin connections and should not occur on
+# a t=kiwi SND connection).
+BADP_OK = 0
+BADP_WRONG_PASSWORD = 1   # kiwi.js BADP_TRY_AGAIN: "Try again" (re-prompt)
+BADP_MEANINGS = {
+    2: "still determining local interface address",
+    3: "not allowed from this IP",
+    4: "no admin password set",
+    5: "multiple connections from the same IP not allowed",
+    6: "database update in progress",
+    7: "another admin connection already open",
+}
+
 # A sequence jump larger than this is a stream restart, not lost frames:
 # resynchronise rather than inventing seconds of zeros.
 MAX_GAP_FRAMES = 120
@@ -48,7 +64,8 @@ class KiwiChannel:
     ``on_audio(samples, rx_monotonic)`` gets float32 samples (int16/32768)
     per SND frame; a lost frame is delivered as zeros of the same length.
     ``on_state(state, detail)`` reports ``connected``, ``refused``,
-    ``auth_failed``, ``dropped`` or ``bad_rate``.  Reconnection is the
+    ``auth_failed`` (badp=1 only), ``dropped`` or ``bad_rate``; any other
+    non-zero badp is ``refused`` with its meaning in the detail.  Reconnection is the
     caller's business: after any terminal state the thread ends.
     """
 
@@ -146,8 +163,16 @@ class KiwiChannel:
                 self._finish(ws, "refused", token)
                 return
             if name == "badp":
-                if value != "0":
+                try:
+                    code = int(value)
+                except ValueError:
+                    code = -1
+                if code == BADP_WRONG_PASSWORD:
                     self._finish(ws, "auth_failed", token)
+                    return
+                if code != BADP_OK:
+                    meaning = BADP_MEANINGS.get(code, "unknown badp code")
+                    self._finish(ws, "refused", f"{token} ({meaning})")
                     return
             elif name == "sample_rate":
                 rate = float(value)

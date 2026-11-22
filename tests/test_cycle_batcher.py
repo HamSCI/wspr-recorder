@@ -910,3 +910,34 @@ class TestCycleBatcherUnproducibleBands(unittest.TestCase):
             self.assertEqual(len(sink.calls), 0, "6 expected again")
         finally:
             b.stop()
+
+    def test_band_rejoins_only_from_the_cycle_it_can_produce(self):
+        """A band that comes back mid-way (a Kiwi channel reconnected
+        before the 07:52 boundary) is producible from 07:52 on: the 07:50
+        cycle it missed must not wait for it, 07:52 must."""
+        from datetime import datetime, timezone
+        sink = _RecordingSink()
+        b = self._batcher(sink)
+        b.set_band_producible("radiod:A", "6", False)
+        b.set_band_producible("radiod:A", "8", False)
+        from_epoch = datetime(2026, 5, 12, 7, 52,
+                              tzinfo=timezone.utc).timestamp()
+        b.set_band_producible("radiod:A", "6", True, from_epoch=from_epoch)
+        try:
+            expected_0750 = b._expected_bands_for_cycle(
+                ("260512", "0750"), "radiod:A")
+            expected_0752 = b._expected_bands_for_cycle(
+                ("260512", "0752"), "radiod:A")
+            self.assertNotIn("6", expected_0750)
+            self.assertIn("6", expected_0752)
+            self.assertNotIn("8", expected_0752)
+            # A plain True (the radiod path) clears the cycle bound.
+            b.set_band_producible("radiod:A", "6", True)
+            self.assertIn("6", b._expected_bands_for_cycle(
+                ("260512", "0750"), "radiod:A"))
+            # False then True again: the old bound does not linger.
+            b.set_band_producible("radiod:A", "6", False)
+            self.assertNotIn("6", b._expected_bands_for_cycle(
+                ("260512", "0752"), "radiod:A"))
+        finally:
+            b.stop()

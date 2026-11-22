@@ -118,7 +118,8 @@ def _recorder(config, executor=None):
     return rec
 
 
-def _kiwi_manager(rec, src, behaviour="connect", channels=None):
+def _kiwi_manager(rec, src, behaviour="connect", channels=None,
+                  start_supervisor=False):
     channels = [] if channels is None else channels
 
     def factory(*a, **kw):
@@ -130,7 +131,8 @@ def _kiwi_manager(rec, src, behaviour="connect", channels=None):
     mgr = KiwiSourceManager(
         rec.config,
         lambda ssrc, st, sk=src.key: rec._build_sink(ssrc, st, source_key=sk),
-        src, None, channel_factory=factory, start_supervisor=False)
+        src, None, channel_factory=factory,
+        start_supervisor=start_supervisor)
     rec.receiver_managers[src.key] = mgr
     return mgr
 
@@ -212,7 +214,8 @@ def test_kiwi_rows_tier_is_not_injected(t6_authority, tmp_path):
     # WAV sidecar: the Kiwi slot names no hf-timestd tier and no radiod.
     writer = WavWriter(output_dir=tmp_path, sample_rate=12000,
                        sample_format="float32",
-                       timing_service=rec.timing_service)
+                       timing_service=rec.timing_service,
+                       host_clock_only=rec._is_kiwi_source)
 
     def sidecar(rx_source):
         req = DecodeRequest(
@@ -374,8 +377,10 @@ def test_watchdog_exempts_kiwi_only_station_without_channels():
     cfg = _config()
     rec = _recorder(cfg)
     kiwi_src = next(s for s in cfg.sources if s.kind == "kiwisdr")
-    mgr = _kiwi_manager(rec, kiwi_src, behaviour="refuse")
+    mgr = _kiwi_manager(rec, kiwi_src, behaviour="refuse",
+                        start_supervisor=True)
     mgr.connect()
+    mgr.start_streams()
     assert rec._kiwi_sources_idle()
     # With any radiod source the radiod ingestion watchdog stays in force.
     rec.receiver_managers[RADIOD] = MagicMock(spec=ReceiverManager)
@@ -395,8 +400,10 @@ def test_watchdog_loop_pings_while_kiwi_waits(monkeypatch):
     cfg = _config()
     rec = _recorder(cfg)
     kiwi_src = next(s for s in cfg.sources if s.kind == "kiwisdr")
-    mgr = _kiwi_manager(rec, kiwi_src, behaviour="badp")
+    mgr = _kiwi_manager(rec, kiwi_src, behaviour="badp",
+                        start_supervisor=True)
     mgr.connect()
+    mgr.start_streams()
     rec._running = True
     sent = []
     rec._sd_notify = sent.append
@@ -413,8 +420,103 @@ def test_watchdog_loop_pings_while_kiwi_waits(monkeypatch):
         rec._running = False
         t.cancel()
 
-    asyncio.run(go())
+    try:
+        asyncio.run(go())
+    finally:
+        mgr.shutdown()
     assert b"WATCHDOG=1" in sent
+
+
+def test_watchdog_exemption_needs_a_live_kiwi_supervisor():
+    """The exemption trusts the manager's supervisor to retry; with that
+    thread dead nothing would, so a channel-less Kiwi-only station must
+    stop feeding the watchdog and let systemd restart it."""
+    cfg = _config()
+    rec = _recorder(cfg)
+    kiwi_src = next(s for s in cfg.sources if s.kind == "kiwisdr")
+    mgr = _kiwi_manager(rec, kiwi_src, behaviour="refuse",
+                        start_supervisor=True)
+    try:
+        assert mgr.connect()
+        mgr.start_streams()
+        assert rec._kiwi_sources_idle()
+        mgr.stop_streams()                     # supervisor thread exits
+        assert not mgr.supervisor_alive()
+        assert not rec._kiwi_sources_idle()
+    finally:
+        mgr.shutdown()
+
+
+def test_watchdog_exemption_for_never_answered_kiwi_without_supervisor():
+    """A Kiwi that never answered has no supervisor yet; the health loop
+    retries its connect() (test_health_tick_reconnects_kiwi_that_never_
+    answered), so it still counts as idle, not wedged."""
+    cfg = _config()
+    rec = _recorder(cfg)
+    kiwi_src = next(s for s in cfg.sources if s.kind == "kiwisdr")
+    mgr = _kiwi_manager(rec, kiwi_src, behaviour="unreachable",
+                        start_supervisor=True)
+    try:
+        assert not mgr.connect()
+        assert not mgr.supervisor_alive()
+        assert rec._kiwi_sources_idle()
+    finally:
+        mgr.shutdown()
+
+
+def test_watchdog_exemption_survives_concurrent_manager_changes():
+    """receiver_managers changing under the check (shutdown/rebuild on
+    another thread) reads as not idle, never an exception."""
+    cfg = _config()
+    rec = _recorder(cfg)
+
+    class Exploding(dict):
+        def values(self):
+            raise RuntimeError("dictionary changed size during iteration")
+
+    rec.receiver_managers = Exploding()
+    assert rec._kiwi_sources_idle() is False
+
+
+def test_custom_key_kiwi_source_gets_host_clock_sidecar(t6_authority,
+                                                        tmp_path):
+    """A kiwisdr [[source]] with a custom key= is still timed by the host
+    clock: the sidecar is chosen by the source's kind, not its key text."""
+    cfg = _config(TOML.replace('kiwisdr = "10.22.23.70:8073"',
+                               'kiwisdr = "10.22.23.70:8073"\n'
+                               'key = "lab-kiwi"'))
+    rec = _recorder(cfg)
+    assert any(s.key == "lab-kiwi" and s.kind == "kiwisdr"
+               for s in cfg.sources)
+    writer = WavWriter(output_dir=tmp_path, sample_rate=12000,
+                       sample_format="float32",
+                       timing_service=rec.timing_service,
+                       host_clock_only=rec._is_kiwi_source)
+
+    def sidecar(rx_source):
+        req = DecodeRequest(
+            frequency_hz=F20, band_name="20",
+            modes=[DecodeMode.W2], period_seconds=120,
+            start_wallclock=datetime(2026, 11, 22, 12, 0,
+                                     tzinfo=timezone.utc),
+            start_rtp_timestamp=0, end_rtp_timestamp=1_440_000,
+            samples=np.zeros(1_440_000, np.float32), gaps=[],
+            rx_source=rx_source)
+        wav = writer.write_period(req)
+        return json.loads(wav.with_suffix(".json").read_text())["timing"]
+
+    kiwi_timing = sidecar("lab-kiwi")
+    assert "T6" not in json.dumps(kiwi_timing)
+    assert kiwi_timing["timing_authority"]["source"] == "standalone-fallback"
+    assert sidecar(RADIOD)["timing_source"] == "HF_TIMESTD_T6"
+
+
+def test_recorder_wires_wav_writer_host_clock_to_source_kind():
+    """__main__ hands WavWriter the kind-based predicate it uses itself."""
+    import inspect
+    from wspr_recorder import __main__ as m
+    src = inspect.getsource(m.WsprRecorder)
+    assert "host_clock_only=self._is_kiwi_source" in src
 
 
 def test_kiwi_overloads_never_poll_the_radiod():

@@ -213,3 +213,24 @@ def test_keepalive_sent_periodically_once_connected():
     time.sleep(0.15)
     ch.stop()
     assert ws.sent.count("SET keepalive") >= 2
+
+
+@pytest.mark.parametrize("code,meaning", [
+    (2, "still determining local interface address"),
+    (3, "not allowed from this IP"),
+    (5, "multiple connections from the same IP not allowed"),
+    (6, "database update in progress"),
+    (9, "unknown"),
+])
+def test_badp_other_than_1_is_refused_not_auth_failed(code, meaning):
+    """Only badp=1 is a wrong password (Beagle_SDR_GPS web/kiwi/kiwi.js
+    BADP_TRY_AGAIN); the other codes are transient or policy refusals,
+    retried like too_busy, with the code's meaning in the detail."""
+    rec, ws = Recorder(), FakeWS()
+    ch = _channel(rec)
+    _replay(ch, ws, [f"MSG badp={code}".encode()], _snd_frames()[:3])
+    assert rec.states and rec.states[0][0] == "refused"
+    assert f"badp={code}" in rec.states[0][1]
+    assert meaning in rec.states[0][1]
+    assert rec.audio == []
+    assert ws.closed

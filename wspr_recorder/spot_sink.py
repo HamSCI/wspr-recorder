@@ -865,6 +865,10 @@ class CycleBatcher:
         # Bands radiod cannot produce (above ADC Nyquist), per rx_source.
         # Set by the receiver manager; excluded from the expected set.
         self._unproducible_bands: dict = {}
+        # {rx_source: {band: epoch}}: a band producible again only from
+        # the cycle starting at ``epoch`` (a reconnected KiwiSDR channel
+        # cannot produce the cycle it joined mid-way).
+        self._producible_from: dict = {}
         self._stop = threading.Event()
         # Wake callback — invoked after every flush that committed
         # spots so an in-process uploader can pump immediately
@@ -945,7 +949,8 @@ class CycleBatcher:
             }
 
     def set_band_producible(self, rx_source: str, band: str,
-                            producible: bool) -> None:
+                            producible: bool, *,
+                            from_epoch: Optional[float] = None) -> None:
         """Record whether radiod can produce ``band`` for ``rx_source``.
 
         The receiver manager skips bands above the ADC Nyquist; those
@@ -953,13 +958,25 @@ class CycleBatcher:
         expected set.  ``producible=True`` restores a band once the
         manager provisions it (after a process restart or full_reset
         re-learns a higher sample rate).
+
+        ``from_epoch`` (with ``producible=True``) restores the band only
+        for cycles starting at or after that UTC epoch second: a KiwiSDR
+        channel reconnected before a boundary produces from that boundary
+        on, so the earlier cycle it missed must not wait for it.  None
+        restores it for every cycle (the radiod path).
         """
         with self._lock:
             skipped = self._unproducible_bands.setdefault(rx_source, set())
+            bounds = self._producible_from.setdefault(rx_source, {})
             if producible:
                 skipped.discard(band)
+                if from_epoch is None:
+                    bounds.pop(band, None)
+                else:
+                    bounds[band] = float(from_epoch)
             else:
                 skipped.add(band)
+                bounds.pop(band, None)
 
     def unproducible_bands(self, rx_source: str) -> set:
         """Bands radiod cannot produce for ``rx_source`` (a copy)."""
@@ -1006,8 +1023,9 @@ class CycleBatcher:
         epoch_sec = int(dt.timestamp())
         expected: set = set()
         skipped = self._unproducible_bands.get(rx_source, ())
+        bounds = self._producible_from.get(rx_source, {})
         for band, periods in bands_for_source.items():
-            if band in skipped:
+            if band in skipped or epoch_sec < bounds.get(band, epoch_sec):
                 continue
             for p in periods:
                 if p > 0 and epoch_sec % p == 0:

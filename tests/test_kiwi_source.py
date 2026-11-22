@@ -8,7 +8,8 @@ import numpy as np
 import pytest
 
 from wspr_recorder.config import SourceConfig
-from wspr_recorder.kiwi_source import KiwiSourceManager, STALL_TIMEOUT_S
+from wspr_recorder.kiwi_source import (
+    AUTH_RETRY_S, RECONNECT_LEAD_S, KiwiSourceManager, STALL_TIMEOUT_S)
 from wspr_recorder.receiver_manager import ChannelSink
 
 F20, F30, F40 = 14095600, 10138700, 7038600
@@ -48,6 +49,9 @@ class FakeChannel:
             self.on_state("refused", "too_busy=1")
         elif b == "badp":
             self.on_state("auth_failed", "badp=1")
+        elif b == "badp5":
+            self.on_state("refused", "badp=5 (multiple connections from "
+                                     "the same IP not allowed)")
         elif b == "unreachable":
             self.on_state("dropped", "connection refused")
 
@@ -79,6 +83,8 @@ class Rig:
         self.dropped = []
         self.restored = []
         self.producible = []
+        self.producible_from = []   # from_epoch of each producible=True
+        self.open_times = []
         cfg = SimpleNamespace(frequencies=list(freqs))
         src = SourceConfig(key=f"kiwisdr:{HOST}:8073", status_address="",
                            kind="kiwisdr", host=HOST, http_port=8073,
@@ -90,6 +96,7 @@ class Rig:
 
     def make_channel(self, *a, **kw):
         ch = FakeChannel(self.behaviour, self.rate, *a, **kw)
+        self.open_times.append(self.clock.t)
         self.channels.append(ch)
         return ch
 
@@ -112,8 +119,10 @@ class Rig:
                 self.restored.append(ssrc),
                 self.events.append(("restored", ssrc))))
 
-    def on_producible(self, source_key, band, producible):
+    def on_producible(self, source_key, band, producible, from_epoch=None):
         self.producible.append((source_key, band, producible))
+        if producible:
+            self.producible_from.append(from_epoch)
 
     def live(self, freq):
         """The most recent channel for freq."""
@@ -180,16 +189,46 @@ def test_refused_band_not_producible_and_retried_next_cycle():
     assert rig.starts(F20) == 1
 
 
-def test_auth_failed_not_retried(caplog):
+def test_auth_failed_retried_hourly_not_per_cycle(caplog):
+    """badp=1 (wrong password) is a config fault: logged as one, and
+    retried on a slow cadence (AUTH_RETRY_S), never once per cycle."""
     rig = Rig([F20], behaviour={F20: "badp"})
     with caplog.at_level(logging.ERROR, logger="wspr_recorder.kiwi_source"):
         rig.mgr.connect()
         rig.mgr.start_streams()
+        rig.advance(AUTH_RETRY_S - 2 * 120)
+        assert rig.starts(F20) == 1
+        rig.advance(2 * 120 + 1)
+        assert rig.starts(F20) == 2
+        # Still wrong: the next try is another hour away.
+        rig.advance(AUTH_RETRY_S - 2 * 120)
+        assert rig.starts(F20) == 2
+        # Password fixed: the hourly retry gets the channel.
+        rig.behaviour[F20] = "connect"
+        rig.advance(2 * 120 + 1)
+    assert rig.starts(F20) == 3
+    assert rig.mgr.get_status()["channels_obtained"] == 1
+    assert (rig.mgr.source_key, "20", False) in rig.producible
+    assert rig.producible[-1] == (rig.mgr.source_key, "20", True)
+    errors = [r.getMessage() for r in caplog.records
+              if "password" in r.getMessage()]
+    assert len(errors) == 2       # one per failed attempt, an hour apart
+    assert all("check password" in m for m in errors)
+
+
+def test_other_badp_codes_retried_once_per_cycle(caplog):
+    """A non-password badp (here 5: multiple connections from one IP) is
+    retried once per cycle like too_busy, and the log names its meaning."""
+    rig = Rig([F20], behaviour={F20: "badp5"})
+    with caplog.at_level(logging.WARNING, logger="wspr_recorder.kiwi_source"):
+        rig.mgr.connect()
+        rig.mgr.start_streams()
         rig.advance(600)
-    assert rig.producible == [(rig.mgr.source_key, "20", False)]
-    assert rig.starts(F20) == 1
-    errors = [r for r in caplog.records if "password" in r.getMessage()]
-    assert len(errors) == 1
+    assert rig.starts(F20) == 1 + 5
+    assert rig.mgr.get_status()["channels"][F20]["state"] == "refused"
+    msgs = [r.getMessage() for r in caplog.records]
+    assert any("multiple connections from the same IP" in m for m in msgs)
+    assert not any("password" in m for m in msgs)
 
 
 def test_samples_reach_band_recorder_at_12000():
@@ -228,7 +267,7 @@ def test_audio_before_start_streams_is_not_delivered():
     assert rig.received[F20] == []
 
 
-def test_drop_records_gap_and_reconnects_at_cycle_boundary():
+def test_drop_records_gap_and_reconnects_before_cycle_boundary():
     clock = FakeClock(1_000_080.0)          # cycle starts at 999_960 + 120
     rig = Rig([F20], clock=clock)
     rig.mgr.connect()
@@ -239,11 +278,14 @@ def test_drop_records_gap_and_reconnects_at_cycle_boundary():
     rig.live(F20).on_state("dropped", "1006 reset")
     assert rig.dropped == [F20]
     assert rig.mgr.get_status()["channels_obtained"] == 0
-    # No reconnect before the next even-minute boundary (1_000_200).
-    rig.advance(1_000_199.0 - clock.t, audio=False)
+    # Reconnect RECONNECT_LEAD_S before the next even-minute boundary
+    # (1_000_200), so the first audio anchors on that boundary.
+    reopen = 1_000_200.0 - RECONNECT_LEAD_S
+    rig.advance(reopen - 1.0 - clock.t, audio=False)
     assert rig.starts(F20) == 1
     rig.advance(2.0, audio=False)
     assert rig.starts(F20) == 2
+    assert reopen <= rig.open_times[-1] < 1_000_200.0
     assert rig.restored == [F20]              # recorder resets: no stitching
     # First audio after reconnect carries the gap of the missing length.
     n_before = len(rig.received[F20])
@@ -252,7 +294,7 @@ def test_drop_records_gap_and_reconnects_at_cycle_boundary():
     assert len(gaps) == 1
     expected = round((clock.t - (1.0 - 512 / 12000) - last_audio) * 12000)
     assert abs(gaps[0].duration_samples - expected) <= 512 + 1
-    assert gaps[0].duration_samples > 115 * 12000
+    assert gaps[0].duration_samples > 100 * 12000
     # Only the first batch after reconnect carries it.
     assert all(g == [] for _, g, _ in rig.received[F20][n_before + 1:])
 
@@ -271,7 +313,7 @@ def test_stalled_channel_is_treated_as_dropped():
     # Late audio from the abandoned channel is ignored.
     ch.on_audio(np.zeros(512, np.float32), clock.t)
     n = len(rig.received[F20])
-    rig.advance(1_000_201.0 - clock.t, audio=False)
+    rig.advance(1_000_201.0 - RECONNECT_LEAD_S - clock.t, audio=False)
     assert rig.starts(F20) == 2
     assert len(rig.received[F20]) == n
     rig.feed(F20, 0.5)
@@ -322,7 +364,7 @@ def test_bad_rate_mid_stream_is_an_outage():
     assert rig.producible[-1] == (rig.mgr.source_key, "20", False)
     assert rig.mgr.get_status()["channels"][F20]["state"] == "bad_rate"
     mark = len(rig.events)
-    rig.advance(1_000_201.0 - clock.t, audio=False)
+    rig.advance(1_000_201.0 - RECONNECT_LEAD_S - clock.t, audio=False)
     assert rig.starts(F20) == 2
     rig.feed(F20, 0.5)
     # The recorder is reset before any post-reconnect audio reaches it.
@@ -343,7 +385,7 @@ def test_refused_mid_stream_is_an_outage():
     rig.live(F20).on_state("refused", "down")
     assert rig.dropped == [F20]
     assert rig.mgr.get_status()["channels"][F20]["state"] == "refused"
-    rig.advance(1_000_201.0 - clock.t, audio=False)
+    rig.advance(1_000_201.0 - RECONNECT_LEAD_S - clock.t, audio=False)
     assert rig.restored == [F20]
 
 
@@ -358,9 +400,11 @@ def test_connecting_channel_that_never_answers_is_retried():
     st = rig.mgr.get_status()["channels"][F30]
     assert st["state"] == "unreachable"
     assert (rig.mgr.source_key, "30", False) in rig.producible
-    # Retried once at the next cycle boundary (t=1_000_080), not before.
+    # Retried once, RECONNECT_LEAD_S before the next cycle boundary
+    # (t=1_000_080), not before.
+    rig.advance(1_000_080.0 - RECONNECT_LEAD_S - 1.0 - rig.clock.t)
     assert rig.starts(F30) == 1
-    rig.advance(1_000_081.0 - rig.clock.t)
+    rig.advance(2.0)
     assert rig.starts(F30) == 2
 
 
@@ -372,3 +416,63 @@ def test_no_channel_opened_after_shutdown():
     n = len(rig.channels)
     rig.mgr._open(band)
     assert len(rig.channels) == n
+
+
+def test_refused_retries_open_before_boundary_once_per_cycle():
+    """Every retry opens RECONNECT_LEAD_S before an even minute, one per
+    2-minute cycle, never a second try at the boundary itself."""
+    rig = Rig([F30], behaviour={F30: "refuse"})
+    rig.mgr.connect()
+    rig.mgr.start_streams()
+    rig.advance(1200)
+    retries = rig.open_times[1:]
+    assert len(retries) == 10
+    for t in retries:
+        assert 120 - RECONNECT_LEAD_S <= t % 120 < 120 - RECONNECT_LEAD_S + 1
+    cycles = [int((t + RECONNECT_LEAD_S) // 120) for t in retries]
+    assert cycles == sorted(set(cycles))
+
+
+def test_drop_inside_lead_window_reopens_for_the_next_cycle():
+    """A channel lost in the last RECONNECT_LEAD_S of a cycle has not
+    had its attempt for the next cycle yet: it reopens straight away
+    (once), not a whole cycle later."""
+    clock = FakeClock(1_000_080.0)
+    rig = Rig([F20], clock=clock)
+    rig.mgr.connect()
+    rig.mgr.start_streams()
+    rig.advance(1_000_195.0 - clock.t)
+    rig.live(F20).connected = False
+    rig.behaviour[F20] = "refuse"
+    rig.live(F20).on_state("dropped", "1006 reset")
+    rig.advance(2.0, audio=False)
+    assert rig.starts(F20) == 2
+    # Refused for 1_000_200: the next try is for 1_000_320, not sooner.
+    rig.advance(1_000_309.0 - clock.t, audio=False)
+    assert rig.starts(F20) == 2
+    rig.advance(2.0, audio=False)
+    assert rig.starts(F20) == 3
+
+
+def test_reconnected_band_producible_only_from_its_first_full_cycle():
+    """A drop makes the band unproducible at once (its cycle is lost); the
+    reconnect makes it producible again only from the minute boundary its
+    first audio anchors on, so the batcher never waits for the cycle the
+    band joined mid-way."""
+    clock = FakeClock(1_000_080.0)
+    rig = Rig([F20], clock=clock)
+    rig.mgr.connect()
+    rig.mgr.start_streams()
+    rig.feed(F20, 5.0)
+    key = rig.mgr.source_key
+    assert (key, "20", True) in rig.producible
+    rig.live(F20).connected = False
+    rig.live(F20).on_state("dropped", "1006 reset")
+    assert rig.producible[-1] == (key, "20", False)
+    rig.advance(1_000_200.0 - RECONNECT_LEAD_S + 0.5 - clock.t, audio=False)
+    assert rig.starts(F20) == 2
+    # Connected but no audio yet: still unproducible.
+    assert rig.producible[-1] == (key, "20", False)
+    rig.feed(F20, 0.5)
+    assert rig.producible[-1] == (key, "20", True)
+    assert rig.producible_from[-1] == 1_000_200.0

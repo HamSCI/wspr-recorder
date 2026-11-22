@@ -196,6 +196,7 @@ class WavWriter:
         sample_format: str = "int16",
         timing_service: Optional['TimingService'] = None,
         float_capable: Optional[Callable[[], bool]] = None,
+        host_clock_only: Optional[Callable[[str], bool]] = None,
     ):
         """
         Initialize WAV writer.
@@ -209,12 +210,18 @@ class WavWriter:
                 read IEEE-float?  When it says no, a "float32" writer
                 writes int16 instead (stock WSJT-X wsprd/jt9 read float
                 WAVs as garbage and report nothing).  None = trust config.
+            host_clock_only: Asked per period with the slot's rx_source:
+                is that source timed by this host's clock (a KiwiSDR)?
+                Its sidecar then never claims radiod's hf-timestd
+                authority.  Decided by the caller from the source's kind,
+                never from the key text.  None = no such sources.
         """
         self.output_dir = Path(output_dir)
         self.sample_rate = sample_rate
         self.sample_format = sample_format
         self.timing_service = timing_service
         self.float_capable = float_capable
+        self.host_clock_only = host_clock_only
         self._float_refused = False
         
         # Ensure output directory exists
@@ -472,8 +479,9 @@ class WavWriter:
                         sample_rate=self.sample_rate,
                         # A Kiwi band is timed by the host clock, never by
                         # radiod's hf-timestd authority (spec §7b.4).
-                        host_clock_only=(request.rx_source or "").startswith(
-                            "kiwisdr:"),
+                        host_clock_only=bool(
+                            self.host_clock_only is not None
+                            and self.host_clock_only(request.rx_source or "")),
                     )
                     timing_dict = timing_metadata.to_dict()
                 except Exception as e:
