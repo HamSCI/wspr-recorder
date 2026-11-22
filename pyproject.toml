@@ -32,6 +32,7 @@ dependencies = [
     "callhash>=1.0.0",
     "hs-uploader>=0.1.0",
     "hamsci-dsp>=0.8.0",
+    "websocket-client>=1.6",
 ]
 
 [tool.uv.sources]
