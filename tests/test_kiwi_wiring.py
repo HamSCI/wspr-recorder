@@ -555,3 +555,81 @@ def test_kiwi_status_reports_gps_fix_field():
         assert st["kiwi_gps_fix"] is False
     finally:
         mgr.shutdown()
+
+
+# --- a drop just after the cycle boundary keeps the completed cycle --------
+
+class _Clock:
+    def __init__(self, t):
+        self.t = t
+
+    def __call__(self):
+        return self.t
+
+
+def _drop_after_boundary(monkeypatch, past_boundary_s, in_rate=12000.0):
+    """Connect at :32 of an odd minute (like the lab run at 21:09:32Z),
+    stream through the whole next even-minute cycle plus
+    ``past_boundary_s``, then have the Kiwi close the socket and reconnect.
+    Returns the start times of every slot the recorder handed on."""
+    import wspr_recorder.band_recorder as br
+
+    cycle_start = 1_795_000_000 - 1_795_000_000 % 120 + 120   # an even minute
+    clock = _Clock(cycle_start - 28.0)                        # hh:m9:32
+
+    class FakeDatetime(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime.fromtimestamp(clock.t, tz=tz)
+
+    monkeypatch.setattr(br, "datetime", FakeDatetime)
+    cfg = _config()
+    rec = _recorder(cfg)
+    kiwi_src = next(s for s in cfg.sources if s.kind == "kiwisdr")
+    channels = []
+    mgr = KiwiSourceManager(
+        rec.config,
+        lambda ssrc, st, sk=kiwi_src.key: rec._build_sink(
+            ssrc, st, source_key=sk),
+        kiwi_src, None, clock=clock,
+        channel_factory=lambda *a, **kw: channels.append(
+            FakeChannel(*a, **kw)) or channels[-1],
+        start_supervisor=False)
+    try:
+        mgr.connect()
+        mgr.start_streams()
+        ch = next(c for c in channels if c.freq_hz == F20)
+        ch.sample_rate = in_rate
+        frame = 1200
+        n_frames = int(round((28.0 + 120.0 + past_boundary_s) * 12000 / frame))
+        for _ in range(n_frames):
+            clock.t += frame / 12000
+            ch.on_audio(np.zeros(frame, np.float32), 0.0)
+        with mock.patch("os._exit", side_effect=AssertionError("os._exit")):
+            ch.on_state("dropped", "socket closed")
+            clock.t += 1.0
+            mgr._open(mgr._bands[F20])
+            for _ in range(10):
+                clock.t += frame / 12000
+                channels[-1].on_audio(np.zeros(frame, np.float32), 0.0)
+        return cycle_start, [
+            c.args[1].start_wallclock.timestamp()
+            for c in rec.executor.submit.call_args_list
+            if c.args[1].band_name == "20"]
+    finally:
+        mgr.shutdown()
+
+
+@pytest.mark.parametrize("past_boundary_s", [4.0, 8.0, 0.0])
+def test_kiwi_drop_after_boundary_keeps_completed_cycle(monkeypatch,
+                                                        past_boundary_s):
+    cycle_start, slots = _drop_after_boundary(monkeypatch, past_boundary_s)
+    assert slots == [cycle_start]
+
+
+def test_kiwi_drop_after_boundary_keeps_cycle_with_crystal_rate(monkeypatch):
+    """A crystal-clocked Kiwi (~12001.1 Hz) is resampled; the completed
+    cycle must still be handed on before the drop."""
+    cycle_start, slots = _drop_after_boundary(monkeypatch, 4.0,
+                                              in_rate=12001.1)
+    assert slots == [cycle_start]
