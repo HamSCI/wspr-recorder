@@ -8,7 +8,7 @@
 
 **Tech Stack:** Python 3.11, numpy, scipy.signal (resampling), `websocket-client` (Kiwi WebSocket), pytest. No `kiwiclient` dependency (it is not on PyPI and vendors its own websocket stack); the Kiwi audio protocol subset we need is small and is pinned by recorded-frame tests.
 
-**Spec:** sigmond `docs/superpowers/specs/2026-10-30-multi-receiver-station-design.md` §7b (items 1, 4, 6 here; 2, 3, 5 are the sigmond plumbing plan). Rob 2026-11-22: fixed bands first, proven on AI6VN-2 against the Kiwi at 10.20.23.73:8073; ON5KQ waits for scheduling + a parity run vs wsprdaemon.
+**Spec:** sigmond `docs/superpowers/specs/2026-10-30-multi-receiver-station-design.md` §7b (items 1, 4, 6 here; 2, 3, 5 are the sigmond plumbing plan). Rob 2026-11-22: fixed bands first, proven on AI6VN-2 against the lab Kiwi, now at 10.22.23.70:8073 (found by LAN scan 2026-11-22; spec still says .73); ON5KQ waits for scheduling + a parity run vs wsprdaemon.
 
 ## Global Constraints
 
@@ -96,7 +96,7 @@ def test_radiod_source_unchanged():
   `on_audio(samples_int16_as_float32, rx_monotonic)` per SND frame; `on_state(state, detail)` with state in `{"connected", "refused", "auth_failed", "dropped", "bad_rate"}`.
 - Protocol subset (to pin in tests): open `ws://host:port/<epoch_ms>/SND`; send `SET auth t=kiwi p=<password>`; wait for `MSG ... sample_rate=<float>` and `MSG audio_init=…`; send `SET mod=usb low_cut=1340 high_cut=1660 freq=<dial_khz>` where dial = band frequency the same way wspr-recorder tunes radiod (USB dial = WSPR dial frequency), `SET agc=0 hang=0 thresh=-100 slope=6 decay=1000 manGain=60`, `SET compression=0`, `SET ident_user=<user>`, `SET AR OK in=12000 out=44100`, then `SET keepalive` every 5 s. Audio arrives as binary `SND` frames: 3-byte tag, 1 byte flags, 4-byte LE sequence, 2-byte BE S-meter, then big-endian int16 PCM. Refusals arrive as `MSG too_busy=…` / `MSG badp=1`.
 
-- [ ] **Step 1: Record fixtures.** From AI6VN-2 against 10.20.23.73:8073 (read-only, one channel, 30 s): save the server text messages and the first 50 binary frames to `tests/fixtures/kiwi/handshake.jsonl` and `snd_frames.bin` with a small capture script `scripts/kiwi_capture.py` (commit the script). If the Kiwi is unreachable, stop and report — do not invent frames.
+- [ ] **Step 1: Record fixtures.** From AI6VN-2 against 10.22.23.70:8073 (read-only, one channel, 30 s): save the server text messages and the first 50 binary frames to `tests/fixtures/kiwi/handshake.jsonl` and `snd_frames.bin` with a small capture script `scripts/kiwi_capture.py` (commit the script). If the Kiwi is unreachable, stop and report — do not invent frames.
 - [ ] **Step 2: Write the failing tests** (replay fixtures through a fake socket):
 
 ```python
@@ -217,9 +217,9 @@ def test_noise_offset_applied_to_kiwi_rows_only(): ...
 - Create: `docs/KIWISDR.md` (operator note: config example, what "N of M" means, known limits: fixed bands, WSPR only, host-clock timing)
 - Modify: `config.toml.example` (commented kiwisdr `[[source]]` example)
 
-- [ ] **Step 1:** On AI6VN-2 run a test instance (not the station's production instance) with one kiwisdr source for 10.20.23.73:8073, 2–4 WSPR bands, uploads OFF. Announce on the claude-bus before starting (AI6VN-2 is shared with Michael's work).
-- [ ] **Step 2:** Run 2 hours. Expected: every cycle logs "N of N channels obtained"; WAVs 100 % complete; spots decode; dt within ±1 s of the same Kiwi's wsprdaemon spots on wsprnet for overlapping cycles (if WD is still feeding that Kiwi), frequency within ±1 Hz.
-- [ ] **Step 3:** Record the measured noise offset vs wsprdaemon (if available) or vs a co-located radiod band; set it as the documented default for that Kiwi model in `docs/KIWISDR.md` (keep the code default 0.0).
+- [ ] **Step 1:** On AI6VN-2 run a test instance (not the station's production instance) with one kiwisdr source for 10.22.23.70:8073, all 8 WSPR bands on its 8 channels (Rob), uploads OFF. Announce on the claude-bus before starting (AI6VN-2 is shared with Michael's work).
+- [ ] **Step 2:** Run 2 hours. The lab Kiwi has NO antenna (status `ant_connected=0`, GPS no fix), so there will be no spots — Rob 2026-11-22. Expected instead: every cycle logs "8 of 8 channels obtained"; every band writes 100 %-complete 120 s WAVs at 12000 Hz; the decoder runs on each WAV and returns cleanly with 0 spots; noise rows are written for all 8 bands with plausible receiver-floor levels (with manual gain 60 the floor sits near normal radiod levels, not ~-60 dB lower — Rob); `adc_ov` reads a number; disconnect the WebSocket once by hand (kill the test process's socket or restart the Kiwi's listener) and confirm the gap is recorded and the channel returns at the next cycle.
+- [ ] **Step 3:** Record the 8-band noise floor readings in `docs/KIWISDR.md` as the no-antenna baseline for this Kiwi (v1.902, manual gain 60). The calibration offset vs wsprdaemon stays 0.0 in code until the ON5KQ parity run measures it with a real antenna.
 - [ ] **Step 4:** Commit docs. Report results on the bus; the sigmond plumbing plan (§7b.2–3, 5) starts after this.
 
 ---
