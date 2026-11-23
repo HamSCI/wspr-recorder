@@ -96,6 +96,57 @@ def wav_format_tag(path: Path) -> Optional[int]:
     return None
 
 
+# ── fine frequency (ubersdr 262b4db, madpsy PR #6) ─────────────────────
+#
+# `wsprd -F` prints ALL_WSPR.TXT's frequency %13.9f (WSJT-X's %11.7f) and
+# `jt9 --fst4w --fine-freq` fst4_decodes.dat's fsig f9.3 (WSJT-X's f7.1):
+# each decode's frequency measured to 0.001 Hz, no column moved.  Only
+# ubersdr builds since then accept the options, and a decoder handed one it
+# does not know refuses to run, so ask each binary once, as wsprdaemon's
+# decoder_fine_freq_flag does: wsprd's usage (printed when it is run with no
+# arguments) lists "-F fine", `jt9 --help` lists "--fine-freq".  Cached per
+# (path, mtime), so a decoder-set swap is seen at the next decode.
+_WSPRD_FINE_RE = re.compile(r"^ *-F fine", re.MULTILINE)
+_FINE_FREQ_PROBE_TIMEOUT_S = 10
+_FINE_FREQ_CACHE: dict = {}
+
+
+def _help_text(cmd: List[str]) -> Optional[str]:
+    """stdout+stderr of a decoder's help run, or None if it cannot run."""
+    try:
+        r = subprocess.run(cmd, capture_output=True, text=True,
+                           stdin=subprocess.DEVNULL,
+                           timeout=_FINE_FREQ_PROBE_TIMEOUT_S)
+    except (OSError, subprocess.SubprocessError):
+        return None
+    return (r.stdout or "") + (r.stderr or "")
+
+
+def _fine_freq_probe(path: str, help_args: List[str], matches) -> bool:
+    found = shutil.which(path) or path
+    try:
+        mtime = os.path.getmtime(found)
+    except OSError:
+        mtime = None
+    key = (path, tuple(help_args), found, mtime)
+    if key not in _FINE_FREQ_CACHE:
+        text = _help_text([path, *help_args])
+        _FINE_FREQ_CACHE[key] = bool(text is not None and matches(text))
+        logger.info("decoder %s fine frequency: %s", path,
+                    "yes" if _FINE_FREQ_CACHE[key] else "no")
+    return _FINE_FREQ_CACHE[key]
+
+
+def wsprd_has_fine_freq(path: str) -> bool:
+    """True iff the wsprd at `path` takes -F (frequency to 0.001 Hz)."""
+    return _fine_freq_probe(path, [], lambda t: bool(_WSPRD_FINE_RE.search(t)))
+
+
+def jt9_has_fine_freq(path: str) -> bool:
+    """True iff the jt9 at `path` takes --fine-freq (FST4W, 0.001 Hz)."""
+    return _fine_freq_probe(path, ["--help"], lambda t: "--fine-freq" in t)
+
+
 # Regex for jt9 -Y numeric hash: <NNNNNNN> (7-digit zero-padded)
 _HASH22_RE = re.compile(r'<(\d{1,7})>')
 # fst4_decodes.dat leading nutc column: i6.6 → exactly six digits.
@@ -296,13 +347,15 @@ class DecoderRunner:
         kill_after = (WSPRD_TIMEOUT_S if period <= 120
                       else _env_int("WSPR_LONG_DECODE_TIMEOUT_SEC", LONG_DECODE_TIMEOUT_S))
         # Run jt9
+        # --fine-freq: fsig to 0.001 Hz (needs the plotspec touched above).
+        fine = ["--fine-freq"] if jt9_has_fine_freq(self.jt9_path) else []
         cmd = [
             "nice", "-n", "19",
             "timeout", str(kill_after),
             self.jt9_path,
             "-Y",
             "-a", str(self.work_dir),
-            "--fst4w",
+            "--fst4w", *fine,
             "-p", str(period),
             "-f", "1500",
             "-F", "100",
@@ -437,6 +490,8 @@ class DecoderRunner:
         # NOT need a -n flag — the no-drift behavior is built into the binary.
         # v3 conditionally passes -n on some platforms but the v27 binary doesn't
         # accept it.
+        if wsprd_has_fine_freq(wsprd_bin):
+            cmd.append("-F")       # ALL_WSPR.TXT's frequency to 0.001 Hz
         cmd.extend(["-f", f"{self.freq_mhz:.6f}", str(wav_path)])
 
         try:
@@ -607,7 +662,8 @@ class DecoderRunner:
         try:
             snr = int(round(float(parts[14 + off])))    # xsnr
             dt = float(parts[15 + off])                  # xdt
-            fsig_hz = float(parts[16 + off])             # fsig: audio offset (Hz)
+            # fsig: audio offset (Hz); f7.1, or f9.3 with --fine-freq
+            fsig_hz = float(parts[16 + off])
             # jt9's fsig is relative to the WAV's 0 Hz, i.e. to this band's
             # dial.  Keep accepting an absolute value (old fixtures) by size.
             freq_hz = fsig_hz if fsig_hz >= 100_000.0 else self.frequency_hz + fsig_hz
@@ -628,7 +684,13 @@ class DecoderRunner:
             # Derive date/time from context (use placeholder, will be set by caller)
             sync_quality = float(parts[13 + off])  # sync
             nhardmin = int(parts[9 + off])         # nharderrors
-            metric = float(parts[10 + off])        # dmin
+            # w50: the spread, the width holding half the power, in Hz
+            # (the column after fsig).  wsprdaemon's decoding.sh carries
+            # it as the metric ("19 w50 ... metric (repurposed)"), and the
+            # uploader sends metric*1000, i.e. mHz.  Until 2026-11-23 this
+            # read dmin (column 10+off), which reached wsprdaemon.org as
+            # 3000-94600 "spreads" (G3ZIL).
+            metric = float(parts[17 + off])        # w50
 
             return RawSpot(
                 date="", time="",  # filled by caller from WAV filename

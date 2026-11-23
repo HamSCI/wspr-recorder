@@ -43,6 +43,15 @@ NOISE_SCHEMA_VERSION = 1  # wspr.noise rows (rms+fft+overload per cycle)
 # Geodesy (distance, az, lat/lon) is computed downstream by
 # hs-uploader's wsprdaemon transport from grid pairs — no need
 # to denormalise it here.
+#
+# 2026-11-23: rows also carry `frequency_mhz_full` (float MHz, the
+# decoder's full resolution) beside `frequency_hz`.  It is an optional,
+# additive key, so the version is deliberately NOT bumped: the rendered
+# pipelines.toml filters wspr.spots on accepted_schema_versions = [1, 2]
+# (deploy.toml's wspr-wsprnet), `smd update` does not re-render it, and a
+# v3 row would be held from WSPRnet until it was.  Readers that predate
+# the key ignore it; hs-uploader's wsprdaemon transport prefers it and
+# falls back to frequency_hz.
 
 
 
@@ -266,7 +275,13 @@ def spot_to_row(
         "rx_source":       rx_source_eff,
         "reporter_id":     reporter_id_eff,
         "host_id":         host_id,
+        # frequency_hz is the integer-Hz dedupe / GROUP BY key.
+        # frequency_mhz_full is the decoder's frequency as it printed it
+        # (wsprd -F / jt9 --fine-freq: 0.001 Hz; without them 0.1 Hz),
+        # for wsprdaemon.org's extended line.  An additive key, so
+        # SCHEMA_VERSION stays 2: see the note at SCHEMA_VERSION.
         "frequency_hz":    int(round(spot.freq * 1_000_000)),
+        "frequency_mhz_full": float(spot.freq),
         "callsign":        callsign,
         "grid":            grid,
         "snr_db":          int(spot.snr),

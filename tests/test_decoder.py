@@ -116,7 +116,7 @@ class TestParseFst4Line:
         assert (spot.call, spot.grid, spot.power) == ("WB6CXC", "CM88", 30)
         assert abs(spot.sync_quality - 43.16) < 1e-9
         assert spot.nhardmin == 0          # nharderrors (col 10); nsync_qual=80 is col 9
-        assert spot.metric == 0.0          # dmin
+        assert spot.metric == 0.012        # w50 (the spread), not dmin
         assert spot.hash22 is None
 
     def test_real_jt9_line_hash_and_no_grid(self):
