@@ -95,6 +95,20 @@ status = "<configure-via-config-init>"
 # RTP port (all channels share this port, demuxed by SSRC)
 port = 5004
 
+# A KiwiSDR as a source instead of radiod (see docs/KIWISDR.md).  When any
+# [[source]] is present the [radiod] block above is ignored.  Fixed bands,
+# one Kiwi channel per [[band]]; WSPR/FST4W only (no FT8/FT4), so keep
+# the [[band]] modes to W2/F2/F5...  `channels` must be >= the number of
+# bands AND within the Kiwi admin's non-browser (ext_api) connection limit.
+#
+# [[source]]
+# kiwisdr = "10.22.23.70:8073"   # host[:port]; port defaults to 8073
+# channels = 4                   # REQUIRED, positive: audio channels to open
+# password = ""                  # optional Kiwi user password
+# label = "lab Kiwi"             # free text
+# key = "kiwisdr:10.22.23.70:8073"  # optional; default is kiwisdr:<host>:<port>
+# noise_offset_db = 0.0          # dB added to noise rows; 0.0 = uncalibrated
+
 [channel_defaults]
 # Sample rate in Hz (12000 is standard for WSPR)
 sample_rate = 12000
