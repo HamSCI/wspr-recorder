@@ -408,9 +408,11 @@ class WsprRecorder:
             # match v3 bash wsprdaemon-client's zero-cycle-loss
             # behavior.  Lost time: ~30-60 s waiting for the next clean
             # UTC minute boundary, vs 4+ min on the os._exit path.
+            outage_kind = ("source" if self._is_kiwi_source(source_key)
+                           else "radiod")
             logger.warning(
                 f"{channel_state.band_name}: Stream restored after "
-                f"radiod outage — resetting recorder + sync_strategy "
+                f"{outage_kind} outage — resetting recorder + sync_strategy "
                 f"in place (waiting for next UTC minute boundary to "
                 f"resume decoding)"
             )

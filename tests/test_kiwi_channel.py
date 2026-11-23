@@ -205,6 +205,14 @@ def test_unexpected_close_reports_dropped_but_stop_does_not():
     assert "dropped" not in [s for s, _ in rec2.states]
 
 
+def test_close_without_detail_says_connection_closed():
+    rec, ws = Recorder(), FakeWS()
+    ch = _channel(rec)
+    _replay(ch, ws, _server_messages())
+    ch._handle_close(ws, None, None)
+    assert rec.states[-1] == ("dropped", "connection closed")
+
+
 def test_keepalive_sent_periodically_once_connected():
     rec, ws = Recorder(), FakeWS()
     ch = _channel(rec)

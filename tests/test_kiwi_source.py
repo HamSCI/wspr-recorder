@@ -287,16 +287,17 @@ def test_drop_records_gap_and_reconnects_before_cycle_boundary():
     assert rig.starts(F20) == 2
     assert reopen <= rig.open_times[-1] < 1_000_200.0
     assert rig.restored == [F20]              # recorder resets: no stitching
-    # First audio after reconnect carries the gap of the missing length.
+    # The outage goes to stats/logs, never into batch_gaps: the recorder
+    # was reset on reconnect, so a gap would be charged to a whole cycle.
     n_before = len(rig.received[F20])
+    assert rig.mgr.get_status()["channels"][F20]["outage_count"] == 0
     rig.feed(F20, 1.0)
-    _, gaps, _ = rig.received[F20][n_before]
-    assert len(gaps) == 1
-    expected = round((clock.t - (1.0 - 512 / 12000) - last_audio) * 12000)
-    assert abs(gaps[0].duration_samples - expected) <= 512 + 1
-    assert gaps[0].duration_samples > 100 * 12000
-    # Only the first batch after reconnect carries it.
-    assert all(g == [] for _, g, _ in rig.received[F20][n_before + 1:])
+    assert all(g == [] for _, g, _ in rig.received[F20][n_before:])
+    ch = rig.mgr.get_status()["channels"][F20]
+    assert ch["outage_count"] == 1
+    expected = clock.t - (1.0 - 512 / 12000) - last_audio
+    assert abs(ch["outage_missing_s"] - expected) <= 512 / 12000 + 0.01
+    assert ch["outage_missing_s"] > 100
 
 
 def test_stalled_channel_is_treated_as_dropped():
@@ -317,8 +318,9 @@ def test_stalled_channel_is_treated_as_dropped():
     assert rig.starts(F20) == 2
     assert len(rig.received[F20]) == n
     rig.feed(F20, 0.5)
-    _, gaps, _ = rig.received[F20][n]
-    assert len(gaps) == 1 and gaps[0].duration_samples > 100 * 12000
+    assert all(g == [] for _, g, _ in rig.received[F20][n:])
+    st = rig.mgr.get_status()["channels"][F20]
+    assert st["outage_count"] == 1 and st["outage_missing_s"] > 100
 
 
 def test_cycle_log_line_n_of_m(caplog):
@@ -371,8 +373,8 @@ def test_bad_rate_mid_stream_is_an_outage():
     after = rig.events[mark:]
     assert after[0] == ("restored", F20)
     assert after[1:] and all(e == ("samples", F20) for e in after[1:])
-    _, gaps, _ = [b for b in rig.received[F20] if b[1]][0]
-    assert len(gaps) == 1 and gaps[0].duration_samples > 100 * 12000
+    assert all(g == [] for _, g, _ in rig.received[F20])
+    assert rig.mgr.get_status()["channels"][F20]["outage_count"] == 1
 
 
 def test_refused_mid_stream_is_an_outage():
@@ -476,3 +478,79 @@ def test_reconnected_band_producible_only_from_its_first_full_cycle():
     rig.feed(F20, 0.5)
     assert rig.producible[-1] == (key, "20", True)
     assert rig.producible_from[-1] == 1_000_200.0
+
+
+def test_cycle_after_reconnect_is_whole_with_no_gaps(monkeypatch):
+    """A real BandRecorder behind the manager: the first cycle recorded after
+    a drop + reconnect is 1,440,000 samples with 0 gaps (100 % complete)."""
+    from datetime import datetime as real_datetime, timezone
+    from wspr_recorder import band_recorder as br
+    from wspr_recorder.band_recorder import BandRecorder
+    from wspr_recorder.decode_mode import DecodeMode
+    from wspr_recorder.sync_strategy import RtpSyncStrategy
+
+    clock = FakeClock(1_000_080.0)            # an even-minute boundary
+
+    class FakeDT(real_datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return real_datetime.fromtimestamp(clock.t, tz)
+
+    monkeypatch.setattr(br, "datetime", FakeDT)
+    requests = []
+    recorders = {}
+
+    def sink_factory(ssrc, state):
+        rec = BandRecorder(
+            ssrc=ssrc, frequency_hz=state.frequency_hz, band_name="20",
+            sample_rate=12000, decode_modes=[DecodeMode.W2],
+            on_period_complete=requests.append,
+            sync_strategy=RtpSyncStrategy(sample_rate=12000),
+            rx_source="kiwisdr")
+        recorders[ssrc] = rec
+        return ChannelSink(
+            on_samples=rec.on_samples,
+            on_stream_dropped=lambda reason: None,
+            on_stream_restored=lambda info: rec.reset())
+
+    cfg = SimpleNamespace(frequencies=[F20])
+    src = SourceConfig(key=f"kiwisdr:{HOST}:8073", status_address="",
+                       kind="kiwisdr", host=HOST, http_port=8073, channels=8)
+    chans = []
+    behaviour, rate = {}, {}
+
+    def make_channel(*a, **kw):
+        ch = FakeChannel(behaviour, rate, *a, **kw)
+        chans.append(ch)
+        return ch
+
+    mgr = KiwiSourceManager(cfg, sink_factory, src,
+                            lambda *a, **k: None, clock=clock,
+                            channel_factory=make_channel,
+                            start_supervisor=False)
+    _RIGS.append(SimpleNamespace(mgr=mgr))
+    mgr.connect()
+    mgr.start_streams()
+
+    def run(seconds, audio=True):
+        end = clock.t + seconds
+        while clock.t < end:
+            clock.t += 1.0
+            if audio:
+                for c in [c for c in chans if c.connected]:
+                    c.on_audio(np.zeros(12000, np.float32), clock.t)
+            mgr.tick()
+
+    run(70)                                   # synced, mid-cycle
+    chans[-1].connected = False
+    chans[-1].on_state("dropped", "connection closed")
+    # Silent until just before the reconnect (boundary 1_000_200, lead 10 s).
+    run(1_000_200.0 - RECONNECT_LEAD_S - 1 - clock.t, audio=False)
+    run(300)                                  # reconnected, two more cycles
+    assert len(chans) == 2
+    assert requests, "no cycle was produced after the reconnect"
+    first = requests[0]
+    assert first.gaps == []
+    assert len(first.samples) == 1_440_000
+    assert recorders[F20].stats.gaps_detected == 0
+    assert mgr.get_status()["channels"][F20]["outage_count"] == 1

@@ -241,6 +241,27 @@ def test_kiwi_rows_tier_is_not_injected(t6_authority, tmp_path):
 
 # --- carried-forward constraints ------------------------------------------
 
+def test_stream_restored_log_names_source_outage_for_kiwi(caplog, t6_authority):
+    cfg = _config()
+    rec = _recorder(cfg)
+    kiwi_src = next(s for s in cfg.sources if s.kind == "kiwisdr")
+    channels = []
+    mgr = _kiwi_manager(rec, kiwi_src, channels=channels)
+    try:
+        mgr.connect()
+        mgr.start_streams()
+        ch = channels[0]
+        _feed(ch, 1.0)
+        with caplog.at_level(logging.WARNING):
+            ch.on_state("dropped", "connection closed")
+            mgr._open(mgr._bands[ch.freq_hz])
+        msgs = [r.getMessage() for r in caplog.records]
+        assert any("Stream restored after source outage" in m for m in msgs)
+        assert not any("radiod outage" in m for m in msgs)
+    finally:
+        mgr.shutdown()
+
+
 def test_stream_restored_none_keeps_host_clock_strategy(t6_authority):
     """on_stream_restored(None) (a Kiwi reconnect) resets the recorder and
     re-correlates on the host clock; set_channel_info(None) is harmless."""

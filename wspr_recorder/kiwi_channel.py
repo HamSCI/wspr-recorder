@@ -152,7 +152,9 @@ class KiwiChannel:
     def _handle_close(self, ws, status_code=None, reason=None) -> None:
         if self._stopping.is_set() or self._finished:
             return
-        self._finish(ws, "dropped", f"{status_code} {reason or ''}".strip())
+        detail = " ".join(str(x) for x in (status_code, reason)
+                          if x not in (None, "")).strip()
+        self._finish(ws, "dropped", detail or "connection closed")
 
     # ---- protocol ------------------------------------------------------
 

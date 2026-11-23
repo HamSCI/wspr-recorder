@@ -16,8 +16,10 @@ Channel policy (spec §7b.6, never fight web listeners for channels):
 * a channel that drops mid-cycle (or goes silent for ``stall_timeout_s``)
   is reported to the sink as dropped and reconnected for the next cycle.
   On reconnect the sink's ``on_stream_restored`` resets the recorder so no
-  stale samples are stitched across the outage, and the first batch
-  afterwards carries one gap of the missing wall-clock length.
+  stale samples are stitched across the outage.  The outage is NOT put in
+  ``batch_gaps`` (the fresh timeline would charge it to the next, whole
+  cycle); it is logged and counted (``outage_count``,
+  ``outage_missing_s`` in ``get_status()``).
 
 Every retry is for one cycle, the one starting at the next even minute,
 and opens ``RECONNECT_LEAD_S`` before that boundary so its first audio
@@ -141,6 +143,8 @@ class _Band:
     resampler: Optional[StreamResampler] = None
     last_audio_t: Optional[float] = None
     gap_from: Optional[float] = None      # last audio before an outage
+    outage_count: int = 0                 # reconnects after an outage
+    outage_missing_s: float = 0.0         # wall-clock seconds those lost
     awaiting_restore: bool = False        # an outage happened; reset on reconnect
     retry_cycle: Optional[int] = None     # next cycle to attempt (see tick)
     attempt_cycle: Optional[int] = None   # the cycle the last _open was for
@@ -340,6 +344,8 @@ class KiwiSourceManager:
                 "samples_received": cs.samples_received,
                 "drop_count": cs.drop_count,
                 "restore_count": cs.restore_count,
+                "outage_count": b.outage_count,
+                "outage_missing_s": round(b.outage_missing_s, 3),
                 "kiwi_sample_rate": (b.resampler.in_rate
                                      if b.resampler is not None else None),
             }
@@ -611,19 +617,21 @@ class KiwiSourceManager:
             rate = self._rate_of(band)
             if rate != rs.in_rate:
                 rs.set_in_rate(rate)
-            gaps: List[KiwiGap] = []
             if band.gap_from is not None:
-                missing_s = (now - band.gap_from) - len(samples) / rate
-                gaps.append(KiwiGap(
-                    duration_samples=max(0, int(round(missing_s * OUT_RATE))),
-                    start_time=band.gap_from))
+                # The outage is a stats/log item only: on_stream_restored
+                # already reset the recorder onto a fresh timeline, so a
+                # gap in batch_gaps would be charged to a whole new cycle.
+                missing_s = max(0.0, (now - band.gap_from) - len(samples) / rate)
+                band.outage_count += 1
+                band.outage_missing_s += missing_s
+                logger.info("%s %s: audio resumed after an outage of "
+                            "%.1f s", self.source_key, band.band_name,
+                            missing_s)
                 band.gap_from = None
             out = rs.process(samples)
             q = band.quality
-            q.batch_gaps = gaps
+            q.batch_gaps = []
             if len(out) == 0:
-                if gaps:
-                    band.gap_from = gaps[0].start_time  # deliver with next batch
                 return
             q.total_samples_delivered += len(out)
             band.sink.on_samples(out, q)
