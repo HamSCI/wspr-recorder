@@ -227,6 +227,28 @@ frequency = "50293000"     # 6m
 modes = ["W2"]
 
 # --------------------------------------------------------------------------
+# Carrier archive (optional, OFF by default) — see docs/CARRIER-ARCHIVE.md
+#
+# Keeps each WSPR / FST4W spot's carrier, its modulation removed, as a small
+# 15 Hz IQ .wav (about 13 KB per WSPR-2 spot):
+#   <root>/YYYYMMDD/<reporter id>/<band>/HHMM_MODE_CALL_RFHZ.wav
+# Needs the ubersdr decoders at 5eeeb53 or later (wsprd -I, jt9
+# --carrier-dir); with older decoders nothing is written and decoding is
+# unchanged.  Browse it with the wspr-carrier-browser.service unit
+# (127.0.0.1:8089; reach it with ssh -L 8089:127.0.0.1:8089 <host>).
+#
+# [carrier_archive]
+# enabled = false
+# # On disk, under the unit's StateDirectory; NOT /dev/shm (RAM).
+# root = "/var/lib/wspr-recorder/carrier-archive"
+# # Whole UTC days kept, today included.
+# max_age_days = 3
+# # Then the oldest days go while the file system holding root is fuller
+# # than this percentage (the newest day is always kept).
+# max_disk_pct = 90
+# --------------------------------------------------------------------------
+
+# --------------------------------------------------------------------------
 # Legacy format (backward compatible, used if no [[band]] sections above)
 # All bands default to W2 (WSPR-2) only.
 # --------------------------------------------------------------------------

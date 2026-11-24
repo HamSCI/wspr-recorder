@@ -16,10 +16,12 @@ import struct
 import subprocess
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import List, Optional
 
 from .callsign_db import CallsignDB
+from .carrier_archive import CarrierArchive
 from .decode_health import HEALTH
 from .decode_mode import DecodeMode, DECODE_MODE_PKT_MODES
 
@@ -106,8 +108,14 @@ def wav_format_tag(path: Path) -> Optional[int]:
 # decoder_fine_freq_flag does: wsprd's usage (printed when it is run with no
 # arguments) lists "-F fine", `jt9 --help` lists "--fine-freq".  Cached per
 # (path, mtime), so a decoder-set swap is seen at the next decode.
+#
+# The carrier archive's options (ubersdr 5eeeb53, madpsy PR #6) are probed
+# the same way: wsprd's usage lists "-I dir:", `jt9 --help` "--carrier-dir".
 _WSPRD_FINE_RE = re.compile(r"^ *-F fine", re.MULTILINE)
+_WSPRD_CARRIER_RE = re.compile(r"^ *-I dir", re.MULTILINE)
 _FINE_FREQ_PROBE_TIMEOUT_S = 10
+# (path, help args, resolved path, mtime, option) -> bool.  The option is in
+# the key: wsprd's -F and -I are both read from the same bare usage text.
 _FINE_FREQ_CACHE: dict = {}
 
 
@@ -122,29 +130,46 @@ def _help_text(cmd: List[str]) -> Optional[str]:
     return (r.stdout or "") + (r.stderr or "")
 
 
-def _fine_freq_probe(path: str, help_args: List[str], matches) -> bool:
+def _option_probe(path: str, help_args: List[str], option: str,
+                  matches) -> bool:
+    """True iff the decoder at `path` lists `option` in its help text.
+    Asked once per (path, mtime, option); False if it cannot run."""
     found = shutil.which(path) or path
     try:
         mtime = os.path.getmtime(found)
     except OSError:
         mtime = None
-    key = (path, tuple(help_args), found, mtime)
+    key = (path, tuple(help_args), found, mtime, option)
     if key not in _FINE_FREQ_CACHE:
         text = _help_text([path, *help_args])
         _FINE_FREQ_CACHE[key] = bool(text is not None and matches(text))
-        logger.info("decoder %s fine frequency: %s", path,
+        logger.info("decoder %s option %s: %s", path, option,
                     "yes" if _FINE_FREQ_CACHE[key] else "no")
     return _FINE_FREQ_CACHE[key]
 
 
 def wsprd_has_fine_freq(path: str) -> bool:
     """True iff the wsprd at `path` takes -F (frequency to 0.001 Hz)."""
-    return _fine_freq_probe(path, [], lambda t: bool(_WSPRD_FINE_RE.search(t)))
+    return _option_probe(path, [], "-F",
+                         lambda t: bool(_WSPRD_FINE_RE.search(t)))
 
 
 def jt9_has_fine_freq(path: str) -> bool:
     """True iff the jt9 at `path` takes --fine-freq (FST4W, 0.001 Hz)."""
-    return _fine_freq_probe(path, ["--help"], lambda t: "--fine-freq" in t)
+    return _option_probe(path, ["--help"], "--fine-freq",
+                         lambda t: "--fine-freq" in t)
+
+
+def wsprd_has_carrier_dir(path: str) -> bool:
+    """True iff the wsprd at `path` takes -I DIR (each decode's carrier)."""
+    return _option_probe(path, [], "-I",
+                         lambda t: bool(_WSPRD_CARRIER_RE.search(t)))
+
+
+def jt9_has_carrier_dir(path: str) -> bool:
+    """True iff the jt9 at `path` takes --carrier-dir DIR (FST4W carriers)."""
+    return _option_probe(path, ["--help"], "--carrier-dir",
+                         lambda t: "--carrier-dir" in t)
 
 
 # Regex for jt9 -Y numeric hash: <NNNNNNN> (7-digit zero-padded)
@@ -195,6 +220,7 @@ class DecoderRunner:
         wsprd_path: str = "wsprd",
         wsprd_spread_path: Optional[str] = None,
         jt9_path: str = "jt9",
+        carrier_archive: Optional[CarrierArchive] = None,
     ):
         self.band_name = band_name
         self.frequency_hz = frequency_hz
@@ -204,6 +230,9 @@ class DecoderRunner:
         self.wsprd_path = wsprd_path
         self.wsprd_spread_path = wsprd_spread_path
         self.jt9_path = jt9_path
+        # None: no carrier archive, and the decoder command lines are
+        # exactly what they were before it existed.
+        self.carrier_archive = carrier_archive
 
         # Ensure work directory exists
         self.work_dir.mkdir(parents=True, exist_ok=True)
@@ -230,6 +259,23 @@ class DecoderRunner:
 
     def decode_wspr(self, wav_path: Path,
                     cycle_start: Optional[float] = None) -> List[RawSpot]:
+        """Decode a WSPR-2 WAV (see ``_decode_wspr``) and, when the carrier
+        archive is on, file each decode's carrier afterwards."""
+        self._check_input(wav_path, self.wsprd_path)
+        p1 = self._carrier_scratch(self.wsprd_path, wsprd_has_carrier_dir, "p1")
+        p2 = (self._carrier_scratch(self.wsprd_spread_path,
+                                    wsprd_has_carrier_dir, "p2")
+              if self.wsprd_spread_path else None)
+        try:
+            return self._decode_wspr(wav_path, cycle_start, p1, p2)
+        finally:
+            # p2 first: the -n (spreading) pass's carrier wins, as its spot
+            # does in _merge_wspr_passes.
+            self._file_carriers([p2, p1], "W2", wav_path, cycle_start)
+
+    def _decode_wspr(self, wav_path: Path, cycle_start: Optional[float],
+                     carrier_p1: Optional[Path] = None,
+                     carrier_p2: Optional[Path] = None) -> List[RawSpot]:
         """
         Run wsprd twice (standard + spreading), merge via best-spot logic.
 
@@ -241,7 +287,6 @@ class DecoderRunner:
 
         Returns merged spots with pkt_mode=2 (WSPR-2).
         """
-        self._check_input(wav_path, self.wsprd_path)
         # Per operator decision 2026-05-19: don't feed CallsignDB into
         # wsprd's hashtable.  wsprd maintains its own per-band
         # hashtable.txt across invocations (the working-dir state file
@@ -266,6 +311,7 @@ class DecoderRunner:
         # Run standard pass
         standard_spots = self._run_wsprd(
             wav_path, self.wsprd_path, spreading=False, killed=_killed,
+            carrier_dir=carrier_p1,
         )
 
         # Run spreading pass — skipped when no spreading binary was
@@ -274,6 +320,7 @@ class DecoderRunner:
         if self.wsprd_spread_path:
             spreading_spots = self._run_wsprd(
                 wav_path, self.wsprd_spread_path, spreading=True, killed=_killed,
+                carrier_dir=carrier_p2,
             )
         else:
             spreading_spots = []
@@ -306,6 +353,21 @@ class DecoderRunner:
     def decode_fst4w(self, wav_path: Path, period: int,
                      mode: DecodeMode,
                      cycle_start: Optional[float] = None) -> List[RawSpot]:
+        """Decode an FST4W WAV (see ``_decode_fst4w``) and, when the carrier
+        archive is on, file each decode's carrier afterwards."""
+        self._check_input(wav_path, self.jt9_path)
+        carrier_dir = self._carrier_scratch(self.jt9_path, jt9_has_carrier_dir,
+                                            mode.value)
+        try:
+            return self._decode_fst4w(wav_path, period, mode, cycle_start,
+                                      carrier_dir)
+        finally:
+            self._file_carriers([carrier_dir], mode.value, wav_path,
+                                cycle_start)
+
+    def _decode_fst4w(self, wav_path: Path, period: int, mode: DecodeMode,
+                      cycle_start: Optional[float],
+                      carrier_dir: Optional[Path] = None) -> List[RawSpot]:
         """
         Run jt9 -Y --fst4w on a period-length WAV file.
 
@@ -317,7 +379,6 @@ class DecoderRunner:
 
         Returns spots with appropriate pkt_mode.
         """
-        self._check_input(wav_path, self.jt9_path)
         # Same gate as for wsprd's hashtable.txt — let jt9 manage its
         # own ``fst4w_calls.txt`` across invocations unless the
         # operator opts back into CallsignDB-driven seeding.
@@ -349,6 +410,10 @@ class DecoderRunner:
         # Run jt9
         # --fine-freq: fsig to 0.001 Hz (needs the plotspec touched above).
         fine = ["--fine-freq"] if jt9_has_fine_freq(self.jt9_path) else []
+        # --carrier-dir: each decode's carrier (carrier_archive.py); only
+        # when the archive is on and this jt9 has it (see decode_fst4w).
+        if carrier_dir is not None:
+            fine += ["--carrier-dir", str(carrier_dir)]
         cmd = [
             "nice", "-n", "19",
             "timeout", str(kill_after),
@@ -421,6 +486,59 @@ class DecoderRunner:
         self._record_health(mode.value, period, cycle_start, _t0, killed=False)
         return spots
 
+    # ------------------------------------------------------------------
+    # Carrier archive (carrier_archive.py)
+    # ------------------------------------------------------------------
+
+    def _carrier_scratch(self, binary: Optional[str], has_option,
+                         label: str) -> Optional[Path]:
+        """A scratch dir for `binary`'s carriers, or None: archive off (no
+        probe is even run), the binary lacks the option, or no dir could be
+        made.  None leaves the command line exactly as it was."""
+        if self.carrier_archive is None or not binary:
+            return None
+        try:
+            if not has_option(binary):
+                return None
+            return self.carrier_archive.scratch_dir(self.work_dir, label)
+        except Exception:                                    # noqa: BLE001
+            logger.warning("%s: carrier archive: probe of %s failed",
+                           self.band_name, binary, exc_info=True)
+            return None
+
+    def _file_carriers(self, dirs: List[Optional[Path]], mode: str,
+                       wav_path: Path, cycle_start: Optional[float]) -> None:
+        """File what the decoders wrote into `dirs` (most preferred first).
+        Never raises: a filing problem must not cost the decode its spots."""
+        if self.carrier_archive is None or not any(dirs):
+            return
+        try:
+            self.carrier_archive.file_cycle(
+                dirs, band=self.band_name, mode=mode,
+                when=self._cycle_time(wav_path, cycle_start),
+                dial_hz=self.frequency_hz,
+            )
+        except Exception:                                    # noqa: BLE001
+            logger.warning("%s %s: carrier archive: filing failed",
+                           self.band_name, mode, exc_info=True)
+        finally:
+            CarrierArchive.discard(dirs)
+
+    @staticmethod
+    def _cycle_time(wav_path: Path, cycle_start: Optional[float]) -> datetime:
+        """The cycle's UTC start: `cycle_start`, else the decoder WAV's
+        ``YYMMDD_HHMM`` name, else now."""
+        if cycle_start is not None:
+            return datetime.fromtimestamp(cycle_start, tz=timezone.utc)
+        m = re.match(r"^(\d{6})_(\d{4})", Path(wav_path).name)
+        if m:
+            try:
+                return datetime.strptime("".join(m.groups()), "%y%m%d%H%M"
+                                         ).replace(tzinfo=timezone.utc)
+            except ValueError:
+                pass
+        return datetime.now(timezone.utc)
+
     def _record_health(self, mode: str, period_s: int,
                        cycle_start: Optional[float], t0: float,
                        *, killed: bool) -> None:
@@ -474,7 +592,8 @@ class DecoderRunner:
 
     def _run_wsprd(self, wav_path: Path, wsprd_bin: str,
                    spreading: bool = False,
-                   killed: Optional[List[bool]] = None) -> List[RawSpot]:
+                   killed: Optional[List[bool]] = None,
+                   carrier_dir: Optional[Path] = None) -> List[RawSpot]:
         """Run a single wsprd pass and parse ALL_WSPR.TXT for new spots."""
         all_wspr_path = self.work_dir / "ALL_WSPR.TXT"
         prev_lines = self._count_lines(all_wspr_path)
@@ -492,6 +611,8 @@ class DecoderRunner:
         # accept it.
         if wsprd_has_fine_freq(wsprd_bin):
             cmd.append("-F")       # ALL_WSPR.TXT's frequency to 0.001 Hz
+        if carrier_dir is not None:  # each decode's carrier (carrier_archive.py)
+            cmd.extend(["-I", str(carrier_dir)])
         cmd.extend(["-f", f"{self.freq_mhz:.6f}", str(wav_path)])
 
         try:

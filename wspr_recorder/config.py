@@ -372,6 +372,65 @@ class RecorderConfig:
         )
 
 
+# The carrier archive lives on disk under the recorder's systemd
+# StateDirectory (/var/lib/wspr-recorder, already in the unit's sandbox
+# ReadWritePaths), NOT under recorder.output_dir, which is /dev/shm (RAM).
+DEFAULT_CARRIER_ARCHIVE_ROOT = "/var/lib/wspr-recorder/carrier-archive"
+
+
+@dataclass
+class CarrierArchiveConfig:
+    """``[carrier_archive]``: keep each WSPR/FST4W spot's carrier .wav.
+
+    Off by default.  When enabled, the ubersdr decoders' ``wsprd -I DIR``
+    and ``jt9 --fst4w --carrier-dir DIR`` write each decode's carrier (its
+    modulation removed, 15 Hz 2-channel float IQ) and the recorder files it
+    as ``root/YYYYMMDD/RECEIVER/BAND/HHMM_MODE_CALL_RFHZ.wav``.  Day
+    directories older than ``max_age_days`` (whole UTC days, today
+    included) are deleted, then the oldest days while the file system
+    holding ``root`` is fuller than ``max_disk_pct``.  See
+    docs/CARRIER-ARCHIVE.md.
+    """
+    enabled: bool = False
+    root: str = DEFAULT_CARRIER_ARCHIVE_ROOT
+    max_age_days: int = 3
+    max_disk_pct: float = 90
+
+    @classmethod
+    def from_dict(cls, data: dict) -> 'CarrierArchiveConfig':
+        d = cls()
+        return cls(
+            enabled=data.get("enabled", d.enabled),
+            root=data.get("root", d.root),
+            max_age_days=data.get("max_age_days", d.max_age_days),
+            max_disk_pct=data.get("max_disk_pct", d.max_disk_pct),
+        )
+
+    def validate(self) -> List[str]:
+        errors = []
+        if not isinstance(self.enabled, bool):
+            errors.append(
+                f"carrier_archive.enabled must be true or false; "
+                f"got {self.enabled!r}")
+        if not isinstance(self.root, str) or not self.root.startswith("/"):
+            errors.append(
+                f"carrier_archive.root must be an absolute path; "
+                f"got {self.root!r}")
+        if (isinstance(self.max_age_days, bool)
+                or not isinstance(self.max_age_days, int)
+                or self.max_age_days < 1):
+            errors.append(
+                f"carrier_archive.max_age_days must be a whole number of "
+                f"days >= 1; got {self.max_age_days!r}")
+        if (isinstance(self.max_disk_pct, bool)
+                or not isinstance(self.max_disk_pct, (int, float))
+                or not 0 < self.max_disk_pct <= 100):
+            errors.append(
+                f"carrier_archive.max_disk_pct must be a number in "
+                f"(0, 100]; got {self.max_disk_pct!r}")
+        return errors
+
+
 @dataclass
 class Config:
     """Complete wspr-recorder configuration.
@@ -393,6 +452,8 @@ class Config:
     frequencies: List[int] = field(default_factory=list)
     bands: List[BandConfig] = field(default_factory=list)
     sources: List[SourceConfig] = field(default_factory=list)
+    carrier_archive: CarrierArchiveConfig = field(
+        default_factory=CarrierArchiveConfig)
 
     def ensure_sources(self) -> None:
         """Backfill ``sources`` from the legacy ``radiod`` section.
@@ -468,6 +529,10 @@ class Config:
         # Validate band configs
         for bc in self.bands:
             errors.extend(bc.validate())
+
+        # Validated even when disabled: a typo shows now, not the day
+        # someone flips enabled = true.
+        errors.extend(self.carrier_archive.validate())
 
         # Validate sources.  Either ``sources`` must be populated
         # (post-ensure_sources()) or the legacy ``radiod.status_address``
@@ -698,6 +763,11 @@ def load_config(config_path: str) -> Config:
             high=ch.get("high", config.channel_defaults.high),
         )
     
+    # Parse [carrier_archive] (optional; off when absent)
+    if "carrier_archive" in data:
+        config.carrier_archive = CarrierArchiveConfig.from_dict(
+            data["carrier_archive"])
+
     # Parse band configurations — new [[band]] format takes precedence
     if "band" in data:
         for band_entry in data["band"]:

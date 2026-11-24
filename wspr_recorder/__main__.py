@@ -35,6 +35,7 @@ from .timing_service import TimingService
 from .ipc_server import IPCServer
 from .decode_mode import DecodeMode
 from .decoder import DecoderRunner, decoders_read_float, wav_format_tag
+from .carrier_archive import CarrierArchive, purge as carrier_archive_purge
 from .callsign_db import CallsignDB
 from .spot_sink import SpotSink, CycleBatcher, resolve_reporter_identity
 from .noise import compute_noise, read_wav_mono_float, overload_delta
@@ -658,9 +659,45 @@ class WsprRecorder:
             wsprd_path=wsprd_path,
             wsprd_spread_path=wsprd_spread,
             jt9_path=jt9_path,
+            # None (the default, [carrier_archive] enabled = false): the
+            # decoder command lines are exactly as before.
+            carrier_archive=self._carrier_archive_for(rx_source),
         )
         self._decoders[cache_key] = runner
         return runner
+
+    def _carrier_archive_for(self, rx_source: str = "") -> Optional[CarrierArchive]:
+        """The CarrierArchive for one source's decoders, or None when
+        [carrier_archive] is not enabled."""
+        cfg = getattr(self.config, "carrier_archive", None)
+        if getattr(cfg, "enabled", False) is not True:
+            return None
+        return CarrierArchive.from_config(cfg, self._carrier_receiver(rx_source))
+
+    def _carrier_receiver(self, rx_source: str = "") -> str:
+        """RECEIVER in the carrier archive's path: the reporter id (e.g.
+        AC0G-B1), else the radiod name; with several sources, the source's
+        slug appended so two receivers on one band never collide.
+        CarrierArchive makes it filesystem-safe (AC0G/S -> AC0G-S)."""
+        from .config import _derive_radiod_id
+        base = self._reporter_id or _derive_radiod_id(
+            self.config.radiod.status_address or "")
+        if rx_source and len(self.config.sources) > 1:
+            from .wav_writer import source_slug as _slug
+            base = f"{base}_{_slug(rx_source)}"
+        return base
+
+    def _purge_carrier_archive(self) -> None:
+        """Purge the carrier archive by age and disk use.  Called from the
+        cleanup timer, never from a decode; never raises."""
+        cfg = getattr(self.config, "carrier_archive", None)
+        if getattr(cfg, "enabled", False) is not True:
+            return
+        try:
+            carrier_archive_purge(cfg.root, max_age_days=cfg.max_age_days,
+                                  max_disk_pct=cfg.max_disk_pct)
+        except Exception as exc:                              # noqa: BLE001
+            logger.warning("carrier archive: purge failed: %s", exc)
 
     @staticmethod
     def _wsprd_compatible_wav(wav_path: Path, work_dir: Path) -> Optional[Path]:
@@ -1355,6 +1392,10 @@ class WsprRecorder:
                     self.wav_writer.enforce_max_files_per_band(
                         self.config.recorder.max_files_per_band
                     )
+                # Carrier archive (off by default): age + disk-use purge,
+                # on this 5-minute timer, off the decode path and off the
+                # event loop.
+                await asyncio.to_thread(self._purge_carrier_archive)
             except asyncio.CancelledError:
                 break
             except Exception as e:
