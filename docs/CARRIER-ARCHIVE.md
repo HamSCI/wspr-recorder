@@ -3,8 +3,14 @@
 > **Audience:** operator/contributor
 > **Status:** new 2026-11-24, off by default, not yet run on a live station
 
-An optional archive of every WSPR / FST4W spot's **carrier**, plus a small
+An optional archive of WSPR / FST4W spots' **carriers**, plus a small
 read-only web page to browse it. Both are **disabled by default**.
+
+**Beta scope: WW0WWV only.** By default only the carriers of **WW0WWV**
+(the WWV-site WSPR beacon) are kept, and the browser's main page compares
+them with WWV's own carrier Doppler. Every other call's carrier is
+discarded as soon as it is decoded. `calls = ["*"]` keeps every call (see
+[Which calls are kept](#which-calls-are-kept)).
 
 ## What it is
 
@@ -69,6 +75,7 @@ enabled = true
 # root = "/var/lib/wspr-recorder/carrier-archive"   # the default
 # max_age_days = 3                                   # whole UTC days kept, today included
 # max_disk_pct = 90                                  # then oldest days go while the fs is fuller
+# calls = ["WW0WWV"]                                 # the default; ["*"] or [] keeps every call
 ```
 
 Then restart `wspr-recorder@<instance>`. Notes:
@@ -102,6 +109,22 @@ Then restart `wspr-recorder@<instance>`. Notes:
   that the WAV cleanup never touches; leftovers from a crash are swept
   when the recorder starts.
 
+## Which calls are kept
+
+`calls` lists the callsigns whose carriers are filed. The default is
+`["WW0WWV"]`. Every other carrier is discarded straight from the decoder's
+scratch directory; nothing of it reaches the archive.
+
+- Matching is on the **base call**, ignoring case: `WW0WWV/P`,
+  `ww0wwv` and `PJ4/WW0WWV` all count as `WW0WWV`.
+- `calls = []` or `calls = ["*"]` keeps **every** call (the archive as it
+  was before the beta).
+- Entries must be letters, digits and `/`, or `"*"`; anything else stops
+  the config from loading.
+
+The browser's main page is about WW0WWV whatever `calls` says. With more
+calls kept, the other spots appear on its **All spots** page.
+
 ## Disk use
 
 A carrier file holds 15 samples/s × 8 bytes for the length of the
@@ -113,6 +136,10 @@ transmission:
 | F5 | ≈ 36 KB |
 | F15 | ≈ 108 KB |
 | F30 | ≈ 216 KB |
+
+With the default `calls = ["WW0WWV"]` the archive is tiny: WW0WWV sends
+on a handful of bands every 2 minutes, so at most a few thousand files a
+day (a few tens of MB). The estimates below are for `calls = ["*"]`.
 
 WSPR-2 dominates. Estimates:
 

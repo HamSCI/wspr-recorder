@@ -246,6 +246,10 @@ modes = ["W2"]
 # # Then the oldest days go while the file system holding root is fuller
 # # than this percentage (the newest day is always kept).
 # max_disk_pct = 90
+# # Calls whose carriers are kept (base call, any case: WW0WWV/P counts);
+# # every other carrier is discarded.  The beta keeps only WW0WWV, for the
+# # carrier browser's WW0WWV-vs-WWV comparison.  [] or ["*"] keeps all.
+# calls = ["WW0WWV"]
 # --------------------------------------------------------------------------
 
 # --------------------------------------------------------------------------

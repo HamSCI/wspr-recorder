@@ -20,6 +20,11 @@ F15 or F30.  Where two wsprd passes both wrote a carrier for one call, the
 -n (no-drift, spreading) pass's wins, the same preference
 ``DecoderRunner._merge_wspr_passes`` gives its spot.
 
+Only the calls listed in ``calls`` are filed (``[carrier_archive] calls``,
+``["WW0WWV"]`` by default in the config; matched on the base call, so
+``WW0WWV/P`` counts); every other carrier is discarded with the scratch
+directory.  ``calls`` of None, ``[]`` or ``["*"]`` files every call.
+
 ``purge`` deletes day directories past ``max_age_days`` and then, while the
 file system is fuller than ``max_disk_pct``, the oldest days (never the
 newest).  It runs from the recorder's cleanup timer, never in a decode.
@@ -55,6 +60,28 @@ _DAY_RE = re.compile(r"^\d{8}$")
 _UNSAFE_RE = re.compile(r"[^A-Za-z0-9._=-]+")
 
 PathLike = Union[str, Path]
+_CALL_SPLIT_RE = re.compile(r"[^A-Za-z0-9]+")
+
+
+def base_call(call: str) -> str:
+    """The base callsign of ``call``, upper-cased: of the parts split at any
+    non-alphanumeric (``/`` in a call, ``_`` in a decoder's file name), the
+    longest that holds a digit, else the longest.  ``WW0WWV/P`` and
+    ``WW0WWV_P`` are ``WW0WWV``; ``PJ4/K1ABC`` is ``K1ABC``."""
+    parts = [p for p in _CALL_SPLIT_RE.split((call or "").upper()) if p]
+    if not parts:
+        return ""
+    with_digit = [p for p in parts if any(c.isdigit() for c in p)
+                  and any(c.isalpha() for c in p)]
+    return max(with_digit or parts, key=len)
+
+
+def call_filter(calls: Optional[Sequence[str]]) -> Optional[frozenset]:
+    """The set of base calls to file, or None for every call (``calls`` is
+    None, empty, or holds ``"*"``)."""
+    if not calls or any(str(c).strip() == "*" for c in calls):
+        return None
+    return frozenset(b for b in (base_call(str(c)) for c in calls) if b)
 
 
 def safe_name(name: str, fallback: str = "receiver") -> str:
@@ -166,8 +193,13 @@ class CarrierArchive:
 
     def __init__(self, root: PathLike, receiver: str, *,
                  max_age_days: int = 3, max_disk_pct: float = 90,
+                 calls: Optional[Sequence[str]] = None,
                  disk_used_pct: Callable[[PathLike], Optional[float]] = disk_used_pct):
+        """``calls``: the calls whose carriers are filed (base call, any
+        case); None, ``[]`` or ``["*"]`` files them all.  The config's
+        default is ``["WW0WWV"]`` (CarrierArchiveConfig)."""
         self.root = Path(root)
+        self.calls = call_filter(calls)
         self.receiver = safe_name(receiver)
         self.max_age_days = max_age_days
         self.max_disk_pct = max_disk_pct
@@ -273,7 +305,13 @@ class CarrierArchive:
         if getattr(cfg, "enabled", False) is not True:
             return None
         return cls(cfg.root, receiver, max_age_days=cfg.max_age_days,
-                   max_disk_pct=cfg.max_disk_pct)
+                   max_disk_pct=cfg.max_disk_pct,
+                   calls=getattr(cfg, "calls", None))
+
+    def wants(self, call: str) -> bool:
+        """True iff a carrier of ``call`` (as the decoder names the file:
+        ``/`` already ``_``) is to be filed."""
+        return self.calls is None or base_call(call) in self.calls
 
     def scratch_dir(self, work_dir: PathLike, label: str) -> Optional[Path]:
         """A fresh, empty directory for one decoder run to write carriers
@@ -325,6 +363,8 @@ class CarrierArchive:
                     if not m:
                         continue
                     call = m.group("call")
+                    if not self.wants(call):
+                        continue                  # discarded with src
                     if call in filed:
                         continue                  # a preferred pass had it
                     filed.add(call)

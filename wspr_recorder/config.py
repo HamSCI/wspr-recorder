@@ -376,6 +376,10 @@ class RecorderConfig:
 # StateDirectory (/var/lib/wspr-recorder, already in the unit's sandbox
 # ReadWritePaths), NOT under recorder.output_dir, which is /dev/shm (RAM).
 DEFAULT_CARRIER_ARCHIVE_ROOT = "/var/lib/wspr-recorder/carrier-archive"
+# During the beta only WW0WWV's carriers are kept: the browser compares them
+# with WWV's (docs/CARRIER-ARCHIVE.md).  [] or ["*"] keeps every call.
+DEFAULT_CARRIER_ARCHIVE_CALLS = ("WW0WWV",)
+_CALL_RE = re.compile(r"^[A-Za-z0-9]+(?:/[A-Za-z0-9]+)*$")
 
 
 @dataclass
@@ -388,13 +392,16 @@ class CarrierArchiveConfig:
     as ``root/YYYYMMDD/RECEIVER/BAND/HHMM_MODE_CALL_RFHZ.wav``.  Day
     directories older than ``max_age_days`` (whole UTC days, today
     included) are deleted, then the oldest days while the file system
-    holding ``root`` is fuller than ``max_disk_pct``.  See
-    docs/CARRIER-ARCHIVE.md.
+    holding ``root`` is fuller than ``max_disk_pct``.  Only the carriers
+    of ``calls`` are kept (base call, any case: ``WW0WWV/P`` counts);
+    ``[]`` or ``["*"]`` keeps every call.  See docs/CARRIER-ARCHIVE.md.
     """
     enabled: bool = False
     root: str = DEFAULT_CARRIER_ARCHIVE_ROOT
     max_age_days: int = 3
     max_disk_pct: float = 90
+    calls: list = field(
+        default_factory=lambda: list(DEFAULT_CARRIER_ARCHIVE_CALLS))
 
     @classmethod
     def from_dict(cls, data: dict) -> 'CarrierArchiveConfig':
@@ -404,6 +411,7 @@ class CarrierArchiveConfig:
             root=data.get("root", d.root),
             max_age_days=data.get("max_age_days", d.max_age_days),
             max_disk_pct=data.get("max_disk_pct", d.max_disk_pct),
+            calls=data.get("calls", d.calls),
         )
 
     # Directories the archive root may be neither equal to nor a parent of
@@ -458,6 +466,18 @@ class CarrierArchiveConfig:
             errors.append(
                 f"carrier_archive.max_disk_pct must be a number in "
                 f"(0, 100]; got {self.max_disk_pct!r}")
+        if not isinstance(self.calls, list):
+            errors.append(
+                f"carrier_archive.calls must be a list of callsigns "
+                f"(e.g. [\"WW0WWV\"]; [] or [\"*\"] for all); "
+                f"got {self.calls!r}")
+        else:
+            for c in self.calls:
+                if not isinstance(c, str) or not (
+                        c.strip() == "*" or _CALL_RE.match(c.strip())):
+                    errors.append(
+                        f"carrier_archive.calls: {c!r} is not a callsign "
+                        f"(letters, digits and /) or \"*\"")
         return errors
 
 
