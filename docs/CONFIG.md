@@ -101,6 +101,19 @@ Known band names (`WSPR_BANDS` in [config.py](../wspr_recorder/config.py))
 map frequency → directory name (`"20"`, `"80eu"`, `"630"`, etc.);
 unknown frequencies get directory `"<hz>Hz"`.
 
+## `[carrier_archive]` (optional, off by default)
+
+Keeps each WSPR/FST4W spot's carrier (`wsprd -I`, `jt9 --carrier-dir`;
+ubersdr decoders 5eeeb53+) as `<root>/YYYYMMDD/RECEIVER/BAND/HHMM_MODE_CALL_RFHZ.wav`.
+See [CARRIER-ARCHIVE.md](CARRIER-ARCHIVE.md).
+
+| Key | Type | Default | Notes |
+|---|---|---|---|
+| `enabled` | bool | `false` | Off: no decoder option is passed; command lines unchanged. |
+| `root` | absolute path | `/var/lib/wspr-recorder/carrier-archive` | On disk under the unit's StateDirectory, not `/dev/shm`. |
+| `max_age_days` | int ≥ 1 | `3` | Whole UTC days kept, today included. |
+| `max_disk_pct` | number in (0, 100] | `90` | Then the oldest days go while the file system is fuller; the newest day is kept. |
+
 ## Resolution rules
 
 ### `status_address` precedence

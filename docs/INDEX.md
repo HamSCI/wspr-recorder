@@ -13,6 +13,7 @@
 | [../README.md](../README.md) | all | what this client is, quick start |
 | [ARCHITECTURE.md](ARCHITECTURE.md) ★ | contributor | internals: the high-level pipeline |
 | [CONFIG.md](CONFIG.md) ★ | operator/contributor | TOML config reference + environment variables |
+| [CARRIER-ARCHIVE.md](CARRIER-ARCHIVE.md) | operator/contributor | optional (off by default) archive of each spot's carrier + its localhost browser |
 | [INSTALL.md](INSTALL.md) | contributor | standalone install: deps, systemd, paths, Pattern A |
 | [OPERATIONS.md](OPERATIONS.md) ★ | operator/contributor | running it day-to-day: starting/stopping, logs, health, troubleshooting |
 | [REQUIREMENTS.md](REQUIREMENTS.md) | contributor | formal requirements, reconciled to code |
