@@ -406,6 +406,34 @@ class CarrierArchiveConfig:
             max_disk_pct=data.get("max_disk_pct", d.max_disk_pct),
         )
 
+    # Directories the archive root may be neither equal to nor a parent of
+    # (purge deletes YYYYMMDD dirs under root).  Config.validate adds the
+    # recorder's output_dir, inside which the root may not be either.
+    protected_paths: tuple = ("/var/lib/sigmond", "/var/lib/wspr-recorder")
+
+    @staticmethod
+    def validate_root(root: str, protected, inside_forbidden=()) -> List[str]:
+        import posixpath
+        def norm(p: str) -> str:
+            return posixpath.normpath("/" + p.lstrip("/"))
+        r = norm(root)
+        if r == "/":
+            return [f"carrier_archive.root must not be / (got {root!r})"]
+        errors = []
+        for prot in list(protected) + list(inside_forbidden):
+            n = norm(prot)
+            if n == r or n.startswith(r + "/"):
+                errors.append(
+                    f"carrier_archive.root {root!r} is or contains {prot}; "
+                    f"give the archive a directory of its own")
+        for prot in inside_forbidden:
+            n = norm(prot)
+            if r.startswith(n + "/"):
+                errors.append(
+                    f"carrier_archive.root {root!r} is inside {prot} (the "
+                    f"WAV output, cleaned by age and often RAM)")
+        return errors
+
     def validate(self) -> List[str]:
         errors = []
         if not isinstance(self.enabled, bool):
@@ -416,6 +444,8 @@ class CarrierArchiveConfig:
             errors.append(
                 f"carrier_archive.root must be an absolute path; "
                 f"got {self.root!r}")
+        else:
+            errors.extend(self.validate_root(self.root, self.protected_paths))
         if (isinstance(self.max_age_days, bool)
                 or not isinstance(self.max_age_days, int)
                 or self.max_age_days < 1):
@@ -533,6 +563,10 @@ class Config:
         # Validated even when disabled: a typo shows now, not the day
         # someone flips enabled = true.
         errors.extend(self.carrier_archive.validate())
+        ca_root = self.carrier_archive.root
+        if isinstance(ca_root, str) and ca_root.startswith("/") and ca_root.strip("/"):
+            errors.extend(CarrierArchiveConfig.validate_root(
+                ca_root, (), (self.recorder.output_dir,)))
 
         # Validate sources.  Either ``sources`` must be populated
         # (post-ensure_sources()) or the legacy ``radiod.status_address``

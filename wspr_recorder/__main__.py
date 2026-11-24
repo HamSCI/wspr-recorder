@@ -651,6 +651,9 @@ class WsprRecorder:
         else:
             work_dir = self.wav_writer.output_dir / band_name / ".phase2"
         work_dir.mkdir(parents=True, exist_ok=True)
+        # Carrier scratch left by a recorder that died mid-decode (the WAV
+        # cleanup deliberately never looks inside carrier.d).
+        CarrierArchive.sweep_scratch(work_dir, older_than_s=3600)
         runner = DecoderRunner(
             band_name=band_name,
             frequency_hz=frequency_hz,
@@ -672,7 +675,9 @@ class WsprRecorder:
         cfg = getattr(self.config, "carrier_archive", None)
         if getattr(cfg, "enabled", False) is not True:
             return None
-        return CarrierArchive.from_config(cfg, self._carrier_receiver(rx_source))
+        archive = CarrierArchive.from_config(cfg, self._carrier_receiver(rx_source))
+        archive.ensure_root()        # create + mark the root (never raises)
+        return archive
 
     def _carrier_receiver(self, rx_source: str = "") -> str:
         """RECEIVER in the carrier archive's path: the reporter id (e.g.
@@ -1383,24 +1388,30 @@ class WsprRecorder:
         while self._running:
             try:
                 await asyncio.sleep(self.CLEANUP_INTERVAL)
-                if self.wav_writer:
-                    # Remove files older than max age
-                    self.wav_writer.cleanup_old_files(
-                        self.config.recorder.max_file_age_minutes
-                    )
-                    # Also enforce max files per band as safety net
-                    self.wav_writer.enforce_max_files_per_band(
-                        self.config.recorder.max_files_per_band
-                    )
-                # Carrier archive (off by default): age + disk-use purge,
-                # on this 5-minute timer, off the decode path and off the
-                # event loop.
-                await asyncio.to_thread(self._purge_carrier_archive)
+                await self._cleanup_once()
             except asyncio.CancelledError:
                 break
             except Exception as e:
                 logger.error(f"Cleanup error: {e}")
     
+    async def _cleanup_once(self) -> None:
+        """One cleanup tick: WAV age + per-band caps, then the carrier
+        archive's purge (only when enabled: a disabled archive costs no
+        thread at all)."""
+        if self.wav_writer:
+            # Remove files older than max age
+            self.wav_writer.cleanup_old_files(
+                self.config.recorder.max_file_age_minutes
+            )
+            # Also enforce max files per band as safety net
+            self.wav_writer.enforce_max_files_per_band(
+                self.config.recorder.max_files_per_band
+            )
+        cfg = getattr(self.config, "carrier_archive", None)
+        if getattr(cfg, "enabled", False) is True:
+            # Age + disk-use purge, off the decode path and the event loop.
+            await asyncio.to_thread(self._purge_carrier_archive)
+
     def _executor_backlog(self) -> int:
         """Number of submitted tasks not yet picked up by a worker.
 

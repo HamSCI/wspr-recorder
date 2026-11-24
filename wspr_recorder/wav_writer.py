@@ -21,6 +21,12 @@ from .config import freq_to_band_name
 logger = logging.getLogger(__name__)
 
 
+def _in_carrier_scratch(path: Path) -> bool:
+    """True for anything inside a carrier-archive scratch dir
+    (``<band>/.phase2/carrier.d/...``, carrier_archive.py)."""
+    return "carrier.d" in path.parts[:-1] or path.name == "carrier.d"
+
+
 def source_slug(rx_source: str) -> str:
     """Filesystem-safe path segment derived from a SourceConfig.key.
 
@@ -621,6 +627,11 @@ class WavWriter:
         cutoff_time = time.time() - (max_age_minutes * 60)
 
         for wav_path in self.output_dir.rglob("*.wav"):
+            # Carrier-archive scratch (.phase2/carrier.d/): a decoder may be
+            # writing there right now, and CarrierArchive.sweep_scratch
+            # owns its leftovers.
+            if _in_carrier_scratch(wav_path):
+                continue
             try:
                 # lstat() does NOT follow symlinks, so broken symlinks
                 # don't error out — they get unlinked just like regular
@@ -690,6 +701,8 @@ class WavWriter:
             if not d.is_dir():
                 continue
             if d.name.startswith("."):
+                continue
+            if _in_carrier_scratch(d):
                 continue
             # Cheap test: any direct *.wav child?  Stop iteration as
             # soon as one is found.

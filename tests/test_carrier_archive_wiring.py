@@ -54,6 +54,7 @@ def test_receiver_falls_back_to_radiod_and_adds_source_when_several(tmp_path):
 def test_purge_runs_only_when_enabled(tmp_path):
     old = tmp_path / "ca" / "20200101"
     old.mkdir(parents=True)
+    (tmp_path / "ca" / ".wspr-carrier-archive").touch()
     _rec(tmp_path, CarrierArchiveConfig(root=str(tmp_path / "ca"))
          )._purge_carrier_archive()
     assert old.exists()

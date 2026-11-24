@@ -9,12 +9,16 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from pathlib import Path
 
-from wspr_recorder.carrier_archive import CarrierArchive, disk_used_pct, purge
+from wspr_recorder.carrier_archive import (
+    MARKER, CarrierArchive, disk_used_pct, purge,
+)
 
 NOW = datetime(2026, 11, 23, 14, 8, tzinfo=timezone.utc)
 
 
 def _days(root: Path, *names: str) -> None:
+    root.mkdir(parents=True, exist_ok=True)
+    (root / MARKER).touch()                  # an archive root (see fix1 M-4)
     for n in names:
         d = root / n / "AC0G-B1" / "20"
         d.mkdir(parents=True)
@@ -22,7 +26,7 @@ def _days(root: Path, *names: str) -> None:
 
 
 def _left(root: Path):
-    return sorted(p.name for p in root.iterdir())
+    return sorted(p.name for p in root.iterdir() if p.name != MARKER)
 
 
 def _never_full(path):
@@ -52,6 +56,7 @@ def test_age_purge_does_not_follow_symlinks(tmp_path):
     _days(outside, "keepme")
     root = tmp_path / "root"
     root.mkdir()
+    (root / MARKER).touch()
     (root / "20200101").symlink_to(outside / "keepme", target_is_directory=True)
     purge(root, max_age_days=3, max_disk_pct=90, now=NOW,
           disk_used_pct=_never_full)

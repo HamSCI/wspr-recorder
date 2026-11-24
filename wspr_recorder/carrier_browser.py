@@ -234,7 +234,10 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def build_server(root, bind: str = "127.0.0.1", port: int = 8089) -> ThreadingHTTPServer:
-    """The server for archive `root` (not created if missing: read-only)."""
+    """The server for archive `root` (not created if missing: read-only).
+    Refuses / as the root: that would serve every .wav on the host."""
+    if os.path.realpath(str(root)) == os.sep:
+        raise ValueError("refusing to serve / as the carrier archive root")
     srv = ThreadingHTTPServer((bind, port), Handler)
     srv.daemon_threads = True
     srv.root = os.path.realpath(str(root))
@@ -254,7 +257,11 @@ def parse_args(argv=None) -> argparse.Namespace:
 
 def main(argv=None) -> int:
     a = parse_args(argv)
-    srv = build_server(a.root, a.bind, a.port)
+    try:
+        srv = build_server(a.root, a.bind, a.port)
+    except ValueError as exc:
+        print(f"carrier-browser: {exc}", file=sys.stderr, flush=True)
+        sys.exit(2)
     if not srv.loopback_only:
         print(f"carrier-browser: WARNING: listening on {a.bind}, not loopback: "
               f"anyone who can reach it can read the archive", file=sys.stderr, flush=True)

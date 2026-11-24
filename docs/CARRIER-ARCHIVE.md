@@ -80,13 +80,27 @@ Then restart `wspr-recorder@<instance>`. Notes:
   a drop-in.
 - Invalid values (for example `max_age_days = 0`, or a relative `root`)
   stop the config from loading. They are checked even while
-  `enabled = false`.
+  `enabled = false`. `root` may not be `/`, may not be (or contain)
+  `/var/lib/sigmond`, `/var/lib/wspr-recorder` or the recorder's
+  `output_dir`, and may not sit inside `output_dir`.
+- The recorder writes a `.wspr-carrier-archive` marker file into `root`
+  when it creates it, or when it first uses an existing root that is empty
+  or holds only day directories. Purge does nothing, and logs one warning,
+  in a root without the marker.
 - Purging runs on the recorder's 5-minute cleanup timer, never during a
-  decode. First, any day directory older than `max_age_days` is deleted.
-  Then, while the filesystem holding `root` is more than `max_disk_pct`
-  full, the oldest day is deleted. The newest day is never deleted.
-- Errors while filing or purging are logged (`carrier archive: ...`) and
-  ignored. They never stop a decode or an upload.
+  decode, and only when the archive is enabled. First, any day directory
+  older than `max_age_days`, or dated after today (a clock jump), is
+  deleted. Then, while the filesystem holding `root` is more than
+  `max_disk_pct` full, the oldest day before today is deleted. Today's
+  directory is never deleted for disk use.
+- Hard limit: while the filesystem is at `max_disk_pct + 5` (at most 98%)
+  or above, carriers are not filed at all (one warning, and one line when
+  filing resumes).
+- Errors while filing or purging are logged (`carrier archive: ...`), at
+  most once per cycle, and ignored. They never stop a decode or an upload.
+- Decoders write into hidden scratch dirs (`<band>/.phase2/carrier.d/.p1.XXXX`)
+  that the WAV cleanup never touches; leftovers from a crash are swept
+  when the recorder starts.
 
 ## Disk use
 

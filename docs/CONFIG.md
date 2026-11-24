@@ -110,9 +110,9 @@ See [CARRIER-ARCHIVE.md](CARRIER-ARCHIVE.md).
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `enabled` | bool | `false` | Off: no decoder option is passed; command lines unchanged. |
-| `root` | absolute path | `/var/lib/wspr-recorder/carrier-archive` | On disk under the unit's StateDirectory, not `/dev/shm`. |
+| `root` | absolute path | `/var/lib/wspr-recorder/carrier-archive` | On disk under the unit's StateDirectory, not `/dev/shm`. Not `/`, not a parent of `output_dir` / `/var/lib/sigmond` / `/var/lib/wspr-recorder`, not inside `output_dir`. Purged only if it holds `.wspr-carrier-archive`. |
 | `max_age_days` | int ≥ 1 | `3` | Whole UTC days kept, today included. |
-| `max_disk_pct` | number in (0, 100] | `90` | Then the oldest days go while the file system is fuller; the newest day is kept. |
+| `max_disk_pct` | number in (0, 100] | `90` | Then the oldest days go while the file system is fuller; today is kept. Filing stops at `max_disk_pct + 5` (cap 98). |
 
 ## Resolution rules
 
