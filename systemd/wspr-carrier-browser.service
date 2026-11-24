@@ -1,0 +1,60 @@
+[Unit]
+Description=wspr-recorder carrier archive browser (read-only web page, localhost only)
+Documentation=file:///opt/git/sigmond/wspr-recorder/docs/CARRIER-ARCHIVE.md
+After=network.target
+StartLimitIntervalSec=300
+StartLimitBurst=10
+
+# Installed but NOT enabled: it is only useful where [carrier_archive]
+# enabled = true.  Turn it on with
+#   sudo systemctl enable --now wspr-carrier-browser.service
+# and reach it from your own machine with
+#   ssh -L 8089:127.0.0.1:8089 <host>     then open http://localhost:8089/
+
+[Service]
+Type=simple
+User=wsprrec
+Group=wsprrec
+
+# Must match [carrier_archive] root in the recorder's config.  Override with
+# a drop-in (systemctl edit wspr-carrier-browser) if you changed it there.
+Environment=CARRIER_ARCHIVE_ROOT=/var/lib/wspr-recorder/carrier-archive
+Environment=CARRIER_BROWSER_BIND=127.0.0.1
+Environment=CARRIER_BROWSER_PORT=8089
+
+WorkingDirectory=/opt/git/sigmond/wspr-recorder
+ExecStart=/opt/git/sigmond/wspr-recorder/venv/bin/python3 -m wspr_recorder.carrier_browser \
+    --root ${CARRIER_ARCHIVE_ROOT} --bind ${CARRIER_BROWSER_BIND} --port ${CARRIER_BROWSER_PORT}
+
+Restart=on-failure
+RestartSec=30
+
+StandardOutput=journal
+StandardError=inherit
+SyslogIdentifier=wspr-carrier-browser
+
+Nice=10
+MemoryMax=256M
+MemorySwapMax=0
+
+# Read-only by construction: the page never writes, and the sandbox makes the
+# whole file system read-only for it anyway (ProtectSystem=strict, no
+# ReadWritePaths).
+NoNewPrivileges=true
+ProtectSystem=strict
+ProtectHome=true
+PrivateTmp=true
+PrivateDevices=true
+ProtectKernelTunables=true
+ProtectKernelModules=true
+ProtectControlGroups=true
+RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
+CapabilityBoundingSet=
+# Loopback only, even if the bind above is changed.  To serve a LAN, change
+# CARRIER_BROWSER_BIND *and* override these two in a drop-in — knowingly:
+# the page has no authentication.
+IPAddressDeny=any
+IPAddressAllow=localhost
+
+[Install]
+WantedBy=multi-user.target

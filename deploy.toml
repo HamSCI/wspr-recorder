@@ -57,6 +57,13 @@ kind = "link"
 src  = "systemd/wspr-uploader.service"
 dst  = "/etc/systemd/system/wspr-uploader.service"
 
+# Carrier archive browser (docs/CARRIER-ARCHIVE.md): installed, never enabled
+# or started here; an operator enables it where [carrier_archive] is on.
+[[install.steps]]
+kind = "link"
+src  = "systemd/wspr-carrier-browser.service"
+dst  = "/etc/systemd/system/wspr-carrier-browser.service"
+
 [[install.steps]]
 kind      = "render"
 src       = "config.toml.example"
@@ -91,7 +98,9 @@ templated_units = ["wspr-recorder@.service"]
 # Host-local singleton: the fleet merge-uploader runs on ONE host (the merge
 # host); smd only manages it where it's actually enabled (see
 # lifecycle._resolve_optional_units), so decode-only hosts don't false-alarm.
-optional_units = ["wspr-uploader.service"]
+# wspr-carrier-browser.service likewise: managed only where an operator has
+# enabled it (off by default, like [carrier_archive]).
+optional_units = ["wspr-uploader.service", "wspr-carrier-browser.service"]
 
 [deps]
 [[deps.pypi]]

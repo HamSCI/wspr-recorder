@@ -313,6 +313,14 @@ EOF
     ln -sfn "$unit_src" "$unit_dst"
     info "Installed $unit_dst -> $unit_src"
 
+    # Carrier archive browser: installed, deliberately NOT enabled or started
+    # (off by default, like [carrier_archive]; see docs/CARRIER-ARCHIVE.md).
+    if [[ -f "$repo_root/systemd/wspr-carrier-browser.service" ]]; then
+        ln -sfn "$repo_root/systemd/wspr-carrier-browser.service" \
+            /etc/systemd/system/wspr-carrier-browser.service
+        info "Installed wspr-carrier-browser.service (not enabled)"
+    fi
+
     systemctl daemon-reload
 
     info "Systemd service installed (templated). Enable with:"
@@ -345,6 +353,8 @@ uninstall() {
     # Remove systemd files
     rm -f /etc/systemd/system/wspr-recorder.service
     rm -f /etc/systemd/system/wspr-recorder@.service
+    systemctl disable --now wspr-carrier-browser.service 2>/dev/null || true
+    rm -f /etc/systemd/system/wspr-carrier-browser.service
     rm -f /etc/tmpfiles.d/wspr-recorder.conf
     systemctl daemon-reload
     
