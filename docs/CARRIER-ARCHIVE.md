@@ -180,6 +180,8 @@ days) the page shows one card per band pair:
 
 | WW0WWV band | WW0WWV nominal, Hz | compared with |
 |---|---|---|
+| 80 m | 3 570 050.145432 | WWV 2.5 MHz |
+| 40 m | 7 040 050.130209 | WWV 5 MHz |
 | 30 m | 10 140 150.146485 | WWV 10 MHz |
 | 20 m | 14 097 050.048829 | WWV 15 MHz |
 | 15 m | 21 096 050.048829 | WWV 20 MHz |

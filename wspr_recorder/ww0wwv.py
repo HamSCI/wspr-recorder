@@ -65,9 +65,11 @@ NOMINAL_HZ: Dict[str, float] = {
 }
 
 # Each WW0WWV band and the WWV frequency, MHz, it is compared with: the
-# nearest WWV carrier above it, as in the KPH study.  (The study also had
-# 80 m with 2.5 MHz and 40 m with 5 MHz; the beta shows these five.)
+# nearest WWV carrier above it, as in the KPH study (80 m and 40 m added
+# 2026-11-25, Rob: WW0WWV is heard there at night).
 BAND_PAIRS: List[Tuple[str, float]] = [
+    ("80", 2.5),
+    ("40", 5.0),
     ("30", 10.0),
     ("20", 15.0),
     ("15", 20.0),

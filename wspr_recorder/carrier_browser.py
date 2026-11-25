@@ -8,7 +8,7 @@ DIR is the archive: YYYYMMDD/RECEIVER/BAND/HHMM_MODE_CALL_RFHZ.wav, each a
 its LIST/INFO/ICMT chunk (ubersdr's carrier_iq.h).
 
 Main page (the beta's purpose): WW0WWV against WWV.  For a UTC day, one
-chart per band pair (30 m / WWV 10 MHz, 20 m / 15, 15 m / 20, 12 m and
+chart per band pair (80 m / WWV 2.5 MHz, 40 m / 5, 30 m / WWV 10 MHz, 20 m / 15, 15 m / 20, 12 m and
 10 m / 25): WW0WWV's Doppler in ppb of its nominal frequency and its SNR,
 one point per WSPR cycle, against WWV's Doppler from hf-timestd (one a
 minute).  Clicking a cycle opens its carrier's spectrogram and Doppler

@@ -168,7 +168,7 @@ def test_compare_levels_from_sink_noise(archive, tmp_path):
 def test_levels_without_sink(archive, tmp_path):
     d, c = _both(archive, noise=cb.SinkNoise(str(tmp_path / "missing.db")))
     assert d["levels"]["available"] is False and "sink" in d["levels"]["reason"]
-    cy = d["bands"][0]["cycles"][0]
+    cy = next(b for b in d["bands"] if b["cycles"])["cycles"][0]
     assert cy["level_dbm"] is None and cy["noise_dbm_hz"] is None
     assert c["level_dbm"] is None
     assert all(p.get("level_dbm") is None for p in c["track"]["points"])
