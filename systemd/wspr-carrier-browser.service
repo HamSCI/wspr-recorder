@@ -1,5 +1,5 @@
 [Unit]
-Description=wspr-recorder carrier archive browser (read-only web page, localhost only)
+Description=wspr-recorder carrier archive browser: WW0WWV vs WWV (read-only web page)
 Documentation=file:///opt/git/sigmond/wspr-recorder/docs/CARRIER-ARCHIVE.md
 After=network.target
 StartLimitIntervalSec=300
@@ -19,12 +19,26 @@ Group=wsprrec
 # Must match [carrier_archive] root in the recorder's config.  Override with
 # a drop-in (systemctl edit wspr-carrier-browser) if you changed it there.
 Environment=CARRIER_ARCHIVE_ROOT=/var/lib/wspr-recorder/carrier-archive
+# Address and port.  Loopback by default.  A host relay (e.g. the Proxmox
+# host forwarding to this VM, as for station-web on :8000) needs a drop-in:
+#   [Service]
+#   Environment=CARRIER_BROWSER_BIND=0.0.0.0
+#   IPAddressAllow=<the relay's address or subnet>
+#   Environment=CARRIER_BROWSER_ALLOWED_HOSTS=<names users type, if any>
+# The page has no authentication: whoever reaches the port can read the
+# archive.  See docs/CARRIER-ARCHIVE.md.
 Environment=CARRIER_BROWSER_BIND=127.0.0.1
 Environment=CARRIER_BROWSER_PORT=8089
+# Host names (besides IP addresses, localhost and this host's name) the page
+# answers to; comma-separated.  Anything else gets 403 (DNS rebinding).
+Environment=CARRIER_BROWSER_ALLOWED_HOSTS=
+# hf-timestd's database, for WWV's Doppler (read-only; "none" for no WWV).
+Environment=TIMESTD_DB=/var/lib/timestd/phase2/timestd.db
 
 WorkingDirectory=/opt/git/sigmond/wspr-recorder
+# --bind, --port, the Host list and the database come from the environment.
 ExecStart=/opt/git/sigmond/wspr-recorder/venv/bin/python3 -m wspr_recorder.carrier_browser \
-    --root ${CARRIER_ARCHIVE_ROOT} --bind ${CARRIER_BROWSER_BIND} --port ${CARRIER_BROWSER_PORT}
+    --root ${CARRIER_ARCHIVE_ROOT}
 
 Restart=on-failure
 RestartSec=30
@@ -50,9 +64,9 @@ ProtectKernelModules=true
 ProtectControlGroups=true
 RestrictAddressFamilies=AF_INET AF_INET6 AF_UNIX
 CapabilityBoundingSet=
-# Loopback only, even if the bind above is changed.  To serve a LAN, change
-# CARRIER_BROWSER_BIND *and* override these two in a drop-in — knowingly:
-# the page has no authentication.
+# Loopback only, even if the bind above is changed.  To serve a relay or a
+# LAN, change CARRIER_BROWSER_BIND *and* add IPAddressAllow= in a drop-in
+# (drop-ins add to this list) -- knowingly: the page has no authentication.
 IPAddressDeny=any
 IPAddressAllow=localhost
 

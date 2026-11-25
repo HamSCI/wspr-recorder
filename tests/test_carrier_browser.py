@@ -181,7 +181,9 @@ def test_foreign_host_header_refused_on_loopback(server):
 
 # ---- defaults ---------------------------------------------------------------
 
-def test_defaults_bind_localhost_8089():
+def test_defaults_bind_localhost_8089(monkeypatch):
+    monkeypatch.delenv("CARRIER_BROWSER_BIND", raising=False)
+    monkeypatch.delenv("CARRIER_BROWSER_PORT", raising=False)
     a = cb.parse_args(["--root", "/x"])
     assert (a.bind, a.port, a.root) == ("127.0.0.1", 8089, "/x")
 

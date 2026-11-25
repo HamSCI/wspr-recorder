@@ -40,5 +40,6 @@ config.toml
 
 # Output
 *.wav
+!tests/fixtures/ww0wwv/*.wav
 *.json
 status.json

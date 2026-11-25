@@ -1,25 +1,37 @@
 """A read-only web page for wspr-recorder's carrier archive (carrier_archive.py).
 
-    python -m wspr_recorder.carrier_browser --root DIR [--bind 127.0.0.1] [--port 8089]
+    python -m wspr_recorder.carrier_browser --root DIR [--bind ADDR] [--port 8089]
+                                            [--timestd-db PATH]
 
 DIR is the archive: YYYYMMDD/RECEIVER/BAND/HHMM_MODE_CALL_RFHZ.wav, each a
 2-channel float32 IQ .wav at 15 Hz with the decode's particulars as JSON in
-its LIST/INFO/ICMT chunk (ubersdr's carrier_iq.h).  The page lists dates, the
-cycles of a date and the spots of a cycle, band by band; a spot's file is
-plotted in the browser (spectrogram, Doppler and SNR over the transmission)
-and can be downloaded.  Standard library only.
+its LIST/INFO/ICMT chunk (ubersdr's carrier_iq.h).
 
-Ported from wsprdaemon's carrier-browser.py (WD c1835bf), hardened:
-  * read-only: GET only, nothing under DIR is created or written;
+Main page (the beta's purpose): WW0WWV against WWV.  For a UTC day, one
+chart per band pair (30 m / WWV 10 MHz, 20 m / 15, 15 m / 20, 12 m and
+10 m / 25): WW0WWV's Doppler in ppb of its nominal frequency and its SNR,
+one point per WSPR cycle, against WWV's Doppler from hf-timestd (one a
+minute).  Clicking a cycle opens its carrier's spectrogram and Doppler
+track beside WWV's for the same minutes.  The physics is in ww0wwv.py.
+
+Second page, "All spots": the archive's dates, cycles and spots, band by
+band; a spot's file is plotted in the browser and can be downloaded.
+
+Standard library and numpy.  Ported from wsprdaemon's carrier-browser.py
+(WD c1835bf), hardened:
+  * read-only: GET only, nothing under DIR (or the hf-timestd database,
+    opened mode=ro) is created or written;
   * only DIR is served: /file resolves symlinks and refuses anything whose
     real path is not under DIR's; listings skip symlinks and entries whose
     real path leaves DIR, so a link cannot expose a file's name or comment;
-  * binds 127.0.0.1 by default (reach it with ssh -L 8089:127.0.0.1:8089),
-    and while bound to loopback refuses requests whose Host header is not a
-    loopback name (DNS rebinding);
+  * binds 127.0.0.1 unless told otherwise (--bind, or CARRIER_BROWSER_BIND);
+  * DNS rebinding: a request is refused unless its Host header is an IP
+    address literal, a loopback name, this host's name, or a name in
+    CARRIER_BROWSER_ALLOWED_HOSTS (comma-separated) -- whatever the bind;
   * text from file names and WAV comments reaches the page's HTML escaped.
 
-API (JSON): /api/dates, /api/cycles?date=YYYYMMDD, /api/spots?date=YYYYMMDD&hhmm=HHMM;
+API (JSON): /api/compare?date=YYYYMMDD, /api/cycle?date=&hhmm=&band=[&rx=],
+/api/dates, /api/cycles?date=YYYYMMDD, /api/spots?date=YYYYMMDD&hhmm=HHMM;
 files: /file?path=REL.
 """
 from __future__ import annotations
@@ -27,21 +39,36 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import json
+import math
 import os
 import re
+import socket
 import struct
 import sys
+import threading
+from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Iterator, List, Optional, Tuple
+from typing import Iterable, Iterator, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
+
+from . import ww0wwv as W
+from .carrier_archive import base_call
 
 NAME = re.compile(r"^(\d{4})_([A-Z]\d+)_(.+)_(\d+\.\d+)\.wav$")
 _DATE = re.compile(r"\d{8}")
 _HHMM = re.compile(r"\d{4}")
+_BAND = re.compile(r"[0-9a-z]{1,8}")
 # Largest carrier file served: an F30 carrier is 1800 s x 15 Hz x 8 B, about
 # 216 KB; anything far bigger is not one of ours.
 MAX_FILE_BYTES = 16 * 1024 * 1024
 LOOPBACK_HOSTS = {"localhost", "127.0.0.1", "::1"}
+DEFAULT_BIND = "127.0.0.1"
+DEFAULT_PORT = 8089
+DEFAULT_TIMESTD_DB = "/var/lib/timestd/phase2/timestd.db"
+ENV_BIND = "CARRIER_BROWSER_BIND"
+ENV_PORT = "CARRIER_BROWSER_PORT"
+ENV_ALLOWED = "CARRIER_BROWSER_ALLOWED_HOSTS"
+ENV_TIMESTD_DB = "TIMESTD_DB"
 
 
 def _under(root: str, path: str) -> bool:
@@ -158,6 +185,156 @@ def resolve_file(root: str, rel: str) -> Optional[str]:
     return full
 
 
+# ---- WW0WWV vs WWV ------------------------------------------------------------
+
+def day_epoch(date: str) -> int:
+    return int(datetime.strptime(date, "%Y%m%d").replace(tzinfo=timezone.utc).timestamp())
+
+
+def _finite(v):
+    """JSON-safe: NaN and infinities become null, recursively."""
+    if isinstance(v, float):
+        return v if math.isfinite(v) else None
+    if isinstance(v, dict):
+        return {k: _finite(x) for k, x in v.items()}
+    if isinstance(v, (list, tuple)):
+        return [_finite(x) for x in v]
+    return v
+
+
+class CarrierCache:
+    """Per-file results (whole-transmission summary, track), keyed by the
+    file's real path, size and mtime; bounded."""
+
+    def __init__(self, limit: int = 20000):
+        self.limit = limit
+        self._d: dict = {}
+        self._lock = threading.Lock()
+
+    def get(self, full: str, what: str, compute):
+        try:
+            st = os.stat(full)
+        except OSError:
+            return None
+        key = (full, what, st.st_size, st.st_mtime_ns)
+        with self._lock:
+            if key in self._d:
+                return self._d[key]
+        val = compute()
+        with self._lock:
+            if len(self._d) >= self.limit:
+                self._d.clear()
+            self._d[key] = val
+        return val
+
+
+def ww0wwv_files(root: str, date: str, call: str = W.CALL) -> Iterator[dict]:
+    """The WSPR-2 carriers of `call` (base call) of a date on the compared
+    bands: receiver, band, hhmm, epoch, path (relative) and the file
+    name's RF."""
+    if not _DATE.fullmatch(date or ""):
+        return
+    day0 = day_epoch(date)
+    want = base_call(call)
+    for rx, band, fn in walk_date(root, date):
+        if band not in W.WWV_FOR_BAND:
+            continue
+        m = NAME.match(fn)
+        if not m or m.group(2) != "W2" or base_call(m.group(3)) != want:
+            continue
+        hh, mm = int(m.group(1)[:2]), int(m.group(1)[2:])
+        if hh > 23 or mm > 59:
+            continue
+        yield {"receiver": rx, "band": band, "hhmm": m.group(1),
+               "epoch": day0 + hh * 3600 + mm * 60,
+               "path": f"{date}/{rx}/{band}/{fn}", "name_rf_hz": float(m.group(4))}
+
+
+def _summary(root: str, f: dict, cache: CarrierCache) -> Optional[dict]:
+    full = resolve_file(root, f["path"])
+    if full is None:
+        return None
+
+    def compute():
+        try:
+            meta, rate, iq = W.read_carrier(full)
+        except (OSError, ValueError, struct.error):
+            return None
+        s = W.carrier_summary(meta, rate, iq, f["band"], f["name_rf_hz"])
+        if s is None:
+            return None
+        s["snr_wsprd"] = meta.get("snr")
+        s["w50_hz"] = meta.get("w50_hz")
+        s["message"] = meta.get("message")
+        return s
+    return cache.get(full, "summary", compute)
+
+
+def compare(root: str, date: str, wwv: W.WwvSource, cache: CarrierCache,
+            call: str = W.CALL) -> dict:
+    """The main page's day: per band pair, WW0WWV's cycles and WWV's series."""
+    out = {"date": date, "call": call, "wwv_source": wwv.name, "bands": [], "receivers": []}
+    if not _DATE.fullmatch(date or ""):
+        return out
+    day0 = day_epoch(date)
+    by_band: dict = {b: [] for b, _ in W.BAND_PAIRS}
+    rx_count: dict = {}
+    for f in ww0wwv_files(root, date, call):
+        s = _summary(root, f, cache)
+        if s is None:
+            continue
+        rx_count[f["receiver"]] = rx_count.get(f["receiver"], 0) + 1
+        by_band[f["band"]].append({
+            "hhmm": f["hhmm"], "epoch": f["epoch"], "receiver": f["receiver"],
+            "path": f["path"], "ppb": round(s["ppb"], 4), "hz": round(s["hz"], 6),
+            "snr_wsprd": s.get("snr_wsprd"), "snr_carrier": round(s["snr_db"], 2),
+            "w50_hz": s.get("w50_hz"), "message": s.get("message")})
+    out["receivers"] = sorted(rx_count, key=lambda r: (-rx_count[r], r))
+    for band, mhz in W.BAND_PAIRS:
+        series = wwv.series(mhz, day0, day0 + 86400 + 120)
+        cyc = sorted(by_band[band], key=lambda c: (c["epoch"], c["receiver"]))
+        for c in cyc:
+            c["wwv_ppb"] = W.wwv_over(series, c["epoch"], c["epoch"] + 120)
+        out["bands"].append({"band": band, "nominal_hz": W.NOMINAL_HZ[band],
+                             "wwv_mhz": mhz, "cycles": cyc, "wwv": series})
+    return out
+
+
+def cycle_detail(root: str, date: str, hhmm: str, band: str, rx: str,
+                 wwv: W.WwvSource, cache: CarrierCache, call: str = W.CALL) -> Optional[dict]:
+    """One cycle of one band: WW0WWV's track and WWV's minutes around it."""
+    if band not in W.WWV_FOR_BAND:
+        return None
+    found = [f for f in ww0wwv_files(root, date, call) if f["band"] == band and f["hhmm"] == hhmm]
+    if not found:
+        return None
+    f = next((x for x in found if x["receiver"] == rx), found[0])
+    full = resolve_file(root, f["path"])
+    if full is None:
+        return None
+
+    def compute():
+        try:
+            meta, rate, iq = W.read_carrier(full)
+        except (OSError, ValueError, struct.error):
+            return None
+        return {"meta": meta,
+                "summary": W.carrier_summary(meta, rate, iq, band, f["name_rf_hz"]),
+                "track": W.carrier_track(meta, rate, iq, band, f["epoch"], f["name_rf_hz"])}
+    d = cache.get(full, "track", compute)
+    if d is None:
+        return None
+    mhz = W.WWV_FOR_BAND[band]
+    series = wwv.series(mhz, f["epoch"] - 120, f["epoch"] + 240)
+    return {"date": date, "hhmm": hhmm, "band": band, "epoch": f["epoch"],
+            "receiver": f["receiver"], "receivers": sorted({x["receiver"] for x in found}),
+            "path": f["path"], "rf_hz": f["name_rf_hz"], "nominal_hz": W.NOMINAL_HZ[band],
+            "wwv_mhz": mhz, "meta": d["meta"], "summary": d["summary"], "track": d["track"],
+            "wwv": series, "wwv_ppb": W.wwv_over(series, f["epoch"], f["epoch"] + 120)}
+
+
+# ---- Host check ---------------------------------------------------------------
+
 def _is_loopback(bind: str) -> bool:
     if bind == "localhost":
         return True
@@ -172,6 +349,48 @@ def _host_name(header: str) -> str:
     if h.startswith("["):                       # [::1]:8089
         return h[1:h.find("]")] if "]" in h else h
     return h.rsplit(":", 1)[0] if h.count(":") == 1 else h
+
+
+def _is_ip(name: str) -> bool:
+    try:
+        ipaddress.ip_address(name)
+        return True
+    except ValueError:
+        return False
+
+
+def allowed_hosts(bind: str, extra: Iterable[str] = ()) -> set:
+    """Names a request's Host header may carry (besides any IP literal):
+    loopback names, this host's name, a named bind address, and `extra`."""
+    names = set(LOOPBACK_HOSTS)
+    try:
+        hn = socket.gethostname().strip().lower()
+        if hn:
+            names.add(hn)
+            names.add(hn.split(".")[0])
+    except OSError:
+        pass
+    if bind and not _is_ip(bind):
+        names.add(bind.lower())
+    for e in extra:
+        e = _host_name(e.strip())
+        if e:
+            names.add(e)
+    return names
+
+
+def host_ok(header: str, allowed: set) -> bool:
+    """DNS rebinding guard.  A rebinding attack reaches us under the
+    attacker's own host name, so only names are checked: an IP literal
+    (the address the user typed) passes, a name must be in `allowed`."""
+    name = _host_name(header)
+    if not name:
+        return False
+    return _is_ip(name) or name.rstrip(".") in allowed
+
+
+def _env_list(v: Optional[str]) -> List[str]:
+    return [x.strip() for x in (v or "").replace(" ", ",").split(",") if x.strip()]
 
 
 class Handler(BaseHTTPRequestHandler):
@@ -200,72 +419,118 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
+    def json(self, obj, code=200):
+        return self.send(code, json.dumps(_finite(obj), allow_nan=False))
+
     def do_GET(self):
-        root = self.server.root
-        if self.server.loopback_only and _host_name(self.headers.get("Host", "")) not in LOOPBACK_HOSTS:
-            return self.send(403, json.dumps({"error": "host"}))
+        srv = self.server
+        root = srv.root
+        if not host_ok(self.headers.get("Host", ""), srv.allowed_hosts):
+            return self.json({"error": "host"}, 403)
         u = urlparse(self.path)
         q = {k: v[0] for k, v in parse_qs(u.query).items()}
         try:
             if u.path == "/":
                 return self.send(200, PAGE, "text/html; charset=utf-8")
+            if u.path == "/api/compare":
+                if not _DATE.fullmatch(q.get("date", "")):
+                    return self.json({"error": "date"}, 400)
+                return self.json(compare(root, q["date"], srv.wwv, srv.cache, srv.call))
+            if u.path == "/api/cycle":
+                if not (_DATE.fullmatch(q.get("date", "")) and _HHMM.fullmatch(q.get("hhmm", ""))
+                        and _BAND.fullmatch(q.get("band", ""))):
+                    return self.json({"error": "date, hhmm or band"}, 400)
+                d = cycle_detail(root, q["date"], q["hhmm"], q["band"], q.get("rx", ""),
+                                 srv.wwv, srv.cache, srv.call)
+                if d is None:
+                    return self.json({"error": "no such cycle"}, 404)
+                return self.json(d)
             if u.path == "/api/dates":
-                return self.send(200, json.dumps(dates(root)))
+                return self.json(dates(root))
             if u.path == "/api/cycles":
-                return self.send(200, json.dumps(cycles(root, q.get("date", ""))))
+                return self.json(cycles(root, q.get("date", "")))
             if u.path == "/api/spots":
                 if not _HHMM.fullmatch(q.get("hhmm", "")):
-                    return self.send(400, json.dumps({"error": "hhmm"}))
-                return self.send(200, json.dumps(spots(root, q.get("date", ""), q["hhmm"])))
+                    return self.json({"error": "hhmm"}, 400)
+                return self.json(spots(root, q.get("date", ""), q["hhmm"]))
             if u.path == "/file":
                 full = resolve_file(root, q.get("path", ""))
                 if full is None or os.path.getsize(full) > MAX_FILE_BYTES:
-                    return self.send(404, json.dumps({"error": "no such file"}))
+                    return self.json({"error": "no such file"}, 404)
                 with open(full, "rb") as f:
                     data = f.read(MAX_FILE_BYTES + 1)
                 name = re.sub(r"[^A-Za-z0-9._-]", "_", os.path.basename(full))
                 return self.send(200, data, "audio/wav",
                                  {"Content-Disposition": f'attachment; filename="{name}"'})
-            return self.send(404, json.dumps({"error": "not found"}))
+            return self.json({"error": "not found"}, 404)
         except (BrokenPipeError, ConnectionResetError):
             pass
         except OSError:
-            return self.send(404, json.dumps({"error": "no such file"}))
+            return self.json({"error": "no such file"}, 404)
 
 
-def build_server(root, bind: str = "127.0.0.1", port: int = 8089) -> ThreadingHTTPServer:
+def build_server(root, bind: str = DEFAULT_BIND, port: int = DEFAULT_PORT, *,
+                 wwv: Optional[W.WwvSource] = None,
+                 extra_hosts: Optional[Iterable[str]] = None,
+                 call: str = W.CALL) -> ThreadingHTTPServer:
     """The server for archive `root` (not created if missing: read-only).
-    Refuses / as the root: that would serve every .wav on the host."""
+    Refuses / as the root: that would serve every .wav on the host.
+    `wwv`: where WWV's Doppler comes from (default: none).  `extra_hosts`:
+    more Host names to accept (default: $CARRIER_BROWSER_ALLOWED_HOSTS)."""
     if os.path.realpath(str(root)) == os.sep:
         raise ValueError("refusing to serve / as the carrier archive root")
-    srv = ThreadingHTTPServer((bind, port), Handler)
+    family = socket.AF_INET6 if ":" in bind else socket.AF_INET
+    cls = type("CarrierBrowserServer", (ThreadingHTTPServer,), {"address_family": family})
+    srv = cls((bind, port), Handler)
     srv.daemon_threads = True
     srv.root = os.path.realpath(str(root))
     srv.loopback_only = _is_loopback(bind)
+    if extra_hosts is None:
+        extra_hosts = _env_list(os.environ.get(ENV_ALLOWED))
+    srv.allowed_hosts = allowed_hosts(bind, extra_hosts)
+    srv.wwv = wwv or W.WwvSource()
+    srv.cache = CarrierCache()
+    srv.call = call
     return srv
 
 
 def parse_args(argv=None) -> argparse.Namespace:
+    env = os.environ
     ap = argparse.ArgumentParser(prog="python -m wspr_recorder.carrier_browser",
                                  description="Browse wspr-recorder's carrier archive (read-only).")
     ap.add_argument("--root", required=True, help="the carrier archive ([carrier_archive] root)")
-    ap.add_argument("--bind", default="127.0.0.1",
-                    help="address to listen on (default 127.0.0.1; use ssh -L to reach it)")
-    ap.add_argument("--port", type=int, default=8089)
+    ap.add_argument("--bind", default=env.get(ENV_BIND) or DEFAULT_BIND,
+                    help=f"address to listen on (default ${ENV_BIND}, else 127.0.0.1; "
+                         f"0.0.0.0 or a LAN address serves the network: there is no "
+                         f"authentication)")
+    ap.add_argument("--port", type=int, default=int(env.get(ENV_PORT) or DEFAULT_PORT),
+                    help=f"default ${ENV_PORT}, else {DEFAULT_PORT}")
+    ap.add_argument("--timestd-db", default=env.get(ENV_TIMESTD_DB) or DEFAULT_TIMESTD_DB,
+                    help=f"hf-timestd's SQLite database, for WWV's Doppler (default "
+                         f"${ENV_TIMESTD_DB}, else {DEFAULT_TIMESTD_DB}; 'none' for no WWV)")
+    ap.add_argument("--allow-host", action="append", default=None, metavar="NAME",
+                    help=f"also accept this Host name (repeatable; default "
+                         f"${ENV_ALLOWED}, comma-separated)")
+    ap.add_argument("--call", default=W.CALL, help=argparse.SUPPRESS)
     return ap.parse_args(argv)
 
 
 def main(argv=None) -> int:
     a = parse_args(argv)
+    wwv = W.WwvSource() if a.timestd_db.lower() == "none" else W.TimestdWwv(a.timestd_db)
+    extra = a.allow_host if a.allow_host is not None else _env_list(os.environ.get(ENV_ALLOWED))
     try:
-        srv = build_server(a.root, a.bind, a.port)
+        srv = build_server(a.root, a.bind, a.port, wwv=wwv, extra_hosts=extra, call=a.call)
     except ValueError as exc:
         print(f"carrier-browser: {exc}", file=sys.stderr, flush=True)
         sys.exit(2)
     if not srv.loopback_only:
         print(f"carrier-browser: WARNING: listening on {a.bind}, not loopback: "
-              f"anyone who can reach it can read the archive", file=sys.stderr, flush=True)
-    print(f"carrier-browser: {srv.root} at http://{a.bind}:{a.port}/", flush=True)
+              f"anyone who can reach it can read the archive (no authentication)",
+              file=sys.stderr, flush=True)
+    print(f"carrier-browser: {srv.root} at http://{a.bind}:{a.port}/; WWV from "
+          f"{getattr(wwv, 'db_path', 'nowhere')}; Host names accepted: "
+          f"{', '.join(sorted(srv.allowed_hosts))} and any IP address", flush=True)
     try:
         srv.serve_forever()
     except KeyboardInterrupt:
@@ -275,31 +540,52 @@ def main(argv=None) -> int:
 
 PAGE = r"""<!doctype html>
 <html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
-<title>Spot Carriers</title>
+<title>WW0WWV vs WWV</title>
 <style>
-:root{--bg:#fbfbfa;--fg:#1d1f21;--muted:#6b6f75;--line:#dcdfe3;--card:#fff;--acc:#1f6fb5;--a2:#d9730d;--sel:#e8f1fa}
-@media (prefers-color-scheme: dark){:root{--bg:#16181b;--fg:#e6e6e6;--muted:#9aa0a6;--line:#2c3036;--card:#1e2125;--acc:#6fb3f2;--a2:#f2a35e;--sel:#203040}}
+:root{--bg:#fbfbfa;--fg:#1d1f21;--muted:#6b6f75;--line:#dcdfe3;--card:#fff;--acc:#1f6fb5;--a2:#d9730d;--sel:#e8f1fa;--zero:#9aa0a6}
+@media (prefers-color-scheme: dark){:root{--bg:#16181b;--fg:#e6e6e6;--muted:#9aa0a6;--line:#2c3036;--card:#1e2125;--acc:#6fb3f2;--a2:#f2a35e;--sel:#203040;--zero:#5b6067}}
 *{box-sizing:border-box}body{margin:0;background:var(--bg);color:var(--fg);font:14px/1.4 system-ui,-apple-system,Segoe UI,sans-serif}
 header{padding:12px 16px;border-bottom:1px solid var(--line);display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center}
-h1{font-size:16px;margin:0 8px 0 0}label{color:var(--muted);font-size:12px;margin-right:4px}
+h1{font-size:16px;margin:0 8px 0 0}h2{font-size:15px;margin:0}label{color:var(--muted);font-size:12px;margin-right:4px}
 select,button{font:inherit;padding:4px 8px;border:1px solid var(--line);border-radius:6px;background:var(--card);color:var(--fg)}
-button{cursor:pointer}main{display:grid;grid-template-columns:minmax(320px,1fr) minmax(360px,1.4fr);gap:16px;padding:16px}
-@media (max-width:900px){main{grid-template-columns:1fr}}
+button{cursor:pointer}button[aria-pressed=true]{background:var(--sel);border-color:var(--acc)}
+.views{display:flex;gap:4px}
+#spotsView main{display:grid;grid-template-columns:minmax(320px,1fr) minmax(360px,1.4fr);gap:16px;padding:16px}
+@media (max-width:900px){#spotsView main{grid-template-columns:1fr}}
+#compareView{padding:16px;display:grid;gap:16px}
 .card{background:var(--card);border:1px solid var(--line);border-radius:10px;padding:12px;min-width:0}
+.bar{display:flex;flex-wrap:wrap;gap:8px 16px;align-items:center;padding:12px 16px 0}
 table{border-collapse:collapse;width:100%;font-variant-numeric:tabular-nums}th,td{text-align:left;padding:4px 6px;border-bottom:1px solid var(--line);white-space:nowrap}
 th{font-size:12px;color:var(--muted);font-weight:600}tr.spot{cursor:pointer}tr.spot:hover{background:var(--sel)}tr.on{background:var(--sel)}
 tr.band td{font-weight:600;padding-top:10px;color:var(--muted)}.num{text-align:right}.muted{color:var(--muted)}
-canvas{width:100%;display:block;margin-top:8px}.legend span{margin-right:12px;font-size:12px}.sw{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:-1px}
-#info{font-size:13px}#info b{font-weight:600}a{color:var(--acc)}
+canvas{width:100%;display:block;margin-top:8px}canvas.click{cursor:crosshair}.legend span{margin-right:12px;font-size:12px}.sw{display:inline-block;width:10px;height:10px;border-radius:2px;margin-right:4px;vertical-align:-1px}
+#info{font-size:13px}#info b,.dinfo b{font-weight:600}a{color:var(--acc)}
 .tablewrap{overflow-x:auto;max-height:75vh;overflow-y:auto}
+.sub{font-size:12px;color:var(--muted);margin-top:2px;font-variant-numeric:tabular-nums}
+.drill{border-top:1px solid var(--line);margin-top:12px;padding-top:8px}.dinfo{font-size:13px;font-variant-numeric:tabular-nums}
+.drillgrid{display:grid;grid-template-columns:1fr 1fr;gap:12px}@media (max-width:900px){.drillgrid{grid-template-columns:1fr}}
+.warn{color:var(--a2)}[hidden]{display:none!important}
 </style></head><body>
-<header><h1>Spot carriers</h1>
-<span><label for="date">Date (UTC)</label><select id="date"></select></span>
+<header><h1>WW0WWV vs WWV</h1>
+<span class="views" role="group" aria-label="View"><button id="vCompare" aria-pressed="true">Comparison</button><button id="vSpots" aria-pressed="false">All spots</button></span>
+<span><label for="date">Date (UTC)</label><button id="dprev" title="Day before">&#9664;</button> <select id="date"></select> <button id="dnext" title="Day after">&#9654;</button></span>
+<span id="rxwrap"><label for="crx">Receiver</label><select id="crx"></select></span>
+<span id="status" class="muted"></span>
+</header>
+<section id="compareView" aria-label="WW0WWV against WWV">
+<p class="muted" style="margin:0">WW0WWV's carrier (the WWV-site WSPR beacon, its modulation removed) against WWV's own carrier on the nearest frequency.
+Doppler is in parts per billion of each nominal frequency, so the two compare directly: on a shared path they should move together.
+<span style="color:var(--a2)">&#9632;</span> WW0WWV, one point per WSPR cycle (its whole transmission);
+<span style="color:var(--acc)">&#9473;</span> WWV, one value per minute from hf-timestd. Click a WW0WWV point for that cycle.</p>
+<div id="pairs"></div>
+</section>
+<section id="spotsView" hidden>
+<div class="bar">
 <span><label for="cycle">Cycle</label><button id="prev" title="Earlier cycle">&#9664;</button> <select id="cycle"></select> <button id="next" title="Later cycle">&#9654;</button></span>
 <span><label for="rx">Receiver</label><select id="rx"><option value="">all</option></select></span>
 <span><label for="band">Band</label><select id="band"><option value="">all</option></select></span>
 <span><label><input type="checkbox" id="overlay"> overlay spots (Doppler in ppb)</label></span>
-</header>
+</div>
 <main>
 <section class="card"><div class="tablewrap"><table><thead><tr><th>Call</th><th>Message</th><th class="num">SNR</th><th class="num">Frequency, Hz</th><th class="num">Spread, Hz</th><th>Mode</th></tr></thead><tbody id="spots"></tbody></table></div><p id="count" class="muted"></p></section>
 <section class="card"><div id="info" class="muted">Pick a spot to plot its carrier.</div>
@@ -307,23 +593,114 @@ canvas{width:100%;display:block;margin-top:8px}.legend span{margin-right:12px;fo
 <canvas id="dop" height="220" aria-label="Doppler"></canvas><div class="legend" id="legend"></div>
 <canvas id="snr" height="140" aria-label="SNR"></canvas></section>
 </main>
+</section>
 <script>
 "use strict";
 const $=id=>document.getElementById(id);
 function esc(v){return String(v??"").replace(/[&<>"']/g,c=>({"&":"&amp;","<":"&lt;",">":"&gt;",'"':"&quot;","'":"&#39;"})[c]);}
-function num(v,d){const x=Number(v);return v==null||!isFinite(x)?"":x.toFixed(d);}
+function num(v,d){const x=Number(v);return v==null||v===""||!isFinite(x)?"":x.toFixed(d);}
+function sgn(v,d){const s=num(v,d);return s===""?"?":(Number(v)>0?"+":"")+s;}
+function css(n){return getComputedStyle(document.body).getPropertyValue(n).trim();}
 const COLORS=["#1f6fb5","#d9730d","#2a9d55","#b5341f","#7a4fb5","#8a6d1f","#1f8f9a"];
-let spotsData=[], overlay=[];
+let spotsData=[], overlay=[], view="compare", cmp=null, sel={};
 async function j(url){const r=await fetch(url);if(!r.ok)throw new Error(url+": "+r.status);return r.json();}
 function opt(sel,v,t){const o=document.createElement("option");o.value=v;o.textContent=t??v;sel.appendChild(o);}
 function hhmm(h){return h.slice(0,2)+":"+h.slice(2);}
-async function loadDates(){const d=await j("/api/dates");$("date").innerHTML="";d.forEach(x=>opt($("date"),x,x.slice(0,4)+"-"+x.slice(4,6)+"-"+x.slice(6)));
- if(!d.length){$("count").textContent="No carrier files yet. They appear after the decoders (ubersdr wsprd -I, jt9 --carrier-dir) have run a cycle.";return;}
- const p=new URLSearchParams(location.hash.slice(1));if(p.get("date")&&d.includes(p.get("date")))$("date").value=p.get("date");await loadCycles(p.get("hhmm"));}
+function pad2(n){return String(n).padStart(2,"0");}
+function utc(t){const d=new Date(t*1000);return pad2(d.getUTCHours())+":"+pad2(d.getUTCMinutes());}
+function pst(t){return utc(t-8*3600);}
+function todayUTC(){const d=new Date();return d.getUTCFullYear()+pad2(d.getUTCMonth()+1)+pad2(d.getUTCDate());}
+function dayLabel(x){return x.slice(0,4)+"-"+x.slice(4,6)+"-"+x.slice(6);}
+function hashParams(){return new URLSearchParams(location.hash.slice(1));}
+function setHash(p){const q=new URLSearchParams();for(const [k,v] of Object.entries(p))if(v)q.set(k,v);history.replaceState(null,"","#"+q.toString());}
+
+// ---- canvas plumbing ----
+function frame(cv,xr,yr,xticks,yl,opts){opts=opts||{};const dpr=window.devicePixelRatio||1,W=cv.clientWidth||600;if(!cv.dataset.h)cv.dataset.h=cv.getAttribute("height");const H=+cv.dataset.h;
+ cv.width=W*dpr;cv.height=H*dpr;cv.style.height=H+"px";
+ const g=cv.getContext("2d");g.setTransform(dpr,0,0,dpr,0,0);g.clearRect(0,0,W,H);const fg=css("--fg"),mu=css("--muted"),ln=css("--line");
+ const L=58,R=10,T=18,B=opts.two?40:30,w=W-L-R,h=H-T-B;g.font="11px system-ui";g.strokeStyle=ln;g.fillStyle=mu;g.lineWidth=1;
+ const X=x=>L+(x-xr[0])/(xr[1]-xr[0])*w,Y=y=>T+h-(y-yr[0])/(yr[1]-yr[0])*h;
+ for(let i=0;i<=5;i++){const y=yr[0]+(yr[1]-yr[0])*i/5;g.beginPath();g.moveTo(L,Y(y));g.lineTo(L+w,Y(y));g.stroke();g.fillText(+y.toPrecision(3)+"",4,Y(y)+4);}
+ for(const t of xticks){const x=X(t[0]);g.beginPath();g.moveTo(x,T);g.lineTo(x,T+h);g.stroke();g.fillText(t[1],x-g.measureText(t[1]).width/2,T+h+13);if(t[2])g.fillText(t[2],x-g.measureText(t[2]).width/2,T+h+26);}
+ if(opts.two){g.fillText("UTC",2,T+h+13);g.fillText("PST",2,T+h+26);}else if(opts.xl)g.fillText(opts.xl,L+w/2-g.measureText(opts.xl).width/2,T+h+27);
+ if(yr[0]<0&&yr[1]>0){g.strokeStyle=css("--zero");g.beginPath();g.moveTo(L,Y(0));g.lineTo(L+w,Y(0));g.stroke();}
+ g.fillStyle=fg;g.fillText(yl,L,12);
+ cv._map={xr,L,w};return {g,X,Y,L,T,w,h};}
+function clip(A){A.g.save();A.g.beginPath();A.g.rect(A.L,A.T,A.w,A.h);A.g.clip();}
+function series(A,s){const g=A.g;g.strokeStyle=g.fillStyle=s.color;g.lineWidth=s.lw||1.5;
+ if(s.kind==="line"){g.beginPath();let prev=null;for(const p of s.pts){if(p[1]==null){prev=null;continue;}const x=A.X(p[0]),y=A.Y(p[1]);(prev!==null&&(!s.gap||p[0]-prev<=s.gap))?g.lineTo(x,y):g.moveTo(x,y);prev=p[0];}g.stroke();}
+ else if(s.kind==="step"){for(const p of s.pts){if(p[2]==null)continue;g.beginPath();g.moveTo(A.X(p[0]),A.Y(p[2]));g.lineTo(A.X(p[1]),A.Y(p[2]));g.stroke();}}
+ else if(s.kind==="hline"){g.setLineDash([4,3]);g.beginPath();g.moveTo(A.L,A.Y(s.y));g.lineTo(A.L+A.w,A.Y(s.y));g.stroke();g.setLineDash([]);}
+ else{const r=s.r||3;for(const p of s.pts){if(p[1]==null)continue;const x=A.X(p[0]),y=A.Y(p[1]);if(s.kind==="sq")g.fillRect(x-r,y-r,2*r,2*r);else{g.beginPath();g.arc(x,y,r,0,7);g.fill();}}}}
+function pct(a,q){if(!a.length)return null;const s=[...a].sort((x,y)=>x-y),i=(s.length-1)*q,lo=Math.floor(i),hi=Math.ceil(i);return s[lo]+(s[hi]-s[lo])*(i-lo);}
+function yrange(vals,minPad,robust){vals=vals.filter(v=>v!=null&&isFinite(v));if(!vals.length)return [-minPad,minPad];
+ let lo=robust?pct(vals,0.02):Math.min(...vals),hi=robust?pct(vals,0.98):Math.max(...vals);const p=Math.max(minPad,0.3*(hi-lo));return [lo-p,hi+p];}
+
+// ---- comparison view ----
+function rxSel(){return $("crx").value;}
+async function loadCompare(){const date=$("date").value;$("status").textContent="Loading "+dayLabel(date)+" ...";
+ try{cmp=await j("/api/compare?date="+date);}catch(e){$("status").textContent=String(e);return;}
+ const cur=rxSel();$("crx").innerHTML="";cmp.receivers.forEach(r=>opt($("crx"),r));if(cmp.receivers.includes(cur))$("crx").value=cur;
+ $("rxwrap").hidden=view!=="compare"||cmp.receivers.length<2;
+ const n=cmp.bands.reduce((a,b)=>a+b.cycles.length,0);$("status").textContent=n?"":"No "+cmp.call+" carriers on "+dayLabel(date)+".";
+ drawCompare();}
+function bandCycles(b){const rx=rxSel();return b.cycles.filter(c=>!rx||c.receiver===rx);}
+function drawCompare(){if(!cmp)return;const box=$("pairs");box.innerHTML="";const day0=Date.UTC(+cmp.date.slice(0,4),+cmp.date.slice(4,6)-1,+cmp.date.slice(6))/1000;
+ const xr=[day0,day0+86400],xt=[];for(let h=0;h<=24;h+=3)xt.push([day0+h*3600,pad2(h%24)+":00",pad2((h+16)%24)+":00"]);
+ const cw=css("--a2"),cv=css("--acc");
+ for(const b of cmp.bands){const cyc=bandCycles(b),wv=b.wwv||{points:[]};const card=document.createElement("div");card.className="card";card.id="pair"+b.band;
+  const diffs=cyc.filter(c=>c.wwv_ppb!=null).map(c=>c.ppb-c.wwv_ppb);
+  const wtxt=wv.available?"WWV "+esc(b.wwv_mhz)+" MHz: "+esc(wv.points.length)+" minutes from "+esc(wv.source)+" ("+esc(wv.channel)+")":'<span class="warn">no WWV data</span>: '+esc(wv.reason);
+  card.innerHTML="<h2>"+esc(b.band)+" m WW0WWV &middot; WWV "+esc(b.wwv_mhz)+" MHz</h2><div class=\"sub\">"+esc(cmp.call)+" nominal "+esc(num(b.nominal_hz,3))+" Hz &middot; "+esc(cyc.length)+" cycles &middot; "+wtxt
+   +(diffs.length?" &middot; median WW0WWV &minus; WWV "+esc(sgn(pct(diffs,0.5),2))+" ppb over "+esc(diffs.length)+" cycles":"")+"</div>"
+   +'<canvas class="click dopc" height="230" aria-label="Doppler, ppb, over the day"></canvas><canvas class="snrc" height="120" aria-label="SNR over the day"></canvas>'
+   +'<div class="legend"><span><i class="sw" style="background:'+esc(cw)+'"></i>WW0WWV '+esc(b.band)+' m, whole transmission</span><span><i class="sw" style="background:'+esc(cv)+'"></i>WWV '+esc(b.wwv_mhz)+' MHz, per minute</span></div><div class="drill" hidden></div>';
+  box.appendChild(card);
+  const dop=card.querySelector(".dopc"),sn=card.querySelector(".snrc");
+  card._redraw=()=>{
+  const wp=wv.points.map(p=>[p.t+30,p.ppb]),sp=cyc.map(c=>[c.epoch+60,c.ppb]);
+  let A=frame(dop,xr,yrange(wp.map(p=>p[1]).concat(sp.map(p=>p[1])),5,true),xt,"Doppler, ppb from nominal",{two:true});
+  clip(A);series(A,{kind:"line",pts:wp,color:cv,gap:180,lw:1.2});series(A,{kind:"dot",pts:wp,color:cv,r:1.2});series(A,{kind:"sq",pts:sp,color:cw,r:3});
+  if(sel[b.band])series(A,{kind:"line",pts:[[sel[b.band],-1e9],[sel[b.band],1e9]],color:css("--muted"),lw:1});A.g.restore();
+  const ws=wv.points.filter(p=>p.snr!=null).map(p=>[p.t+30,p.snr]),ss=cyc.filter(c=>c.snr_wsprd!=null).map(c=>[c.epoch+60,Number(c.snr_wsprd)]);
+  A=frame(sn,xr,yrange(ws.map(p=>p[1]).concat(ss.map(p=>p[1])),3,false),xt.map(t=>[t[0],"",""]),"SNR, dB: WW0WWV wsprd (2500 Hz); WWV hf-timestd tick SNR",{});
+  clip(A);series(A,{kind:"line",pts:ws,color:cv,gap:180,lw:1});series(A,{kind:"sq",pts:ss,color:cw,r:2.5});A.g.restore();};
+  card._redraw();
+  dop.onclick=e=>{const m=dop._map,r=dop.getBoundingClientRect(),px=e.clientX-r.left;let best=null,bd=12;
+   for(const c of cyc){const x=m.L+(c.epoch+60-m.xr[0])/(m.xr[1]-m.xr[0])*m.w,d=Math.abs(x-px);if(d<bd){bd=d;best=c;}}
+   if(best)drill(b,best,card);};}
+ const p=hashParams();if(p.get("band")&&p.get("hhmm")){const b=cmp.bands.find(x=>x.band===p.get("band"));const c=b&&bandCycles(b).find(x=>x.hhmm===p.get("hhmm"));if(c)drill(b,c,$("pair"+b.band));}}
+async function drill(b,c,card){const el=card.querySelector(".drill");el.hidden=false;el.innerHTML='<div class="dinfo muted">Loading '+esc(hhmm(c.hhmm))+" ...</div>";
+ setHash({date:cmp.date,band:b.band,hhmm:c.hhmm});
+ let d;try{d=await j("/api/cycle?date="+cmp.date+"&hhmm="+c.hhmm+"&band="+encodeURIComponent(b.band)+"&rx="+encodeURIComponent(c.receiver));}catch(e){el.innerHTML='<div class="dinfo">'+esc(e)+"</div>";return;}
+ const s=d.summary||{},m=d.meta||{},wv=d.wwv||{points:[]},cw=css("--a2"),cv=css("--acc"),list=bandCycles(b),i=list.indexOf(c);
+ const diff=(s.ppb!=null&&d.wwv_ppb!=null)?s.ppb-d.wwv_ppb:null;
+ el.innerHTML='<div class="dinfo"><button class="dp" title="Earlier cycle">&#9664;</button> <button class="dn" title="Later cycle">&#9654;</button> <b>'+esc(b.band)+" m, "+esc(hhmm(d.hhmm))+" UTC</b> ("+esc(pst(d.epoch))+" PST) &middot; "+esc(m.message)+" &middot; "+esc(d.receiver)
+  +" &middot; SNR "+esc(sgn(m.snr,0))+" dB (wsprd)<br>WW0WWV over the transmission <b>"+esc(sgn(s.ppb,2))+" ppb</b> ("+esc(sgn(s.hz*1000,1))+" mHz) &middot; WWV "+esc(d.wwv_mhz)+" MHz over the same minutes <b>"
+  +(d.wwv_ppb!=null?esc(sgn(d.wwv_ppb,2))+" ppb</b> ("+esc(wv.channel)+")":'</b><span class="warn">no WWV data</span> ('+esc(wv.reason)+")")
+  +(diff!=null?" &middot; difference <b>"+esc(sgn(diff,2))+" ppb</b>":"")+' &middot; <a href="/file?path='+encodeURIComponent(d.path)+'">download .wav</a> &middot; <a href="#view=spots&date='+esc(d.date)+"&hhmm="+esc(d.hhmm)+'" class="tospots">all spots of this cycle</a></div>'
+  +'<div class="drillgrid"><div><canvas class="dspec" height="200" aria-label="WW0WWV spectrogram"></canvas></div><div><canvas class="dtrack" height="200" aria-label="Doppler track"></canvas><canvas class="dsnr" height="110" aria-label="SNR track"></canvas>'
+  +'<div class="legend"><span><i class="sw" style="background:'+esc(cw)+'"></i>WW0WWV, '+esc(d.track?d.track.win_s:"")+' s windows every 2 s</span><span><i class="sw" style="background:'+esc(cv)+'"></i>WWV, each minute</span></div></div></div>';
+ el.querySelector(".dp").onclick=()=>{if(i>0)drill(b,list[i-1],card);};el.querySelector(".dn").onclick=()=>{if(i>=0&&i<list.length-1)drill(b,list[i+1],card);};
+ el.querySelector(".tospots").onclick=e=>{e.preventDefault();showView("spots",d.hhmm);};
+ sel[b.band]=c.epoch+60;card._redraw&&card._redraw();
+ const xr=[0,120],xt=[0,20,40,60,80,100,120].map(x=>[x,x+" s"]),E=d.epoch;
+ const tp=(d.track?d.track.points:[]).map(p=>[p.t-E,p.ppb]),wm=wv.points.filter(p=>p.t>=E-60&&p.t<E+180).map(p=>[p.t-E,p.t-E+60,p.ppb]);
+ let A=frame(el.querySelector(".dtrack"),xr,yrange(tp.map(p=>p[1]).concat(wm.map(p=>p[2])),3,false),xt,"Doppler, ppb from nominal",{xl:"seconds into the cycle"});
+ clip(A);series(A,{kind:"step",pts:wm,color:cv,lw:3});series(A,{kind:"line",pts:tp,color:cw});series(A,{kind:"dot",pts:tp,color:cw,r:2});if(s.ppb!=null)series(A,{kind:"hline",y:s.ppb,color:cw,lw:1});A.g.restore();
+ const ts=(d.track?d.track.points:[]).filter(p=>p.snr!=null).map(p=>[p.t-E,p.snr]),wsn=wv.points.filter(p=>p.t>=E-60&&p.t<E+180).map(p=>[p.t-E,p.t-E+60,p.snr]);
+ A=frame(el.querySelector(".dsnr"),xr,yrange(ts.map(p=>p[1]).concat(wsn.map(p=>p[2])),3,false),xt,"SNR, dB",{});
+ clip(A);series(A,{kind:"step",pts:wsn,color:cv,lw:3});series(A,{kind:"line",pts:ts,color:cw});A.g.restore();
+ try{const buf=await (await fetch("/file?path="+encodeURIComponent(d.path))).arrayBuffer();const cr=parseWav(buf);const rf=(m.dial_mhz!=null&&m.ref_hz!=null)?m.dial_mhz*1e6+m.ref_hz:d.rf_hz;
+  drawSpec(cr,el.querySelector(".dspec"),{off:rf-d.nominal_hz,yr:[-1.5,1.5],xr:[0,120],label:"WW0WWV, Hz from nominal "+num(d.nominal_hz,3)});}catch(e){}
+}
+
+// ---- all-spots view (and the carrier maths it plots in the browser) ----
 async function loadCycles(want){const c=await j("/api/cycles?date="+$("date").value);$("cycle").innerHTML="";c.forEach(x=>opt($("cycle"),x.hhmm,hhmm(x.hhmm)+"  ("+x.spots+")"));
+ if(!c.length){$("spots").innerHTML="";$("count").textContent="No carrier files on this date.";return;}
  if(want&&c.some(x=>x.hhmm===want))$("cycle").value=want;await loadSpots();}
 async function loadSpots(){if(!$("cycle").value){$("spots").innerHTML="";return;}
- location.hash="date="+$("date").value+"&hhmm="+$("cycle").value;
+ setHash({view:"spots",date:$("date").value,hhmm:$("cycle").value});
  spotsData=await j("/api/spots?date="+$("date").value+"&hhmm="+$("cycle").value);
  for(const [id,key] of [["rx","receiver"],["band","band"]]){const cur=$(id).value;$(id).innerHTML='<option value="">all</option>';[...new Set(spotsData.map(s=>s[key]))].sort((a,b)=>isNaN(a)?a.localeCompare(b):b-a).forEach(v=>opt($(id),v));if([...$(id).options].some(o=>o.value===cur))$(id).value=cur;}
  render();}
@@ -339,7 +716,7 @@ function parseWav(buf){const v=new DataView(buf);let i=12,rate=15,meta={},iq=nul
  while(i+8<=v.byteLength){const id=String.fromCharCode(...new Uint8Array(buf,i,4)),n=v.getUint32(i+4,true);
   if(id==="fmt ")rate=v.getUint32(i+12,true);
   else if(id==="LIST"){const t=new TextDecoder().decode(new Uint8Array(buf,i+20,v.getUint32(i+16,true)));try{meta=JSON.parse(t.split("\0")[0]);}catch(e){}}
-  else if(id==="data"){iq=new Float32Array(buf.slice(i+8,i+8+n));break;}
+  else if(id==="data"){iq=new Float32Array(buf.slice(i+8,i+8+(n&~7)));break;}
   i+=8+n+(n&1);}
  return {rate,meta,iq};}
 function fft(re,im){const n=re.length;for(let i=1,j=0;i<n;i++){let b=n>>1;for(;j&b;b>>=1)j^=b;j^=b;if(i<j){[re[i],re[j]]=[re[j],re[i]];[im[i],im[j]]=[im[j],im[i]];}}
@@ -356,20 +733,13 @@ function snr(iq,s,n,rate){const nfft=1<<Math.ceil(Math.log2(n)),p=spectrum(iq,s,
 function track(c){const {iq,rate,meta}=c,N=iq.length/2,win=(meta.snr!=null&&meta.snr<=-15)?30:10,nw=Math.min(N,Math.round(win*rate)),ns=Math.round(2*rate);
  const whole=peak(iq,0,N,rate),pts=[];for(let s=0;s+nw<=N;s+=ns)pts.push({t:(meta.t0_s||0)+(s+nw/2)/rate,f:peak(iq,s,nw,rate,whole,2),snr:snr(iq,s,nw,rate)});
  return {whole,win,pts};}
-function axes(cv,xr,yr,xl,yl){const dpr=window.devicePixelRatio||1,W=cv.clientWidth;if(!cv.dataset.h)cv.dataset.h=cv.getAttribute("height");const H=+cv.dataset.h;
- cv.width=W*dpr;cv.height=H*dpr;cv.style.height=H+"px";
- const g=cv.getContext("2d");g.setTransform(dpr,0,0,dpr,0,0);const cs=getComputedStyle(document.body),fg=cs.getPropertyValue("--fg"),mu=cs.getPropertyValue("--muted"),ln=cs.getPropertyValue("--line");
- const L=58,R=10,T=18,B=30,w=W-L-R,h=H-T-B;g.font="11px system-ui";g.strokeStyle=ln;g.fillStyle=mu;
- const X=x=>L+(x-xr[0])/(xr[1]-xr[0])*w,Y=y=>T+h-(y-yr[0])/(yr[1]-yr[0])*h;
- for(let i=0;i<=5;i++){const y=yr[0]+(yr[1]-yr[0])*i/5;g.beginPath();g.moveTo(L,Y(y));g.lineTo(L+w,Y(y));g.stroke();g.fillText(+y.toPrecision(3)+"",4,Y(y)+4);}
- for(let i=0;i<=6;i++){const x=xr[0]+(xr[1]-xr[0])*i/6;g.fillText(Math.round(x)+"",X(x)-8,T+h+14);}
- g.fillText(xl,L+w/2-40,T+h+27);g.fillStyle=fg;g.fillText(yl,L,12);
- return {g,X,Y,L,T,w,h};}
-function drawSpec(c){const {iq,rate,meta}=c,N=iq.length/2,n=Math.round(10*rate),hop=Math.round(rate),nfft=1024,span=3;const cols=[];
+function axes(cv,xr,yr,xl,yl){const xt=[];for(let i=0;i<=6;i++){const x=xr[0]+(xr[1]-xr[0])*i/6;xt.push([x,Math.round(x)+""]);}return frame(cv,xr,yr,xt,yl,{xl});}
+function drawSpec(c,cv,o){o=o||{};const {iq,rate,meta}=c,N=iq.length/2,n=Math.round(10*rate),hop=Math.round(rate),nfft=1024,span=3,off=o.off||0;const cols=[];
+ if(N<n)return;
  for(let s=0;s+n<=N;s+=hop){const p=spectrum(iq,s,n,nfft,true),col=[];for(let k=0;k<nfft;k++){const f=fq(k,nfft,rate);if(Math.abs(f)<=span)col.push([f,10*Math.log10(p[k]+1e-30)]);}col.sort((a,b)=>a[0]-b[0]);cols.push(col);}
- const t0=(meta.t0_s||0)+5,t1=t0+(cols.length-1);const A=axes($("spec"),[t0-5,t1+5],[-span,span],"seconds into the cycle","Hz from "+(c.ref).toFixed(3)+" Hz (decoder's frequency)");
- let mx=-1e9;cols.forEach(col=>col.forEach(v=>{if(v[1]>mx)mx=v[1];}));const img=A.g;const cw=Math.max(1,A.w/cols.length),rh=A.h/cols[0].length;
- cols.forEach((col,i)=>col.forEach((v,k)=>{const z=Math.max(0,Math.min(1,(v[1]-(mx-40))/40));img.fillStyle="hsl("+(240-240*z)+",80%,"+(15+45*z)+"%)";img.fillRect(A.X(t0+i)-cw/2,A.Y(v[0])-rh,cw+0.5,rh+0.5);}));}
+ const t0=(meta.t0_s||0)+5,t1=t0+(cols.length-1),xr=o.xr||[t0-5,t1+5],yr=o.yr||[-span,span];const A=axes(cv,xr,yr,"seconds into the cycle",o.label||("Hz from "+(c.ref).toFixed(3)+" Hz (decoder's frequency)"));
+ let mx=-1e9;cols.forEach(col=>col.forEach(v=>{if(v[1]>mx)mx=v[1];}));const img=A.g;const cw=Math.max(1,A.w*(hop/rate)/(xr[1]-xr[0])),rh=A.h*(rate/nfft)/(yr[1]-yr[0]);
+ clip(A);cols.forEach((col,i)=>col.forEach(v=>{const z=Math.max(0,Math.min(1,(v[1]-(mx-40))/40));img.fillStyle="hsl("+(240-240*z)+",80%,"+(15+45*z)+"%)";img.fillRect(A.X(t0+i)-cw/2,A.Y(v[0]+off)-rh/2,cw+0.5,rh+0.5);}));img.restore();}
 function plotLines(cv,series,yl,key){let xs=[],ys=[];series.forEach(s=>s.pts.forEach(p=>{xs.push(p.t);ys.push(p[key]);}));if(!xs.length)return;
  let y0=Math.min(...ys),y1=Math.max(...ys);if(y1-y0<1e-6){y0-=1;y1+=1;}const pad=(y1-y0)*0.1;const A=axes(cv,[Math.min(...xs)-5,Math.max(...xs)+5],[y0-pad,y1+pad],"seconds into the cycle",yl);
  series.forEach(s=>{A.g.strokeStyle=s.color;A.g.fillStyle=s.color;A.g.lineWidth=1.5;A.g.beginPath();s.pts.forEach((p,i)=>{const x=A.X(p.t),y=A.Y(p[key]);i?A.g.lineTo(x,y):A.g.moveTo(x,y);});A.g.stroke();s.pts.forEach(p=>A.g.fillRect(A.X(p.t)-1.5,A.Y(p[key])-1.5,3,3));});}
@@ -380,15 +750,31 @@ async function pick(s,tr){document.querySelectorAll("tr.on").forEach(r=>{if(!$("
  const entry={label,color:COLORS[overlay.length%COLORS.length],pts:t.pts.map(p=>({t:p.t,hz:(p.f-t.whole)*1000,ppb:(p.f-t.whole)/mean*1e9,snr:p.snr}))};
  overlay=$("overlay").checked?overlay.concat([entry]):[entry];
  const m=c.meta||{};$("info").innerHTML="<b>"+esc(s.call)+"</b> "+esc(m.message)+" &middot; "+esc(s.receiver)+" "+esc(s.band)+" m &middot; "+esc(s.mode)+" &middot; SNR "+(esc(m.snr)||"?")+" dB &middot; spread "+(num(m.w50_hz,3)||"?")+" Hz<br>frequency over the transmission "+num(mean,4)+" Hz &middot; "+esc(t.win)+" s windows &middot; <a href=\"/file?path="+encodeURIComponent(s.path)+"\">download .wav</a>";
- drawSpec(c);
+ drawSpec(c,$("spec"));
  if($("overlay").checked)plotLines($("dop"),overlay,"Doppler, ppb from each spot's mean","ppb");else plotLines($("dop"),overlay,"mHz from the transmission's mean","hz");
  plotLines($("snr"),overlay,"SNR, dB in 2500 Hz","snr");
  $("legend").innerHTML=overlay.map(o=>'<span><i class="sw" style="background:'+esc(o.color)+'"></i>'+esc(o.label)+"</span>").join("");}
-$("date").onchange=()=>loadCycles();$("cycle").onchange=loadSpots;$("rx").onchange=render;$("band").onchange=render;
+
+// ---- views, dates ----
+function showView(v,want){view=v;$("compareView").hidden=v!=="compare";$("spotsView").hidden=v!=="spots";
+ $("vCompare").setAttribute("aria-pressed",v==="compare");$("vSpots").setAttribute("aria-pressed",v==="spots");
+ $("rxwrap").hidden=v!=="compare"||!cmp||cmp.receivers.length<2;$("status").textContent="";
+ if(v==="compare"){setHash({date:$("date").value});loadCompare();}else{setHash({view:"spots",date:$("date").value,hhmm:want});loadCycles(want).catch(e=>{$("count").textContent=String(e);});}}
+function onDate(){showView(view);}
+async function init(){const p=hashParams();let d=[];try{d=await j("/api/dates");}catch(e){$("status").textContent=String(e);}
+ const today=todayUTC();if(!d.includes(today))d.unshift(today);d.sort().reverse();$("date").innerHTML="";d.forEach(x=>opt($("date"),x,dayLabel(x)));
+ $("date").value=(p.get("date")&&d.includes(p.get("date")))?p.get("date"):today;
+ showView(p.get("view")==="spots"?"spots":"compare",p.get("hhmm"));}
+$("vCompare").onclick=()=>showView("compare");$("vSpots").onclick=()=>showView("spots");
+$("date").onchange=onDate;$("crx").onchange=drawCompare;
+$("dprev").onclick=()=>{const s=$("date");if(s.selectedIndex<s.options.length-1){s.selectedIndex++;onDate();}};
+$("dnext").onclick=()=>{const s=$("date");if(s.selectedIndex>0){s.selectedIndex--;onDate();}};
+$("cycle").onchange=loadSpots;$("rx").onchange=render;$("band").onchange=render;
 $("prev").onclick=()=>{const s=$("cycle");if(s.selectedIndex<s.options.length-1){s.selectedIndex++;loadSpots();}};
 $("next").onclick=()=>{const s=$("cycle");if(s.selectedIndex>0){s.selectedIndex--;loadSpots();}};
 $("overlay").onchange=()=>{overlay=[];document.querySelectorAll("tr.on").forEach(r=>r.classList.remove("on"));};
-loadDates().catch(e=>{$("count").textContent=String(e);});
+let rs=null;window.addEventListener("resize",()=>{clearTimeout(rs);rs=setTimeout(()=>{if(view==="compare")drawCompare();},200);});
+init();
 </script></body></html>
 """
 
