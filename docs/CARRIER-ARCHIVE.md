@@ -6,6 +6,10 @@
 An optional archive of WSPR / FST4W spots' **carriers**, plus a small
 read-only web page to browse it. Both are **disabled by default**.
 
+**Release note, 2026-11-25: enabling the archive now keeps only WW0WWV
+unless `calls` is set.** Before, `enabled = true` kept every call; set
+`calls = ["*"]` to keep doing that.
+
 **Beta scope: WW0WWV only.** By default only the carriers of **WW0WWV**
 (the WWV-site WSPR beacon) are kept, and the browser's main page compares
 them with WWV's own carrier Doppler. Every other call's carrier is
@@ -228,14 +232,17 @@ hf-timestd writes one row per channel, station and UTC minute into table
 - `channel` (`WWV_20000`, `SHARED_10000`, …);
 - `station` (only `WWV` rows are used; `WWVH` on shared channels is
   skipped);
-- `doppler_hz` (the slope across the minute of the phase of WWV's
-  ticks, mixed down from the channel's IQ; hf-timestd resolves it within
-  ±0.5 Hz);
+- `doppler_hz` (Doppler from nominal: the slope across the minute of the
+  phase of WWV's ticks, measured on the channel's raw IQ);
 - `mean_snr_db`.
 
 WWV's ppb is `doppler_hz / (MHz × 1e6) × 1e9`. The page looks for channels
-`WWV_<kHz>` and `SHARED_<kHz>`. It opens the database read-only
-(`mode=ro`), once per query, and caches each answer for 60 s.
+`WWV_<kHz>` and `SHARED_<kHz>`, narrowing on `timestamp_utc` (the row's
+write time, which hf-timestd indexes with `channel`) as well as the minute.
+It opens the database read-only (`mode=ro`), once per query, and caches
+each answer for 60 s. Read-only, SQLite cannot open the WAL database once
+hf-timestd has stopped and its `-wal`/`-shm` files are gone; the card then
+says **hf-timestd not running**.
 
 The page never demodulates raw WWV IQ. If the database is missing, or has
 no rows for that frequency and day, the card says **no WWV data** with the
@@ -245,6 +252,31 @@ plugged in through `ww0wwv.WwvSource.series()`.
 
 The service user (`wsprrec`) must be able to read `timestd.db`, and its
 `-wal` and `-shm` files.
+
+### WWV's alias range
+
+hf-timestd resolves `doppler_hz` only within **±0.5 Hz**: beyond that the
+tick phase wraps between ticks and a larger Doppler aliases into the range.
+In ppb that is:
+
+| WWV | resolvable |
+|---|---|
+| 10 MHz | ±50 ppb |
+| 15 MHz | ±33 ppb |
+| 20 MHz | ±25 ppb |
+| 25 MHz | ±20 ppb |
+
+The KPH study's 12 m medians (−22 to −28 ppb) are already past 25 MHz's
+range. Each card states the range and draws it as dashed lines. A cycle is
+flagged **WWV may be aliased** (a hollow square, no difference given, left
+out of the median) when:
+
+- WW0WWV's ppb lies outside WWV's resolvable range (same path, so WWV's
+  true Doppler is probably outside it too); or
+- WWV's value is within 10 % of the ±0.5 Hz edge.
+
+`/api/compare` gives `wwv_limit_ppb` and `wwv_limit_hz` per band, and
+`wwv_alias` and `diff_ppb` (null when flagged) per cycle.
 
 ### All spots
 
@@ -312,6 +344,12 @@ Environment=CARRIER_BROWSER_ALLOWED_HOSTS=station.example.org
   unit's `IPAddressAllow=` as narrow as you can, and never expose it to
   the internet. The data is not secret, but the page was not built to
   face hostile traffic.
+- **Bounded.** At most 8 requests are served at once (more get 503).
+  Concurrent requests for one day's comparison share one computation. The
+  per-file cache is LRU-bounded (8000 summaries, 300 tracks: a few MB),
+  and the unit sets `MemoryMax=256M` and `CPUQuota=50%`. A bad carrier
+  file is skipped (logged once), or answered with a JSON error, never a
+  dropped connection.
 - **Read-only.** It answers only GET, and never creates or writes
   anything. The hf-timestd database is opened `mode=ro`. The unit runs it
   with `ProtectSystem=strict` and no writable paths.

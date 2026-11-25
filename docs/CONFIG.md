@@ -107,6 +107,9 @@ Keeps each WSPR/FST4W spot's carrier (`wsprd -I`, `jt9 --carrier-dir`;
 ubersdr decoders 5eeeb53+) as `<root>/YYYYMMDD/RECEIVER/BAND/HHMM_MODE_CALL_RFHZ.wav`.
 See [CARRIER-ARCHIVE.md](CARRIER-ARCHIVE.md).
 
+**Changed 2026-11-25:** enabling the archive now keeps only WW0WWV's
+carriers unless `calls` is set (`calls = ["*"]` for every call, as before).
+
 | Key | Type | Default | Notes |
 |---|---|---|---|
 | `enabled` | bool | `false` | Off: no decoder option is passed; command lines unchanged. |

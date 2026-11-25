@@ -28,6 +28,13 @@ product, one Doppler a minute per channel and station, in the SQLite
 ``timestd.db``.  Anything else that can answer ``WwvSource.series`` can
 stand in for it.
 
+That Doppler is measured from nominal, on the raw IQ, but only within
++-0.5 Hz (``WWV_DOPPLER_LIMIT_HZ``: the phase of 1 Hz ticks wraps beyond
+that): +-50 ppb at 10 MHz, +-33 at 15, +-25 at 20, +-20 at 25.  A larger
+true Doppler aliases into that range, so a cycle whose WW0WWV ppb lies
+outside it, or whose WWV value is within 10 % of its edge, is flagged
+(``wwv_may_alias``) and no difference is given for it.
+
 Standard library and numpy only.
 """
 from __future__ import annotations
@@ -70,6 +77,30 @@ BAND_PAIRS: List[Tuple[str, float]] = [
 WWV_FOR_BAND: Dict[str, float] = dict(BAND_PAIRS)
 
 WIN_S, WEAK_WIN_S, STEP_S, WEAK_SNR_DB = 10.0, 30.0, 2.0, -15.0
+
+# hf-timestd's tick-phase Doppler (tick_edge_detector._estimate_doppler)
+# is unambiguous only within +-0.5 Hz; within 10 % of that edge it may
+# already be an alias.
+WWV_DOPPLER_LIMIT_HZ = 0.5
+WWV_EDGE_FRACTION = 0.9
+
+
+def wwv_limit_ppb(mhz: float) -> float:
+    """The largest Doppler, ppb, hf-timestd resolves on WWV ``mhz`` MHz."""
+    return WWV_DOPPLER_LIMIT_HZ / (mhz * 1e6) * 1e9
+
+
+def wwv_may_alias(ww0wwv_ppb: Optional[float], wwv_ppb: Optional[float],
+                  mhz: float) -> bool:
+    """True when WWV's value for a cycle may be an alias: WW0WWV's Doppler
+    (the same path) lies outside what WWV ``mhz`` resolves, or WWV's own
+    value is within 10 % of that edge.  False when there is no WWV value."""
+    if wwv_ppb is None:
+        return False
+    lim = wwv_limit_ppb(mhz)
+    if abs(float(wwv_ppb)) >= WWV_EDGE_FRACTION * lim:
+        return True
+    return ww0wwv_ppb is not None and bool(abs(float(ww0wwv_ppb)) > lim)
 
 
 # ---- the carrier file --------------------------------------------------------
@@ -244,6 +275,9 @@ class TimestdWwv(WwvSource):
 
     name = "hf-timestd"
     TABLE = "L2_tick_timing"
+    # timestamp_utc is the row's write time (indexed with channel); a
+    # minute's row is written within seconds, but allow the writer to lag.
+    WRITE_LAG_S = 3600
 
     def __init__(self, db_path: str, channels: Optional[Dict[float, Sequence[str]]] = None,
                  cache_s: float = 60.0):
@@ -258,6 +292,34 @@ class TimestdWwv(WwvSource):
             return list(self.channels[mhz])
         khz = int(round(mhz * 1000))
         return [f"WWV_{khz}", f"SHARED_{khz}"]
+
+    def query_sql(self, mhz: float, t0: float, t1: float) -> Tuple[str, tuple]:
+        """The SELECT for WWV ``mhz`` between epochs t0 and t1, and its
+        arguments.  It narrows on (channel, timestamp_utc), hf-timestd's
+        index; timestamp_utc is ISO-8601 text, so it compares as time."""
+        names = self._channel_names(mhz)
+        lo = _iso(t0 - 60)
+        hi = _iso(t1 + self.WRITE_LAG_S)
+        q = (f"SELECT channel, minute_boundary_utc, doppler_hz, mean_snr_db "
+             f"FROM {self.TABLE} WHERE channel IN ({','.join('?' * len(names))}) "
+             f"AND timestamp_utc >= ? AND timestamp_utc < ? "
+             f"AND minute_boundary_utc >= ? AND minute_boundary_utc < ? "
+             f"AND station = 'WWV' AND doppler_hz IS NOT NULL "
+             f"ORDER BY minute_boundary_utc")
+        return q, (*names, lo, hi, int(t0), int(t1))
+
+    def _why(self, exc: Exception) -> str:
+        """A reason for a failed read.  Read-only, SQLite cannot open a WAL
+        database whose -shm is gone unless it may create one: that is what
+        a stopped hf-timestd leaves behind."""
+        msg = str(exc).lower()
+        if "no such table" in msg or "no such column" in msg:
+            return f"cannot read {self.TABLE} from {self.db_path}: {exc}"
+        if (not os.path.exists(self.db_path + "-shm")
+                or any(k in msg for k in ("readonly", "unable to open"))):
+            return (f"hf-timestd not running: cannot open {self.db_path} "
+                    f"read-only ({exc})")
+        return f"cannot read {self.db_path}: {exc}"
 
     def _none(self, reason: str) -> dict:
         return {"available": False, "reason": reason, "source": self.name,
@@ -280,23 +342,18 @@ class TimestdWwv(WwvSource):
     def _query(self, mhz: float, t0: float, t1: float) -> dict:
         if not os.path.isfile(self.db_path):
             return self._none(f"no hf-timestd database at {self.db_path}")
+        q, args = self.query_sql(mhz, t0, t1)
         names = self._channel_names(mhz)
+        con = None
         try:
             uri = "file:" + os.path.abspath(self.db_path) + "?mode=ro"
             con = sqlite3.connect(uri, uri=True, timeout=2)
+            rows = con.execute(q, args).fetchall()
         except sqlite3.Error as exc:
-            return self._none(f"cannot open {self.db_path}: {exc}")
-        try:
-            q = (f"SELECT channel, minute_boundary_utc, doppler_hz, mean_snr_db "
-                 f"FROM {self.TABLE} WHERE channel IN ({','.join('?' * len(names))}) "
-                 f"AND station = 'WWV' AND minute_boundary_utc >= ? "
-                 f"AND minute_boundary_utc < ? AND doppler_hz IS NOT NULL "
-                 f"ORDER BY minute_boundary_utc")
-            rows = con.execute(q, (*names, int(t0), int(t1))).fetchall()
-        except sqlite3.Error as exc:
-            return self._none(f"cannot read {self.TABLE} from {self.db_path}: {exc}")
+            return self._none(self._why(exc))
         finally:
-            con.close()
+            if con is not None:
+                con.close()
         if not rows:
             return self._none(f"no WWV {mhz:g} MHz Doppler from hf-timestd "
                               f"({' or '.join(names)}) in this period")
@@ -323,6 +380,13 @@ class TimestdWwv(WwvSource):
                         "snr": None if snr is None else round(float(snr), 2)})
         return {"available": bool(pts), "reason": "" if pts else "no usable rows",
                 "source": self.name, "channel": ch, "points": pts}
+
+
+def _iso(t: float) -> str:
+    """Epoch as hf-timestd's timestamp_utc prefix (no zone suffix, so it
+    compares below both '...+00:00' and '...Z' at the same second)."""
+    t = max(0.0, float(t))
+    return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t))
 
 
 def wwv_over(series: dict, t0: float, t1: float) -> Optional[float]:

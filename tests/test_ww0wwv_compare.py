@@ -99,8 +99,10 @@ def make_timestd(path: Path, rows) -> Path:
                 "channel TEXT, station TEXT, frequency_mhz REAL, mean_snr_db REAL, "
                 "valid_windows INTEGER, total_windows INTEGER, doppler_hz REAL, "
                 "doppler_uncertainty_hz REAL)")
-    con.executemany("INSERT INTO L2_tick_timing (minute_boundary_utc, channel, station, "
-                    "frequency_mhz, mean_snr_db, doppler_hz) VALUES (?,?,?,?,?,?)", rows)
+    from datetime import datetime, timezone
+    con.executemany("INSERT INTO L2_tick_timing (timestamp_utc, minute_boundary_utc, channel, "
+                    "station, frequency_mhz, mean_snr_db, doppler_hz) VALUES (?,?,?,?,?,?,?)",
+                    [(datetime.fromtimestamp(r[0] + 62, timezone.utc).isoformat(), *r) for r in rows])
     con.commit()
     con.close()
     return path

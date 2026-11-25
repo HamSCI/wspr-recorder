@@ -238,6 +238,8 @@ modes = ["W2"]
 # (127.0.0.1:8089; reach it with ssh -L 8089:127.0.0.1:8089 <host>).
 #
 # [carrier_archive]
+# NOTE: enabling the archive keeps only WW0WWV's carriers unless `calls`
+# is set (the beta default, 2026-11-25).
 # enabled = false
 # # On disk, under the unit's StateDirectory; NOT /dev/shm (RAM).
 # root = "/var/lib/wspr-recorder/carrier-archive"

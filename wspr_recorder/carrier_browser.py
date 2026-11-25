@@ -39,6 +39,7 @@ from __future__ import annotations
 import argparse
 import ipaddress
 import json
+import logging
 import math
 import os
 import re
@@ -48,11 +49,14 @@ import sys
 import threading
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Iterable, Iterator, List, Optional, Tuple
+from collections import OrderedDict
+from typing import Callable, Dict, Iterable, Iterator, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 from . import ww0wwv as W
 from .carrier_archive import base_call
+
+logger = logging.getLogger(__name__)
 
 NAME = re.compile(r"^(\d{4})_([A-Z]\d+)_(.+)_(\d+\.\d+)\.wav$")
 _DATE = re.compile(r"\d{8}")
@@ -69,6 +73,8 @@ ENV_BIND = "CARRIER_BROWSER_BIND"
 ENV_PORT = "CARRIER_BROWSER_PORT"
 ENV_ALLOWED = "CARRIER_BROWSER_ALLOWED_HOSTS"
 ENV_TIMESTD_DB = "TIMESTD_DB"
+# Requests served at once; more get 503 (the page makes a handful).
+MAX_CONCURRENT = 8
 
 
 def _under(root: str, path: str) -> bool:
@@ -192,7 +198,13 @@ def day_epoch(date: str) -> int:
 
 
 def _finite(v):
-    """JSON-safe: NaN and infinities become null, recursively."""
+    """JSON-safe: NaN and infinities become null, numpy scalars Python
+    ones, recursively."""
+    if hasattr(v, "item") and not isinstance(v, (list, tuple, dict, str)):
+        try:
+            v = v.item()
+        except (TypeError, ValueError):
+            pass
     if isinstance(v, float):
         return v if math.isfinite(v) else None
     if isinstance(v, dict):
@@ -203,29 +215,88 @@ def _finite(v):
 
 
 class CarrierCache:
-    """Per-file results (whole-transmission summary, track), keyed by the
-    file's real path, size and mtime; bounded."""
+    """Per-file results, keyed by the file's real path, size and mtime;
+    least recently used first out, with a separate bound per kind.  A
+    summary is a few hundred bytes; a track (with the decode's JSON) is
+    about 10 KB, so the defaults hold well under 10 MB."""
 
-    def __init__(self, limit: int = 20000):
-        self.limit = limit
-        self._d: dict = {}
+    DEFAULT_LIMITS = {"summary": 8000, "track": 300}
+
+    def __init__(self, limits: Optional[Dict[str, int]] = None):
+        self.limits = dict(self.DEFAULT_LIMITS, **(limits or {}))
+        self._d: Dict[str, "OrderedDict"] = {}
         self._lock = threading.Lock()
+
+    def size(self, what: str) -> int:
+        with self._lock:
+            return len(self._d.get(what, ()))
+
+    def clear(self) -> None:
+        with self._lock:
+            self._d.clear()
 
     def get(self, full: str, what: str, compute):
         try:
             st = os.stat(full)
         except OSError:
             return None
-        key = (full, what, st.st_size, st.st_mtime_ns)
+        key = (full, st.st_size, st.st_mtime_ns)
         with self._lock:
-            if key in self._d:
-                return self._d[key]
+            d = self._d.setdefault(what, OrderedDict())
+            if key in d:
+                d.move_to_end(key)
+                return d[key]
         val = compute()
         with self._lock:
-            if len(self._d) >= self.limit:
-                self._d.clear()
-            self._d[key] = val
+            d[key] = val
+            d.move_to_end(key)
+            while len(d) > self.limits.get(what, 100):
+                d.popitem(last=False)
         return val
+
+
+class SingleFlight:
+    """Concurrent calls with one key share one computation: the first runs
+    it, the rest wait for its result (or its exception)."""
+
+    def __init__(self):
+        self._lock = threading.Lock()
+        self._running: Dict[object, list] = {}
+
+    def do(self, key, fn: Callable):
+        with self._lock:
+            slot = self._running.get(key)
+            leader = slot is None
+            if leader:
+                slot = self._running[key] = [threading.Event(), None, None]
+        if not leader:
+            slot[0].wait()
+            if slot[2] is not None:
+                raise slot[2]
+            return slot[1]
+        try:
+            slot[1] = fn()
+            return slot[1]
+        except BaseException as exc:
+            slot[2] = exc
+            raise
+        finally:
+            with self._lock:
+                self._running.pop(key, None)
+            slot[0].set()
+
+
+_BAD_FILES: set = set()
+
+
+def _bad_file(path: str, exc: BaseException) -> None:
+    """Log a carrier file that cannot be measured, once per path."""
+    if path in _BAD_FILES:
+        return
+    if len(_BAD_FILES) > 10000:
+        _BAD_FILES.clear()
+    _BAD_FILES.add(path)
+    logger.warning("carrier browser: skipping %s: %s: %s", path, type(exc).__name__, exc)
 
 
 def ww0wwv_files(root: str, date: str, call: str = W.CALL) -> Iterator[dict]:
@@ -258,16 +329,33 @@ def _summary(root: str, f: dict, cache: CarrierCache) -> Optional[dict]:
     def compute():
         try:
             meta, rate, iq = W.read_carrier(full)
-        except (OSError, ValueError, struct.error):
+            s = W.carrier_summary(meta, rate, iq, f["band"], f["name_rf_hz"])
+            if s is None:
+                return None
+            s["snr_wsprd"] = _num(meta.get("snr"))
+            s["w50_hz"] = _num(meta.get("w50_hz"))
+            s["message"] = str(meta.get("message") or "")[:80]
+            return s
+        except Exception as exc:                      # noqa: BLE001 -- a bad file
+            _bad_file(f["path"], exc)
             return None
-        s = W.carrier_summary(meta, rate, iq, f["band"], f["name_rf_hz"])
-        if s is None:
-            return None
-        s["snr_wsprd"] = meta.get("snr")
-        s["w50_hz"] = meta.get("w50_hz")
-        s["message"] = meta.get("message")
-        return s
     return cache.get(full, "summary", compute)
+
+
+def _num(v) -> Optional[float]:
+    try:
+        x = float(v)
+    except (TypeError, ValueError):
+        return None
+    return x if math.isfinite(x) else None
+
+
+def _alias_fields(ww0_ppb: Optional[float], wwv_ppb: Optional[float], mhz: float) -> dict:
+    alias = W.wwv_may_alias(ww0_ppb, wwv_ppb, mhz)
+    diff = None
+    if not alias and ww0_ppb is not None and wwv_ppb is not None:
+        diff = round(ww0_ppb - wwv_ppb, 4)
+    return {"wwv_alias": alias, "diff_ppb": diff}
 
 
 def compare(root: str, date: str, wwv: W.WwvSource, cache: CarrierCache,
@@ -293,10 +381,16 @@ def compare(root: str, date: str, wwv: W.WwvSource, cache: CarrierCache,
     for band, mhz in W.BAND_PAIRS:
         series = wwv.series(mhz, day0, day0 + 86400 + 120)
         cyc = sorted(by_band[band], key=lambda c: (c["epoch"], c["receiver"]))
+        lim = W.wwv_limit_ppb(mhz)
+        for p in series.get("points", []):
+            p["edge"] = bool(abs(float(p["ppb"])) >= W.WWV_EDGE_FRACTION * lim)
         for c in cyc:
             c["wwv_ppb"] = W.wwv_over(series, c["epoch"], c["epoch"] + 120)
+            c.update(_alias_fields(c["ppb"], c["wwv_ppb"], mhz))
         out["bands"].append({"band": band, "nominal_hz": W.NOMINAL_HZ[band],
-                             "wwv_mhz": mhz, "cycles": cyc, "wwv": series})
+                             "wwv_mhz": mhz, "wwv_limit_ppb": round(lim, 4),
+                             "wwv_limit_hz": W.WWV_DOPPLER_LIMIT_HZ,
+                             "cycles": cyc, "wwv": series})
     return out
 
 
@@ -316,21 +410,27 @@ def cycle_detail(root: str, date: str, hhmm: str, band: str, rx: str,
     def compute():
         try:
             meta, rate, iq = W.read_carrier(full)
-        except (OSError, ValueError, struct.error):
-            return None
-        return {"meta": meta,
-                "summary": W.carrier_summary(meta, rate, iq, band, f["name_rf_hz"]),
-                "track": W.carrier_track(meta, rate, iq, band, f["epoch"], f["name_rf_hz"])}
+            return {"meta": meta,
+                    "summary": W.carrier_summary(meta, rate, iq, band, f["name_rf_hz"]),
+                    "track": W.carrier_track(meta, rate, iq, band, f["epoch"], f["name_rf_hz"])}
+        except Exception as exc:                      # noqa: BLE001 -- a bad file
+            _bad_file(f["path"], exc)
+            return {"error": f"cannot measure {f['path']}: {type(exc).__name__}"}
     d = cache.get(full, "track", compute)
     if d is None:
         return None
+    if "error" in d:
+        return d
     mhz = W.WWV_FOR_BAND[band]
     series = wwv.series(mhz, f["epoch"] - 120, f["epoch"] + 240)
-    return {"date": date, "hhmm": hhmm, "band": band, "epoch": f["epoch"],
+    wwv_ppb = W.wwv_over(series, f["epoch"], f["epoch"] + 120)
+    ww0_ppb = (d["summary"] or {}).get("ppb")
+    return {**_alias_fields(ww0_ppb, wwv_ppb, mhz), "wwv_limit_ppb": round(W.wwv_limit_ppb(mhz), 4),
+            "date": date, "hhmm": hhmm, "band": band, "epoch": f["epoch"],
             "receiver": f["receiver"], "receivers": sorted({x["receiver"] for x in found}),
             "path": f["path"], "rf_hz": f["name_rf_hz"], "nominal_hz": W.NOMINAL_HZ[band],
             "wwv_mhz": mhz, "meta": d["meta"], "summary": d["summary"], "track": d["track"],
-            "wwv": series, "wwv_ppb": W.wwv_over(series, f["epoch"], f["epoch"] + 120)}
+            "wwv": series, "wwv_ppb": wwv_ppb}
 
 
 # ---- Host check ---------------------------------------------------------------
@@ -419,14 +519,31 @@ class Handler(BaseHTTPRequestHandler):
         self.end_headers()
         self.wfile.write(body)
 
-    def json(self, obj, code=200):
-        return self.send(code, json.dumps(_finite(obj), allow_nan=False))
+    def json(self, obj, code=200, extra=None):
+        return self.send(code, json.dumps(_finite(obj), allow_nan=False), extra=extra)
 
     def do_GET(self):
         srv = self.server
-        root = srv.root
         if not host_ok(self.headers.get("Host", ""), srv.allowed_hosts):
             return self.json({"error": "host"}, 403)
+        if not srv.slots.acquire(blocking=False):
+            return self.json({"error": "busy"}, 503, {"Retry-After": "2"})
+        try:
+            return self._get()
+        except (BrokenPipeError, ConnectionResetError):
+            pass
+        except Exception:                             # noqa: BLE001 -- never drop the client
+            logger.warning("carrier browser: %s failed", self.path, exc_info=True)
+            try:
+                return self.json({"error": "internal error"}, 500)
+            except OSError:
+                pass
+        finally:
+            srv.slots.release()
+
+    def _get(self):
+        srv = self.server
+        root = srv.root
         u = urlparse(self.path)
         q = {k: v[0] for k, v in parse_qs(u.query).items()}
         try:
@@ -435,7 +552,9 @@ class Handler(BaseHTTPRequestHandler):
             if u.path == "/api/compare":
                 if not _DATE.fullmatch(q.get("date", "")):
                     return self.json({"error": "date"}, 400)
-                return self.json(compare(root, q["date"], srv.wwv, srv.cache, srv.call))
+                date = q["date"]
+                return self.json(srv.flight.do(
+                    date, lambda: compare(root, date, srv.wwv, srv.cache, srv.call)))
             if u.path == "/api/cycle":
                 if not (_DATE.fullmatch(q.get("date", "")) and _HHMM.fullmatch(q.get("hhmm", ""))
                         and _BAND.fullmatch(q.get("band", ""))):
@@ -444,6 +563,8 @@ class Handler(BaseHTTPRequestHandler):
                                  srv.wwv, srv.cache, srv.call)
                 if d is None:
                     return self.json({"error": "no such cycle"}, 404)
+                if "error" in d:
+                    return self.json(d, 422)
                 return self.json(d)
             if u.path == "/api/dates":
                 return self.json(dates(root))
@@ -464,7 +585,7 @@ class Handler(BaseHTTPRequestHandler):
                                  {"Content-Disposition": f'attachment; filename="{name}"'})
             return self.json({"error": "not found"}, 404)
         except (BrokenPipeError, ConnectionResetError):
-            pass
+            raise
         except OSError:
             return self.json({"error": "no such file"}, 404)
 
@@ -490,6 +611,8 @@ def build_server(root, bind: str = DEFAULT_BIND, port: int = DEFAULT_PORT, *,
     srv.allowed_hosts = allowed_hosts(bind, extra_hosts)
     srv.wwv = wwv or W.WwvSource()
     srv.cache = CarrierCache()
+    srv.flight = SingleFlight()
+    srv.slots = threading.BoundedSemaphore(MAX_CONCURRENT)
     srv.call = call
     return srv
 
@@ -576,7 +699,8 @@ canvas{width:100%;display:block;margin-top:8px}canvas.click{cursor:crosshair}.le
 <p class="muted" style="margin:0">WW0WWV's carrier (the WWV-site WSPR beacon, its modulation removed) against WWV's own carrier on the nearest frequency.
 Doppler is in parts per billion of each nominal frequency, so the two compare directly: on a shared path they should move together.
 <span style="color:var(--a2)">&#9632;</span> WW0WWV, one point per WSPR cycle (its whole transmission);
-<span style="color:var(--acc)">&#9473;</span> WWV, one value per minute from hf-timestd. Click a WW0WWV point for that cycle.</p>
+<span style="color:var(--acc)">&#9473;</span> WWV, one value per minute from hf-timestd. Click a WW0WWV point for that cycle.
+hf-timestd resolves WWV's Doppler only within &plusmn;0.5 Hz (dashed lines); a hollow square marks a cycle where WWV may be aliased, and no difference is given for it.</p>
 <div id="pairs"></div>
 </section>
 <section id="spotsView" hidden>
@@ -631,7 +755,7 @@ function series(A,s){const g=A.g;g.strokeStyle=g.fillStyle=s.color;g.lineWidth=s
  if(s.kind==="line"){g.beginPath();let prev=null;for(const p of s.pts){if(p[1]==null){prev=null;continue;}const x=A.X(p[0]),y=A.Y(p[1]);(prev!==null&&(!s.gap||p[0]-prev<=s.gap))?g.lineTo(x,y):g.moveTo(x,y);prev=p[0];}g.stroke();}
  else if(s.kind==="step"){for(const p of s.pts){if(p[2]==null)continue;g.beginPath();g.moveTo(A.X(p[0]),A.Y(p[2]));g.lineTo(A.X(p[1]),A.Y(p[2]));g.stroke();}}
  else if(s.kind==="hline"){g.setLineDash([4,3]);g.beginPath();g.moveTo(A.L,A.Y(s.y));g.lineTo(A.L+A.w,A.Y(s.y));g.stroke();g.setLineDash([]);}
- else{const r=s.r||3;for(const p of s.pts){if(p[1]==null)continue;const x=A.X(p[0]),y=A.Y(p[1]);if(s.kind==="sq")g.fillRect(x-r,y-r,2*r,2*r);else{g.beginPath();g.arc(x,y,r,0,7);g.fill();}}}}
+ else{const r=s.r||3;for(const p of s.pts){if(p[1]==null)continue;const x=A.X(p[0]),y=A.Y(p[1]);if(s.kind==="sq")g.fillRect(x-r,y-r,2*r,2*r);else if(s.kind==="hollow")g.strokeRect(x-r,y-r,2*r,2*r);else{g.beginPath();g.arc(x,y,r,0,7);g.fill();}}}}
 function pct(a,q){if(!a.length)return null;const s=[...a].sort((x,y)=>x-y),i=(s.length-1)*q,lo=Math.floor(i),hi=Math.ceil(i);return s[lo]+(s[hi]-s[lo])*(i-lo);}
 function yrange(vals,minPad,robust){vals=vals.filter(v=>v!=null&&isFinite(v));if(!vals.length)return [-minPad,minPad];
  let lo=robust?pct(vals,0.02):Math.min(...vals),hi=robust?pct(vals,0.98):Math.max(...vals);const p=Math.max(minPad,0.3*(hi-lo));return [lo-p,hi+p];}
@@ -649,18 +773,21 @@ function drawCompare(){if(!cmp)return;const box=$("pairs");box.innerHTML="";cons
  const xr=[day0,day0+86400],xt=[];for(let h=0;h<=24;h+=3)xt.push([day0+h*3600,pad2(h%24)+":00",pad2((h+16)%24)+":00"]);
  const cw=css("--a2"),cv=css("--acc");
  for(const b of cmp.bands){const cyc=bandCycles(b),wv=b.wwv||{points:[]};const card=document.createElement("div");card.className="card";card.id="pair"+b.band;
-  const diffs=cyc.filter(c=>c.wwv_ppb!=null).map(c=>c.ppb-c.wwv_ppb);
+  const diffs=cyc.filter(c=>c.diff_ppb!=null).map(c=>c.diff_ppb),nal=cyc.filter(c=>c.wwv_alias).length,lim=b.wwv_limit_ppb;
   const wtxt=wv.available?"WWV "+esc(b.wwv_mhz)+" MHz: "+esc(wv.points.length)+" minutes from "+esc(wv.source)+" ("+esc(wv.channel)+")":'<span class="warn">no WWV data</span>: '+esc(wv.reason);
   card.innerHTML="<h2>"+esc(b.band)+" m WW0WWV &middot; WWV "+esc(b.wwv_mhz)+" MHz</h2><div class=\"sub\">"+esc(cmp.call)+" nominal "+esc(num(b.nominal_hz,3))+" Hz &middot; "+esc(cyc.length)+" cycles &middot; "+wtxt
-   +(diffs.length?" &middot; median WW0WWV &minus; WWV "+esc(sgn(pct(diffs,0.5),2))+" ppb over "+esc(diffs.length)+" cycles":"")+"</div>"
+   +" &middot; WWV resolves &plusmn;"+esc(num(lim,1))+" ppb (&plusmn;"+esc(b.wwv_limit_hz)+" Hz)"
+   +(diffs.length?" &middot; median WW0WWV &minus; WWV "+esc(sgn(pct(diffs,0.5),2))+" ppb over "+esc(diffs.length)+" cycles":"")
+   +(nal?' &middot; <span class="warn">WWV may be aliased in '+esc(nal)+" cycle"+(nal===1?"":"s")+"</span> (hollow squares; no difference given)":"")+"</div>"
    +'<canvas class="click dopc" height="230" aria-label="Doppler, ppb, over the day"></canvas><canvas class="snrc" height="120" aria-label="SNR over the day"></canvas>'
    +'<div class="legend"><span><i class="sw" style="background:'+esc(cw)+'"></i>WW0WWV '+esc(b.band)+' m, whole transmission</span><span><i class="sw" style="background:'+esc(cv)+'"></i>WWV '+esc(b.wwv_mhz)+' MHz, per minute</span></div><div class="drill" hidden></div>';
   box.appendChild(card);
   const dop=card.querySelector(".dopc"),sn=card.querySelector(".snrc");
   card._redraw=()=>{
-  const wp=wv.points.map(p=>[p.t+30,p.ppb]),sp=cyc.map(c=>[c.epoch+60,c.ppb]);
-  let A=frame(dop,xr,yrange(wp.map(p=>p[1]).concat(sp.map(p=>p[1])),5,true),xt,"Doppler, ppb from nominal",{two:true});
-  clip(A);series(A,{kind:"line",pts:wp,color:cv,gap:180,lw:1.2});series(A,{kind:"dot",pts:wp,color:cv,r:1.2});series(A,{kind:"sq",pts:sp,color:cw,r:3});
+  const wp=wv.points.map(p=>[p.t+30,p.ppb]),sp=cyc.filter(c=>!c.wwv_alias).map(c=>[c.epoch+60,c.ppb]),ap=cyc.filter(c=>c.wwv_alias).map(c=>[c.epoch+60,c.ppb]);
+  let A=frame(dop,xr,yrange(wp.map(p=>p[1]).concat(sp.map(p=>p[1]),ap.map(p=>p[1])),5,true),xt,"Doppler, ppb from nominal (dashed: WWV's alias limit)",{two:true});
+  clip(A);if(lim){series(A,{kind:"hline",y:lim,color:css("--muted"),lw:1});series(A,{kind:"hline",y:-lim,color:css("--muted"),lw:1});}
+  series(A,{kind:"line",pts:wp,color:cv,gap:180,lw:1.2});series(A,{kind:"dot",pts:wp,color:cv,r:1.2});series(A,{kind:"sq",pts:sp,color:cw,r:3});series(A,{kind:"hollow",pts:ap,color:cw,r:3});
   if(sel[b.band])series(A,{kind:"line",pts:[[sel[b.band],-1e9],[sel[b.band],1e9]],color:css("--muted"),lw:1});A.g.restore();
   const ws=wv.points.filter(p=>p.snr!=null).map(p=>[p.t+30,p.snr]),ss=cyc.filter(c=>c.snr_wsprd!=null).map(c=>[c.epoch+60,Number(c.snr_wsprd)]);
   A=frame(sn,xr,yrange(ws.map(p=>p[1]).concat(ss.map(p=>p[1])),3,false),xt.map(t=>[t[0],"",""]),"SNR, dB: WW0WWV wsprd (2500 Hz); WWV hf-timestd tick SNR",{});
@@ -674,10 +801,11 @@ async function drill(b,c,card){const el=card.querySelector(".drill");el.hidden=f
  setHash({date:cmp.date,band:b.band,hhmm:c.hhmm});
  let d;try{d=await j("/api/cycle?date="+cmp.date+"&hhmm="+c.hhmm+"&band="+encodeURIComponent(b.band)+"&rx="+encodeURIComponent(c.receiver));}catch(e){el.innerHTML='<div class="dinfo">'+esc(e)+"</div>";return;}
  const s=d.summary||{},m=d.meta||{},wv=d.wwv||{points:[]},cw=css("--a2"),cv=css("--acc"),list=bandCycles(b),i=list.indexOf(c);
- const diff=(s.ppb!=null&&d.wwv_ppb!=null)?s.ppb-d.wwv_ppb:null;
+ const diff=d.diff_ppb;
  el.innerHTML='<div class="dinfo"><button class="dp" title="Earlier cycle">&#9664;</button> <button class="dn" title="Later cycle">&#9654;</button> <b>'+esc(b.band)+" m, "+esc(hhmm(d.hhmm))+" UTC</b> ("+esc(pst(d.epoch))+" PST) &middot; "+esc(m.message)+" &middot; "+esc(d.receiver)
   +" &middot; SNR "+esc(sgn(m.snr,0))+" dB (wsprd)<br>WW0WWV over the transmission <b>"+esc(sgn(s.ppb,2))+" ppb</b> ("+esc(sgn(s.hz*1000,1))+" mHz) &middot; WWV "+esc(d.wwv_mhz)+" MHz over the same minutes <b>"
   +(d.wwv_ppb!=null?esc(sgn(d.wwv_ppb,2))+" ppb</b> ("+esc(wv.channel)+")":'</b><span class="warn">no WWV data</span> ('+esc(wv.reason)+")")
+  +(d.wwv_alias?' &middot; <b class="warn">WWV may be aliased</b> (WWV '+esc(d.wwv_mhz)+" MHz resolves only &plusmn;"+esc(num(d.wwv_limit_ppb,1))+" ppb; no difference given)":"")
   +(diff!=null?" &middot; difference <b>"+esc(sgn(diff,2))+" ppb</b>":"")+' &middot; <a href="/file?path='+encodeURIComponent(d.path)+'">download .wav</a> &middot; <a href="#view=spots&date='+esc(d.date)+"&hhmm="+esc(d.hhmm)+'" class="tospots">all spots of this cycle</a></div>'
   +'<div class="drillgrid"><div><canvas class="dspec" height="200" aria-label="WW0WWV spectrogram"></canvas></div><div><canvas class="dtrack" height="200" aria-label="Doppler track"></canvas><canvas class="dsnr" height="110" aria-label="SNR track"></canvas>'
   +'<div class="legend"><span><i class="sw" style="background:'+esc(cw)+'"></i>WW0WWV, '+esc(d.track?d.track.win_s:"")+' s windows every 2 s</span><span><i class="sw" style="background:'+esc(cv)+'"></i>WWV, each minute</span></div></div></div>';

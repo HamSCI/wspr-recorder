@@ -49,6 +49,9 @@ SyslogIdentifier=wspr-carrier-browser
 
 Nice=10
 MemoryMax=256M
+# A day's first comparison measures every carrier (numpy FFTs); keep it
+# from starving the recorders.
+CPUQuota=50%
 MemorySwapMax=0
 
 # Read-only by construction: the page never writes, and the sandbox makes the
