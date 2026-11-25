@@ -1,6 +1,7 @@
 """A read-only web page for wspr-recorder's carrier archive (carrier_archive.py).
 
     python -m wspr_recorder.carrier_browser --root DIR [--bind ADDR] [--port 8089]
+                                            [--raw-buffer DIRS] [--wwv-cache-dir DIR]
                                             [--timestd-db PATH]
 
 DIR is the archive: YYYYMMDD/RECEIVER/BAND/HHMM_MODE_CALL_RFHZ.wav, each a
@@ -10,17 +11,20 @@ its LIST/INFO/ICMT chunk (ubersdr's carrier_iq.h).
 Main page (the beta's purpose): WW0WWV against WWV.  For a UTC day, one
 chart per band pair (80 m / WWV 2.5 MHz, 40 m / 5, 30 m / WWV 10 MHz, 20 m / 15, 15 m / 20, 12 m and
 10 m / 25): WW0WWV's Doppler in ppb of its nominal frequency and its SNR,
-one point per WSPR cycle, against WWV's Doppler from hf-timestd (one a
-minute).  Clicking a cycle opens its carrier's spectrogram and Doppler
-track beside WWV's for the same minutes.  The physics is in ww0wwv.py.
+one point per WSPR cycle, against WWV's carrier Doppler measured on
+hf-timestd's raw IQ buffers (one a minute; wwv_raw.py).  Clicking a cycle
+opens its carrier's spectrogram and Doppler track beside WWV's for the
+same minutes.  The physics is in ww0wwv.py.
 
 Second page, "All spots": the archive's dates, cycles and spots, band by
 band; a spot's file is plotted in the browser and can be downloaded.
 
 Standard library and numpy.  Ported from wsprdaemon's carrier-browser.py
 (WD c1835bf), hardened:
-  * read-only: GET only, nothing under DIR (or the hf-timestd database,
-    opened mode=ro) is created or written;
+  * read-only: GET only, nothing under DIR, hf-timestd's raw buffers (read
+    through ``zstd -dc``) or its database (opened mode=ro) is created or
+    written; the one thing it writes is its WWV cache (wwv-carrier.sqlite
+    under --wwv-cache-dir, the unit's CacheDirectory);
   * only DIR is served: /file resolves symlinks and refuses anything whose
     real path is not under DIR's; listings skip symlinks and entries whose
     real path leaves DIR, so a link cannot expose a file's name or comment;
@@ -52,10 +56,12 @@ import time
 from datetime import datetime, timezone
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from collections import OrderedDict
-from typing import Callable, Dict, Iterable, Iterator, List, Optional, Tuple
+from typing import Dict, Iterable, Iterator, List, Optional, Tuple
 from urllib.parse import parse_qs, urlparse
 
 from . import ww0wwv as W
+from . import wwv_raw as R
+from .wwv_raw import SingleFlight  # noqa: F401 -- also used by the handler
 from .carrier_archive import base_call, safe_name
 
 logger = logging.getLogger(__name__)
@@ -75,6 +81,9 @@ ENV_BIND = "CARRIER_BROWSER_BIND"
 ENV_PORT = "CARRIER_BROWSER_PORT"
 ENV_ALLOWED = "CARRIER_BROWSER_ALLOWED_HOSTS"
 ENV_TIMESTD_DB = "TIMESTD_DB"
+ENV_RAW_BUFFER = "TIMESTD_RAW_BUFFER"
+ENV_WWV_CACHE = "CARRIER_BROWSER_WWV_CACHE"
+ENV_WWV_PREFILL = "CARRIER_BROWSER_WWV_PREFILL"
 ENV_SINK_DB = "CARRIER_BROWSER_SINK_DB"
 SINK_CONFIG = "/etc/hs-uploader/sink.toml"
 LEGACY_SINK = "/var/lib/sigmond/sink.db"
@@ -261,37 +270,6 @@ class CarrierCache:
         return val
 
 
-class SingleFlight:
-    """Concurrent calls with one key share one computation: the first runs
-    it, the rest wait for its result (or its exception)."""
-
-    def __init__(self):
-        self._lock = threading.Lock()
-        self._running: Dict[object, list] = {}
-
-    def do(self, key, fn: Callable):
-        with self._lock:
-            slot = self._running.get(key)
-            leader = slot is None
-            if leader:
-                slot = self._running[key] = [threading.Event(), None, None]
-        if not leader:
-            slot[0].wait()
-            if slot[2] is not None:
-                raise slot[2]
-            return slot[1]
-        try:
-            slot[1] = fn()
-            return slot[1]
-        except BaseException as exc:
-            slot[2] = exc
-            raise
-        finally:
-            with self._lock:
-                self._running.pop(key, None)
-            slot[0].set()
-
-
 _BAD_FILES: set = set()
 
 
@@ -356,12 +334,28 @@ def _num(v) -> Optional[float]:
     return x if math.isfinite(x) else None
 
 
-def _alias_fields(ww0_ppb: Optional[float], wwv_ppb: Optional[float], mhz: float) -> dict:
-    alias = W.wwv_may_alias(ww0_ppb, wwv_ppb, mhz)
+def _limit_hz(series: dict) -> float:
+    return float(series.get("limit_hz") or W.WWV_DOPPLER_LIMIT_HZ)
+
+
+def _alias_fields(ww0_ppb: Optional[float], wwv_ppb: Optional[float], mhz: float,
+                  series: Optional[dict] = None) -> dict:
+    """``wwv_alias`` (WWV's value may be an alias: see ww0wwv.wwv_may_alias,
+    against the series' own ``limit_hz``) and ``diff_ppb`` (WW0WWV - WWV;
+    None when aliased, or when the series is not ``reliable``)."""
+    series = series or {}
+    alias = W.wwv_may_alias(ww0_ppb, wwv_ppb, mhz, _limit_hz(series))
+    reliable = bool(series.get("reliable", True))
     diff = None
-    if not alias and ww0_ppb is not None and wwv_ppb is not None:
+    if reliable and not alias and ww0_ppb is not None and wwv_ppb is not None:
         diff = round(ww0_ppb - wwv_ppb, 4)
-    return {"wwv_alias": alias, "diff_ppb": diff}
+    return {"wwv_alias": alias, "diff_ppb": diff, "wwv_unreliable": not reliable}
+
+
+def _wwv_two(series: dict, t0: float, t1: float) -> bool:
+    """True when some usable WWV minute in [t0, t1) had two carriers."""
+    return any(p.get("two") and p.get("ok", True)
+               for p in series.get("points", []) if t0 <= p["t"] < t1)
 
 
 # ---- absolute levels: the recorder's calibrated noise rows -------------------------
@@ -545,17 +539,22 @@ def compare(root: str, date: str, wwv: W.WwvSource, cache: CarrierCache,
     for band, mhz in W.BAND_PAIRS:
         series = wwv.series(mhz, day0, day0 + 86400 + 120)
         cyc = sorted(by_band[band], key=lambda c: (c["epoch"], c["receiver"]))
-        lim = W.wwv_limit_ppb(mhz)
+        lim_hz = _limit_hz(series)
+        lim = W.wwv_limit_ppb(mhz, lim_hz)
         for p in series.get("points", []):
             p["edge"] = bool(abs(float(p["ppb"])) >= W.WWV_EDGE_FRACTION * lim)
         for c in cyc:
             c["wwv_ppb"] = W.wwv_over(series, c["epoch"], c["epoch"] + 120)
             c["wwv_hz"] = W.wwv_over(series, c["epoch"], c["epoch"] + 120, "hz")
-            c.update(_alias_fields(c["ppb"], c["wwv_ppb"], mhz))
+            c["wwv_two"] = _wwv_two(series, c["epoch"], c["epoch"] + 120)
+            c.update(_alias_fields(c["ppb"], c["wwv_ppb"], mhz, series))
             c.update(_level_fields(nday, c["receiver"], band, c["epoch"], c["snr_wsprd"]))
         out["bands"].append({"band": band, "nominal_hz": W.NOMINAL_HZ[band],
                              "wwv_mhz": mhz, "wwv_limit_ppb": round(lim, 4),
-                             "wwv_limit_hz": W.WWV_DOPPLER_LIMIT_HZ,
+                             "wwv_limit_hz": lim_hz,
+                             "wwv_blend": series.get("blend") or W.blend_label(mhz),
+                             "wwv_two_minutes": sum(1 for p in series.get("points", [])
+                                                    if p.get("two") and p.get("ok", True)),
                              "cycles": cyc, "wwv": series})
     return out
 
@@ -599,10 +598,12 @@ def cycle_detail(root: str, date: str, hhmm: str, band: str, rx: str,
         nd = lv["noise_dbm_hz"]
         track = {**track, "points": [{**p, "level_dbm": W.signal_dbm(p.get("snr"), nd)}
                                      for p in track.get("points", [])]}
-    return {**_alias_fields(ww0_ppb, wwv_ppb, mhz), **lv, "levels": _levels(nday),
+    return {**_alias_fields(ww0_ppb, wwv_ppb, mhz, series), **lv, "levels": _levels(nday),
             "wwv_hz": W.wwv_over(series, f["epoch"], f["epoch"] + 120, "hz"),
-            "wwv_limit_hz": W.WWV_DOPPLER_LIMIT_HZ,
-            "wwv_limit_ppb": round(W.wwv_limit_ppb(mhz), 4),
+            "wwv_two": _wwv_two(series, f["epoch"], f["epoch"] + 120),
+            "wwv_blend": series.get("blend") or W.blend_label(mhz),
+            "wwv_limit_hz": _limit_hz(series),
+            "wwv_limit_ppb": round(W.wwv_limit_ppb(mhz, _limit_hz(series)), 4),
             "date": date, "hhmm": hhmm, "band": band, "epoch": f["epoch"],
             "receiver": f["receiver"], "receivers": sorted({x["receiver"] for x in found}),
             "path": f["path"], "rf_hz": f["name_rf_hz"], "nominal_hz": W.NOMINAL_HZ[band],
@@ -809,9 +810,22 @@ def parse_args(argv=None) -> argparse.Namespace:
                          f"authentication)")
     ap.add_argument("--port", type=int, default=int(env.get(ENV_PORT) or DEFAULT_PORT),
                     help=f"default ${ENV_PORT}, else {DEFAULT_PORT}")
+    ap.add_argument("--raw-buffer", default=env.get(ENV_RAW_BUFFER) or ":".join(R.DEFAULT_ROOTS),
+                    help=f"hf-timestd's raw IQ buffer roots, colon-separated, where WWV's "
+                         f"carrier is measured (default ${ENV_RAW_BUFFER}, else "
+                         f"{':'.join(R.DEFAULT_ROOTS)}; 'none' to use only --timestd-db)")
+    ap.add_argument("--wwv-cache-dir", default=env.get(ENV_WWV_CACHE) or None,
+                    help=f"where the WWV carrier cache is kept (default ${ENV_WWV_CACHE}, "
+                         f"else systemd's $CACHE_DIRECTORY, else {R.DEFAULT_CACHE_DIR})")
+    ap.add_argument("--wwv-prefill", default=env.get(ENV_WWV_PREFILL) or "1",
+                    choices=["0", "1"],
+                    help=f"measure the current UTC day's WWV in the background, at a capped "
+                         f"rate (default ${ENV_WWV_PREFILL}, else 1)")
     ap.add_argument("--timestd-db", default=env.get(ENV_TIMESTD_DB) or DEFAULT_TIMESTD_DB,
-                    help=f"hf-timestd's SQLite database, for WWV's Doppler (default "
-                         f"${ENV_TIMESTD_DB}, else {DEFAULT_TIMESTD_DB}; 'none' for no WWV)")
+                    help=f"hf-timestd's SQLite database: only a fallback, labelled unreliable, "
+                         f"for a WWV frequency with no raw buffer (its L2 doppler_hz is noise "
+                         f"on hf-timestd 5.0.0; default ${ENV_TIMESTD_DB}, else "
+                         f"{DEFAULT_TIMESTD_DB}; 'none' for no fallback)")
     ap.add_argument("--sink-db", default=None,
                     help=f"the sink database with wspr-recorder's noise rows, for signal "
                          f"levels in dBm (default ${ENV_SINK_DB}, else found as hamsci_sink "
@@ -823,9 +837,28 @@ def parse_args(argv=None) -> argparse.Namespace:
     return ap.parse_args(argv)
 
 
+def make_wwv(a: argparse.Namespace) -> W.WwvSource:
+    """WWV's source: the raw IQ buffers (with the timestd.db reader as a
+    labelled fallback for a frequency without one), or the fallback alone
+    with --raw-buffer none, or nothing."""
+    fallback = None if a.timestd_db.lower() == "none" else W.TimestdWwv(a.timestd_db)
+    if a.raw_buffer.lower() == "none":
+        return fallback or W.WwvSource()
+    return R.RawBufferWwv(R.roots_from(a.raw_buffer), R.cache_dir_from(a.wwv_cache_dir),
+                          fallback=fallback, prefill=a.wwv_prefill == "1")
+
+
+def _wwv_where(wwv) -> str:
+    if isinstance(wwv, R.RawBufferWwv):
+        fb = getattr(wwv.fallback, "db_path", None)
+        return (f"raw IQ under {':'.join(wwv.roots)} (cache "
+                f"{wwv.store.path or 'in memory'}){'; fallback ' + fb if fb else ''}")
+    return getattr(wwv, "db_path", "nowhere")
+
+
 def main(argv=None) -> int:
     a = parse_args(argv)
-    wwv = W.WwvSource() if a.timestd_db.lower() == "none" else W.TimestdWwv(a.timestd_db)
+    wwv = make_wwv(a)
     sink = a.sink_db or resolve_sink_path()
     noise = NoiseSource() if sink.lower() == "none" else SinkNoise(sink)
     extra = a.allow_host if a.allow_host is not None else _env_list(os.environ.get(ENV_ALLOWED))
@@ -840,7 +873,7 @@ def main(argv=None) -> int:
               f"anyone who can reach it can read the archive (no authentication)",
               file=sys.stderr, flush=True)
     print(f"carrier-browser: {srv.root} at http://{a.bind}:{a.port}/; WWV from "
-          f"{getattr(wwv, 'db_path', 'nowhere')}; noise rows from "
+          f"{_wwv_where(wwv)}; noise rows from "
           f"{getattr(noise, 'db_path', 'nowhere')}; Host names accepted: "
           f"{', '.join(sorted(srv.allowed_hosts))} and any IP address", flush=True)
     try:
@@ -889,10 +922,11 @@ canvas{width:100%;display:block;margin-top:8px}canvas.click{cursor:crosshair}.le
 <p class="muted" style="margin:0">WW0WWV's carrier (the WWV-site WSPR beacon, its modulation removed) against WWV's own carrier on the nearest frequency.
 Doppler is in parts per billion of each nominal frequency, so the two compare directly: on a shared path they should move together.
 <span style="color:var(--a2)">&#9632;</span> WW0WWV, one point per WSPR cycle (its whole transmission);
-<span style="color:var(--acc)">&#9473;</span> WWV, one value per minute from hf-timestd. Click a WW0WWV point for that cycle.
-<b>ppb</b> is the comparison; <b>Hz</b> shows each signal's own offset from its nominal (WWV's is hf-timestd's doppler_hz), as other charts do, but Hz at different carrier frequencies do not compare directly.
+<span style="color:var(--acc)">&#9473;</span> WWV, one value per minute: its carrier's peak in that minute's spectrum, measured on hf-timestd's raw IQ (faint dots: too weak or at the edge, not used; small rings: a second carrier). Click a WW0WWV point for that cycle.
+On 2.5, 5, 10 and 15 MHz WWVH shares the frequency (<b>WWV+WWVH</b>): the stronger of the two is what is measured, and a single peak may be both blended.
+<b>ppb</b> is the comparison; <b>Hz</b> shows each signal's own offset from its nominal, as other charts do, but Hz at different carrier frequencies do not compare directly.
 Signal levels are dBm at the antenna feed: wsprd's SNR plus the station's calibrated noise floor (wspr-recorder's noise rows, the same calibration as its wsprdaemon noise graphs).
-hf-timestd resolves WWV's Doppler only within &plusmn;0.5 Hz (dashed lines); a hollow square marks a cycle where WWV may be aliased, and no difference is given for it.</p>
+WWV's carrier is searched within &plusmn;1.5 Hz of nominal (dashed lines); a hollow square marks a cycle where WWV may be aliased (WW0WWV outside that window, or WWV near its edge), and no difference is given for it.</p>
 <div id="pairs"></div>
 </section>
 <section id="spotsView" hidden>
@@ -949,7 +983,7 @@ function series(A,s){const g=A.g;g.strokeStyle=g.fillStyle=s.color;g.lineWidth=s
  if(s.kind==="line"){g.beginPath();let prev=null;for(const p of s.pts){if(p[1]==null){prev=null;continue;}const x=A.X(p[0]),y=A.Y(p[1]);(prev!==null&&(!s.gap||p[0]-prev<=s.gap))?g.lineTo(x,y):g.moveTo(x,y);prev=p[0];}g.stroke();}
  else if(s.kind==="step"){for(const p of s.pts){if(p[2]==null)continue;g.beginPath();g.moveTo(A.X(p[0]),A.Y(p[2]));g.lineTo(A.X(p[1]),A.Y(p[2]));g.stroke();}}
  else if(s.kind==="hline"){g.setLineDash([4,3]);g.beginPath();g.moveTo(A.L,A.Y(s.y));g.lineTo(A.L+A.w,A.Y(s.y));g.stroke();g.setLineDash([]);}
- else{const r=s.r||3;for(const p of s.pts){if(p[1]==null)continue;const x=A.X(p[0]),y=A.Y(p[1]);if(s.kind==="sq")g.fillRect(x-r,y-r,2*r,2*r);else if(s.kind==="hollow")g.strokeRect(x-r,y-r,2*r,2*r);else{g.beginPath();g.arc(x,y,r,0,7);g.fill();}}}}
+ else{const r=s.r||3;for(const p of s.pts){if(p[1]==null)continue;const x=A.X(p[0]),y=A.Y(p[1]);if(s.kind==="sq")g.fillRect(x-r,y-r,2*r,2*r);else if(s.kind==="hollow")g.strokeRect(x-r,y-r,2*r,2*r);else if(s.kind==="ring"){g.beginPath();g.arc(x,y,r,0,7);g.stroke();}else{g.beginPath();g.arc(x,y,r,0,7);g.fill();}}}}
 function pct(a,q){if(!a.length)return null;const s=[...a].sort((x,y)=>x-y),i=(s.length-1)*q,lo=Math.floor(i),hi=Math.ceil(i);return s[lo]+(s[hi]-s[lo])*(i-lo);}
 function yrange(vals,minPad,robust){vals=vals.filter(v=>v!=null&&isFinite(v));if(!vals.length)return [-minPad,minPad];
  let lo=robust?pct(vals,0.02):Math.min(...vals),hi=robust?pct(vals,0.98):Math.max(...vals);const p=Math.max(minPad,0.3*(hi-lo));return [lo-p,hi+p];}
@@ -960,17 +994,22 @@ async function loadCompare(){const date=$("date").value;$("status").textContent=
  try{cmp=await j("/api/compare?date="+date);}catch(e){$("status").textContent=String(e);return;}
  const cur=rxSel();$("crx").innerHTML="";cmp.receivers.forEach(r=>opt($("crx"),r));if(cmp.receivers.includes(cur))$("crx").value=cur;
  $("rxwrap").hidden=view!=="compare"||cmp.receivers.length<2;
- const n=cmp.bands.reduce((a,b)=>a+b.cycles.length,0);$("status").textContent=n?"":"No "+cmp.call+" carriers on "+dayLabel(date)+".";
- drawCompare();}
+ const n=cmp.bands.reduce((a,b)=>a+b.cycles.length,0),pc={};cmp.bands.forEach(b=>{const w=b.wwv||{};if(w.pending)pc[w.channel]=w.pending;}),pend=Object.values(pc).reduce((a,x)=>a+x,0);
+ $("status").textContent=(n?"":"No "+cmp.call+" carriers on "+dayLabel(date)+". ")+(pend?"Measuring WWV: "+pend+" ten-minute files queued; this page reloads itself.":"");
+ drawCompare();clearTimeout(window._reload);if(pend)window._reload=setTimeout(()=>{if(view==="compare"&&$("date").value===date)loadCompare();},30000);}
 function bandCycles(b){const rx=rxSel();return b.cycles.filter(c=>!rx||c.receiver===rx);}
 function drawCompare(){if(!cmp)return;const box=$("pairs");box.innerHTML="";const day0=Date.UTC(+cmp.date.slice(0,4),+cmp.date.slice(4,6)-1,+cmp.date.slice(6))/1000;
  const xr=[day0,day0+86400],xt=[];for(let h=0;h<=24;h+=3)xt.push([day0+h*3600,pad2(h%24)+":00",pad2((h+16)%24)+":00"]);
  const cw=css("--a2"),cv=css("--acc");
  for(const b of cmp.bands){const cyc=bandCycles(b),wv=b.wwv||{points:[]};const card=document.createElement("div");card.className="card";card.id="pair"+b.band;
   const diffs=cyc.filter(c=>c.diff_ppb!=null).map(c=>c.diff_ppb),nal=cyc.filter(c=>c.wwv_alias).length,lim=unit==="hz"?b.wwv_limit_hz:b.wwv_limit_ppb,K=uKey(),lv=cmp.levels||{};
-  const wtxt=wv.available?"WWV "+esc(b.wwv_mhz)+" MHz: "+esc(wv.points.length)+" minutes from "+esc(wv.source)+" ("+esc(wv.channel)+")":'<span class="warn">no WWV data</span>: '+esc(wv.reason);
-  card.innerHTML="<h2>"+esc(b.band)+" m WW0WWV &middot; WWV "+esc(b.wwv_mhz)+" MHz</h2><div class=\"sub\">"+esc(cmp.call)+" nominal "+esc(num(b.nominal_hz,3))+" Hz &middot; "+esc(cyc.length)+" cycles &middot; "+wtxt
-   +" &middot; WWV resolves &plusmn;"+esc(num(lim,1))+" ppb (&plusmn;"+esc(b.wwv_limit_hz)+" Hz)"
+  const nok=wv.points.filter(p=>p.ok!==false).length,blend=b.wwv_blend||"WWV";
+  const wtxt=(wv.available?esc(blend)+" "+esc(b.wwv_mhz)+" MHz: "+esc(nok)+" minutes from "+esc(wv.source)+" ("+esc(wv.channel)+")":'<span class="warn">no WWV data</span>: '+esc(wv.reason))
+   +(wv.available&&wv.pending?' &middot; <span class="warn">'+esc(wv.pending)+" files still being measured</span>":"")
+   +(wv.reliable===false?' &middot; <b class="warn">unreliable: hf-timestd\'s L2 doppler_hz is noise; no difference given</b>':"")
+   +(b.wwv_two_minutes?' &middot; <span class="warn">two carriers in '+esc(b.wwv_two_minutes)+" minute"+(b.wwv_two_minutes===1?"":"s")+(blend==="WWV+WWVH"?" (WWV and WWVH?)":" (multipath?)")+"</span>":"");
+  card.innerHTML="<h2>"+esc(b.band)+" m WW0WWV &middot; "+esc(blend)+" "+esc(b.wwv_mhz)+" MHz</h2><div class=\"sub\">"+esc(cmp.call)+" nominal "+esc(num(b.nominal_hz,3))+" Hz &middot; "+esc(cyc.length)+" cycles &middot; "+wtxt
+   +" &middot; WWV searched within &plusmn;"+esc(num(b.wwv_limit_ppb,1))+" ppb (&plusmn;"+esc(b.wwv_limit_hz)+" Hz)"
    +(diffs.length?" &middot; median WW0WWV &minus; WWV "+esc(sgn(pct(diffs,0.5),2))+" ppb over "+esc(diffs.length)+" cycles":"")
    +(nal?' &middot; <span class="warn">WWV may be aliased in '+esc(nal)+" cycle"+(nal===1?"":"s")+"</span> (hollow squares; no difference given)":"")+"</div>"
    +'<canvas class="click dopc" height="230" aria-label="Doppler over the day"></canvas><canvas class="snrc" height="120" aria-label="SNR over the day"></canvas><canvas class="lvlc" height="130" aria-label="Signal level over the day"></canvas>'
@@ -979,13 +1018,13 @@ function drawCompare(){if(!cmp)return;const box=$("pairs");box.innerHTML="";cons
   box.appendChild(card);
   const dop=card.querySelector(".dopc"),sn=card.querySelector(".snrc");
   card._redraw=()=>{
-  const wp=wv.points.map(p=>[p.t+30,p[K]]),sp=cyc.filter(c=>!c.wwv_alias).map(c=>[c.epoch+60,c[K]]),ap=cyc.filter(c=>c.wwv_alias).map(c=>[c.epoch+60,c[K]]);
+  const wp=wv.points.filter(p=>p.ok!==false).map(p=>[p.t+30,p[K]]),wbad=wv.points.filter(p=>p.ok===false).map(p=>[p.t+30,p[K]]),w2=wv.points.filter(p=>p.two&&p.ok!==false).map(p=>[p.t+30,p[K+"2"]]),sp=cyc.filter(c=>!c.wwv_alias).map(c=>[c.epoch+60,c[K]]),ap=cyc.filter(c=>c.wwv_alias).map(c=>[c.epoch+60,c[K]]);
   let A=frame(dop,xr,yrange(wp.map(p=>p[1]).concat(sp.map(p=>p[1]),ap.map(p=>p[1])),unit==="hz"?0.05:5,true),xt,uLabel()+" (dashed: WWV's alias limit)",{two:true});
   clip(A);if(lim){series(A,{kind:"hline",y:lim,color:css("--muted"),lw:1});series(A,{kind:"hline",y:-lim,color:css("--muted"),lw:1});}
-  series(A,{kind:"line",pts:wp,color:cv,gap:180,lw:1.2});series(A,{kind:"dot",pts:wp,color:cv,r:1.2});series(A,{kind:"sq",pts:sp,color:cw,r:3});series(A,{kind:"hollow",pts:ap,color:cw,r:3});
+  series(A,{kind:"dot",pts:wbad,color:css("--zero"),r:1});series(A,{kind:"line",pts:wp,color:cv,gap:180,lw:1.2});series(A,{kind:"dot",pts:wp,color:cv,r:1.2});series(A,{kind:"ring",pts:w2,color:cv,r:2.5});series(A,{kind:"sq",pts:sp,color:cw,r:3});series(A,{kind:"hollow",pts:ap,color:cw,r:3});
   if(sel[b.band])series(A,{kind:"line",pts:[[sel[b.band],-1e9],[sel[b.band],1e9]],color:css("--muted"),lw:1});A.g.restore();
   const ws=wv.points.filter(p=>p.snr!=null).map(p=>[p.t+30,p.snr]),ss=cyc.filter(c=>c.snr_wsprd!=null).map(c=>[c.epoch+60,Number(c.snr_wsprd)]);
-  A=frame(sn,xr,yrange(ws.map(p=>p[1]).concat(ss.map(p=>p[1])),3,false),xt.map(t=>[t[0],"",""]),"SNR, dB: WW0WWV wsprd (2500 Hz); WWV hf-timestd tick SNR",{});
+  A=frame(sn,xr,yrange(ws.map(p=>p[1]).concat(ss.map(p=>p[1])),3,false),xt.map(t=>[t[0],"",""]),"SNR, dB: WW0WWV wsprd (2500 Hz); WWV "+(wv.reliable===false?"hf-timestd tick SNR":"carrier peak over median noise (1/60 Hz bins)"),{});
   clip(A);series(A,{kind:"line",pts:ws,color:cv,gap:180,lw:1});series(A,{kind:"sq",pts:ss,color:cw,r:2.5});A.g.restore();
   const ls=cyc.filter(c=>c.level_dbm!=null).map(c=>[c.epoch+60,c.level_dbm]),ns=cyc.filter(c=>c.noise_dbm_2500!=null).map(c=>[c.epoch+60,c.noise_dbm_2500]);
   A=frame(card.querySelector(".lvlc"),xr,yrange(ls.map(p=>p[1]).concat(ns.map(p=>p[1])),3,false),xt.map(t=>[t[0],"",""]),"Signal, dBm: WW0WWV (squares); noise floor in 2500 Hz (grey)",{});
@@ -1002,21 +1041,23 @@ async function drill(b,c,card){const el=card.querySelector(".drill");el.hidden=f
  const diff=d.diff_ppb;
  el.innerHTML='<div class="dinfo"><button class="dp" title="Earlier cycle">&#9664;</button> <button class="dn" title="Later cycle">&#9654;</button> <b>'+esc(b.band)+" m, "+esc(hhmm(d.hhmm))+" UTC</b> ("+esc(pst(d.epoch))+" PST) &middot; "+esc(m.message)+" &middot; "+esc(d.receiver)
   +" &middot; SNR "+esc(sgn(m.snr,0))+" dB (wsprd)<br>WW0WWV over the transmission <b>"+esc(sgn(s.ppb,2))+" ppb</b> ("+esc(sgn(s.hz*1000,1))+" mHz) &middot; WWV "+esc(d.wwv_mhz)+" MHz over the same minutes <b>"
-  +(d.wwv_ppb!=null?esc(sgn(d.wwv_ppb,2))+" ppb</b> ("+esc(wv.channel)+")":'</b><span class="warn">no WWV data</span> ('+esc(wv.reason)+")")
-  +(d.wwv_alias?' &middot; <b class="warn">WWV may be aliased</b> (WWV '+esc(d.wwv_mhz)+" MHz resolves only &plusmn;"+esc(num(d.wwv_limit_ppb,1))+" ppb; no difference given)":"")
+  +(d.wwv_ppb!=null?esc(sgn(d.wwv_ppb,2))+" ppb</b> ("+esc(d.wwv_blend||"WWV")+", "+esc(wv.channel)+", "+esc(wv.source)+")":'</b><span class="warn">no WWV data</span> ('+esc(wv.reason)+")")
+  +(d.wwv_unreliable?' &middot; <b class="warn">WWV value unreliable (hf-timestd L2 doppler_hz); no difference given</b>':"")
+  +(d.wwv_two?' &middot; <b class="warn">two carriers</b> in WWV\'s spectrum'+(d.wwv_blend==="WWV+WWVH"?" (WWV and WWVH?)":"")+"; the stronger is used":"")
+  +(d.wwv_alias?' &middot; <b class="warn">WWV may be aliased</b> (WWV '+esc(d.wwv_mhz)+" MHz is searched only within &plusmn;"+esc(num(d.wwv_limit_ppb,1))+" ppb; no difference given)":"")
   +(diff!=null?" &middot; difference <b>"+esc(sgn(diff,2))+" ppb</b>":"")
   +(d.wwv_hz!=null?" &middot; WWV offset "+esc(sgn(d.wwv_hz*1000,1))+" mHz":"")
   +"<br>WW0WWV level "+(d.level_dbm!=null?"<b>"+esc(num(d.level_dbm,1))+" dBm</b> (wsprd SNR "+esc(sgn(m.snr,0))+" dB + noise "+esc(num(d.noise_dbm_hz,1))+" dBm/Hz, "+esc(d.noise_kind)+", over 2500 Hz)":'<span class="warn">unknown</span> ('+esc((d.levels||{}).reason||"no noise row for this cycle")+")")
   +' &middot; <a href="/file?path='+encodeURIComponent(d.path)+'">download .wav</a> &middot; <a href="#view=spots&date='+esc(d.date)+"&hhmm="+esc(d.hhmm)+'" class="tospots">all spots of this cycle</a></div>'
   +'<div class="drillgrid"><div><canvas class="dspec" height="200" aria-label="WW0WWV spectrogram"></canvas></div><div><canvas class="dtrack" height="200" aria-label="Doppler track"></canvas><canvas class="dsnr" height="110" aria-label="SNR track"></canvas><canvas class="dlvl" height="110" aria-label="Level track"></canvas>'
-  +'<div class="legend"><span><i class="sw" style="background:'+esc(cw)+'"></i>WW0WWV, '+esc(d.track?d.track.win_s:"")+' s windows every 2 s</span><span><i class="sw" style="background:'+esc(cv)+'"></i>WWV, each minute</span></div></div></div>';
+  +'<div class="legend"><span><i class="sw" style="background:'+esc(cw)+'"></i>WW0WWV, '+esc(d.track?d.track.win_s:"")+' s windows every 2 s</span><span><i class="sw" style="background:'+esc(cv)+'"></i>WWV, each minute (60 s spectrum; thin: a second carrier)</span></div></div></div>';
  el.querySelector(".dp").onclick=()=>{if(i>0)drill(b,list[i-1],card);};el.querySelector(".dn").onclick=()=>{if(i>=0&&i<list.length-1)drill(b,list[i+1],card);};
  el.querySelector(".tospots").onclick=e=>{e.preventDefault();showView("spots",d.hhmm);};
  sel[b.band]=c.epoch+60;card._redraw&&card._redraw();
  const xr=[0,120],xt=[0,20,40,60,80,100,120].map(x=>[x,x+" s"]),E=d.epoch;
- const K=uKey(),tp=(d.track?d.track.points:[]).map(p=>[p.t-E,p[K]]),wm=wv.points.filter(p=>p.t>=E-60&&p.t<E+180).map(p=>[p.t-E,p.t-E+60,p[K]]);
- let A=frame(el.querySelector(".dtrack"),xr,yrange(tp.map(p=>p[1]).concat(wm.map(p=>p[2])),unit==="hz"?0.03:3,false),xt,uLabel(),{xl:"seconds into the cycle"});
- clip(A);series(A,{kind:"step",pts:wm,color:cv,lw:3});series(A,{kind:"line",pts:tp,color:cw});series(A,{kind:"dot",pts:tp,color:cw,r:2});if(s[K]!=null)series(A,{kind:"hline",y:s[K],color:cw,lw:1});A.g.restore();
+ const K=uKey(),tp=(d.track?d.track.points:[]).map(p=>[p.t-E,p[K]]),wm=wv.points.filter(p=>p.t>=E-60&&p.t<E+180&&p.ok!==false).map(p=>[p.t-E,p.t-E+60,p[K]]),wm2=wv.points.filter(p=>p.t>=E-60&&p.t<E+180&&p.two&&p.ok!==false).map(p=>[p.t-E,p.t-E+60,p[K+"2"]]);
+ let A=frame(el.querySelector(".dtrack"),xr,yrange(tp.map(p=>p[1]).concat(wm.map(p=>p[2]),wm2.map(p=>p[2])),unit==="hz"?0.03:3,false),xt,uLabel(),{xl:"seconds into the cycle"});
+ clip(A);series(A,{kind:"step",pts:wm,color:cv,lw:3});series(A,{kind:"step",pts:wm2,color:cv,lw:1});series(A,{kind:"line",pts:tp,color:cw});series(A,{kind:"dot",pts:tp,color:cw,r:2});if(s[K]!=null)series(A,{kind:"hline",y:s[K],color:cw,lw:1});A.g.restore();
  const ts=(d.track?d.track.points:[]).filter(p=>p.snr!=null).map(p=>[p.t-E,p.snr]),wsn=wv.points.filter(p=>p.t>=E-60&&p.t<E+180).map(p=>[p.t-E,p.t-E+60,p.snr]);
  A=frame(el.querySelector(".dsnr"),xr,yrange(ts.map(p=>p[1]).concat(wsn.map(p=>p[2])),3,false),xt,"SNR, dB",{});
  clip(A);series(A,{kind:"step",pts:wsn,color:cv,lw:3});series(A,{kind:"line",pts:ts,color:cw});A.g.restore();

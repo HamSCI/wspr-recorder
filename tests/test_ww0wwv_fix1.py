@@ -97,22 +97,30 @@ def _stop(srv):
 # ---- 1. WWV's alias range -----------------------------------------------------------
 
 def test_wwv_limit_ppb():
-    assert W.WWV_DOPPLER_LIMIT_HZ == 0.5
-    assert W.wwv_limit_ppb(10.0) == pytest.approx(50.0)
-    assert W.wwv_limit_ppb(15.0) == pytest.approx(33.333, abs=1e-3)
-    assert W.wwv_limit_ppb(20.0) == pytest.approx(25.0)
-    assert W.wwv_limit_ppb(25.0) == pytest.approx(20.0)
+    # the raw-IQ search window (2026-11-25), and the old tick-phase range
+    assert W.WWV_DOPPLER_LIMIT_HZ == 1.5 and W.TICK_PHASE_LIMIT_HZ == 0.5
+    assert W.wwv_limit_ppb(2.5) == pytest.approx(600.0)
+    assert W.wwv_limit_ppb(10.0) == pytest.approx(150.0)
+    assert W.wwv_limit_ppb(20.0) == pytest.approx(75.0)
+    assert W.wwv_limit_ppb(25.0) == pytest.approx(60.0)
+    assert W.wwv_limit_ppb(10.0, 0.5) == pytest.approx(50.0)
+    assert W.wwv_limit_ppb(15.0, 0.5) == pytest.approx(33.333, abs=1e-3)
+    assert W.wwv_limit_ppb(25.0, 0.5) == pytest.approx(20.0)
 
 
-@pytest.mark.parametrize("ww0, wwv_ppb, mhz, aliased", [
-    (-18.4, -13.0, 10.0, False),
-    (-20.7, -10.0, 25.0, True),        # WW0WWV beyond 25 MHz's +-20 ppb
-    (-10.0, -47.0, 10.0, True),        # WWV within 10 % of the 0.5 Hz edge
-    (-10.0, -44.0, 10.0, False),
-    (-10.0, None, 10.0, False),        # no WWV: nothing to alias
+@pytest.mark.parametrize("ww0, wwv_ppb, mhz, limit, aliased", [
+    (-18.4, -13.0, 10.0, 0.5, False),
+    (-20.7, -10.0, 25.0, 0.5, True),   # WW0WWV beyond 25 MHz's +-20 ppb (tick phase)
+    (-20.7, -10.0, 25.0, 1.5, False),  # ... well inside the raw search window's +-60
+    (-10.0, -47.0, 10.0, 0.5, True),   # WWV within 10 % of the 0.5 Hz edge
+    (-10.0, -47.0, 10.0, 1.5, False),
+    (-10.0, -140.0, 10.0, 1.5, True),  # within 10 % of the 1.5 Hz edge
+    (-70.0, -10.0, 25.0, 1.5, True),   # WW0WWV beyond 25 MHz's +-60 ppb
+    (-10.0, -44.0, 10.0, 0.5, False),
+    (-10.0, None, 10.0, 1.5, False),   # no WWV: nothing to alias
 ])
-def test_may_alias(ww0, wwv_ppb, mhz, aliased):
-    assert W.wwv_may_alias(ww0, wwv_ppb, mhz) is aliased
+def test_may_alias(ww0, wwv_ppb, mhz, limit, aliased):
+    assert W.wwv_may_alias(ww0, wwv_ppb, mhz, limit) is aliased
 
 
 def test_compare_flags_aliased_cycles(archive, tmp_path):
@@ -131,7 +139,11 @@ def test_compare_flags_aliased_cycles(archive, tmp_path):
     assert by["12"]["wwv_limit_ppb"] == pytest.approx(20.0)
     assert by["10"]["wwv_limit_ppb"] == pytest.approx(20.0)
     c30, c12 = by["30"]["cycles"][0], by["12"]["cycles"][0]
-    assert c30["wwv_alias"] is False and c30["diff_ppb"] == pytest.approx(c30["ppb"] + 13.0)
+    # hf-timestd's L2 doppler_hz is the unreliable fallback: its own
+    # +-0.5 Hz range, and no difference against it
+    assert by["30"]["wwv_limit_hz"] == 0.5
+    assert by["30"]["wwv"]["reliable"] is False and "unreliable" in by["30"]["wwv"]["source"]
+    assert c30["wwv_alias"] is False and c30["diff_ppb"] is None and c30["wwv_unreliable"]
     # 12 m: WW0WWV -20.7 ppb is past what WWV 25 MHz resolves (+-20 ppb)
     assert c12["wwv_alias"] is True and c12["diff_ppb"] is None
     assert c12["wwv_ppb"] == pytest.approx(-10.0)

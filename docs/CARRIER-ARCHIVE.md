@@ -1,7 +1,7 @@
 # Carrier archive
 
 > **Audience:** operator/contributor
-> **Status:** new 2026-11-24, off by default, not yet run on a live station; WW0WWV-only beta 2026-11-25
+> **Status:** new 2026-11-24, off by default, not yet run on a live station; WW0WWV-only beta 2026-11-25; WWV measured on hf-timestd's raw IQ since 2026-11-25
 
 An optional archive of WSPR / FST4W spots' **carriers**, plus a small
 read-only web page to browse it. Both are **disabled by default**.
@@ -163,7 +163,8 @@ archive fits comfortably.
 `wspr_recorder/carrier_browser.py` serves a read-only page:
 
 ```
-python -m wspr_recorder.carrier_browser --root DIR [--bind ADDR] [--port 8089] [--timestd-db PATH]
+python -m wspr_recorder.carrier_browser --root DIR [--bind ADDR] [--port 8089]
+    [--raw-buffer DIRS] [--wwv-cache-dir DIR] [--wwv-prefill 0|1] [--timestd-db PATH]
 ```
 
 It uses the Python standard library and numpy. Charts are drawn in the
@@ -198,20 +199,25 @@ Each card has:
   one point per WSPR-2 cycle, the whole transmission's frequency (the
   periodogram peak of the carrier, zero-padded 64×, with a parabola
   through the top three bins). Its RF is `dial_mhz × 1e6 + ref_hz` from the
-  file's JSON, plus that peak. The blue line is WWV, one value per minute
-  from hf-timestd. The x axis is UTC, with PST underneath.
-- **SNR over the day.** WW0WWV's is wsprd's (dB in 2500 Hz). WWV's is
-  hf-timestd's per-tick matched-filter SNR. The two are different
-  measures, so compare their trends, not their levels.
+  file's JSON, plus that peak. The blue line is WWV, one value per minute,
+  measured on hf-timestd's raw IQ (see below). Faint grey dots are minutes
+  too weak or at the edge of the search window (not used); small blue
+  rings are a second carrier. The x axis is UTC, with PST underneath.
+- **SNR over the day.** WW0WWV's is wsprd's (dB in 2500 Hz). WWV's is its
+  carrier peak over the median noise of the minute's spectrum, per 1/60 Hz
+  bin, typically 60–90 dB. The two are different measures, so compare
+  their trends, not their levels.
 - **A summary line:** the cycle count, where WWV's data came from (or
-  **no WWV data** and why), and the median WW0WWV − WWV difference.
+  **no WWV data** and why), **WWV+WWVH** on shared frequencies, the
+  minutes with two carriers, and the median WW0WWV − WWV difference.
 
 **Click a WW0WWV point** to open that cycle under the card:
 
 - WW0WWV's carrier spectrogram (±1.5 Hz around the nominal);
 - its Doppler track (10 s windows every 2 s, or 30 s windows when wsprd's
   SNR is −15 dB or less), with WWV's minute values drawn as bars over the
-  same two minutes;
+  same two minutes: two one-minute points per cycle (a second carrier as a
+  thin bar);
 - the SNR track;
 - the numbers: WW0WWV's ppb, WWV's ppb over the same minutes, and their
   difference.
@@ -226,34 +232,106 @@ receiver, a **Receiver** menu appears.
 
 ### Where WWV's Doppler comes from
 
-hf-timestd writes one row per channel, station and UTC minute into table
-`L2_tick_timing` of its SQLite database, `/var/lib/timestd/phase2/timestd.db`
-(hf-timestd's `[storage] sqlite_path`). The page reads these columns:
+**Since 2026-11-25 WWV's carrier is measured directly on hf-timestd's raw
+IQ.** Before, the page read `doppler_hz` from hf-timestd's
+`L2_tick_timing` table. On hf-timestd 5.0.0 that value is **noise**: on
+KPH1, over 24 h, on all six channels, it had mean ≈ 0, standard deviation
+0.04–0.05 Hz and lag-1 autocorrelation 0.00, and it did not follow the
+real carrier at all. Over the same minutes (17:40–17:49Z) the carrier
+itself, 60–86 dB above the noise, moved smoothly from −0.155 to +0.098 Hz
+on WWV 20 MHz, sat at +0.01..+0.19 Hz on 10 MHz and at 0 ± 0.01 Hz on
+5 MHz.
 
-- `minute_boundary_utc` (epoch);
-- `channel` (`WWV_20000`, `SHARED_10000`, …);
-- `station` (only `WWV` rows are used; `WWVH` on shared channels is
-  skipped);
-- `doppler_hz` (Doppler from nominal: the slope across the minute of the
-  phase of WWV's ticks, measured on the channel's raw IQ);
-- `mean_snr_db`.
+**The raw buffers.** hf-timestd keeps every channel's IQ, ten minutes to
+a file, for about two days:
 
-WWV's ppb is `doppler_hz / (MHz × 1e6) × 1e9`. The page looks for channels
-`WWV_<kHz>` and `SHARED_<kHz>`, narrowing on `timestamp_utc` (the row's
-write time, which hf-timestd indexes with `channel`) as well as the minute.
-It opens the database read-only (`mode=ro`), once per query, and caches
-each answer for 60 s. Read-only, SQLite cannot open the WAL database once
-hf-timestd has stopped and its `-wal`/`-shm` files are gone; the card then
-says **hf-timestd not running**.
+```
+/var/lib/timestd/raw_buffer/<CHANNEL>/<YYYYMMDD>/<epoch>.bin.zst   complex64, little-endian, zstd
+/var/lib/timestd/raw_buffer/<CHANNEL>/<YYYYMMDD>/<epoch>.json      minute_boundary, sample_rate,
+                                                                   frequency_hz, completeness_pct, ...
+```
 
-The page never demodulates raw WWV IQ. If the database is missing, or has
-no rows for that frequency and day, the card says **no WWV data** with the
-reason, and WW0WWV is still plotted. Set `--timestd-db` (or `TIMESTD_DB`)
-to another path, or to `none` to turn WWV off. Any other source can be
-plugged in through `ww0wwv.WwvSource.series()`.
+with a live copy under `/dev/shm/timestd/raw_buffer`. The channels are
+`SHARED_2500`, `SHARED_5000`, `SHARED_10000`, `SHARED_15000`, `WWV_20000`
+and `WWV_25000` (the page looks for `WWV_<kHz>`, then `SHARED_<kHz>`).
+radiod tunes each channel to the nominal frequency (`frequency_hz`, e.g.
+20000000), so the carrier sits at 0 Hz and its frequency is its offset
+from nominal. A channel whose `frequency_hz` differs from nominal is
+corrected by the difference.
 
-The service user (`wsprrec`) must be able to read `timestd.db`, and its
-`-wal` and `-shm` files.
+**The measurement** (`wspr_recorder/wwv_raw.py`, from the KPH session's
+`wwvcar.py`):
+
+1. Average blocks of 240 samples (a boxcar): 24 kHz becomes 100 Hz. The
+   boxcar's nulls at multiples of 100 Hz also remove WWV's 100 Hz time
+   code and its audio tones.
+2. For each UTC minute: 6000 samples, a Hann window, a 65536-point FFT.
+3. The peak within **±1.5 Hz** of nominal, refined by a parabola through
+   the log power of the top three bins. This is the minute's Doppler, in Hz
+   and in ppb of the nominal (`hz / (MHz × 1e6) × 1e9`).
+4. SNR: the peak over the median power 3–20 Hz from the carrier, in dB
+   per 1/60 Hz bin.
+5. Quality per minute: `weak` (SNR under 10 dB), `edge` (peak beyond
+   1.35 Hz, so the carrier may be outside the window), `gaps` (the file is
+   under 99 % complete), else `ok`. Only `ok` and `gaps` minutes are used
+   for the comparison; the others are drawn as faint dots.
+
+The drill-down keeps WWV at one value per minute (two per WSPR cycle).
+Shorter windows would cost resolution: 10 s gives 0.1 Hz bins against
+60 s's 1/60 Hz.
+
+**Cost.** The file is streamed through `/usr/bin/zstd -dc` (the browser's
+venv has no `zstandard` module, and adding it would mean a new
+dependency and a venv rebuild on every station) and decimated 960 000
+samples (7.7 MB) at a time, so the 115 MB of a whole file is never held at
+once. On a synthetic 10-minute file this took about 0.3 s of CPU (zstd
+included) on the development VM; budget up to ~1 s on a station's
+Beelink. Peak memory is the Python process plus ~20 MB, and zstd's ~40 MB.
+
+**The cache.** Each file is measured once. Its minutes go into
+`/var/cache/wspr-carrier-browser/wwv-carrier.sqlite` (the unit's
+`CacheDirectory=`, `$CACHE_DIRECTORY`), keyed by the file's size and
+mtime, so a rewritten file is measured again. Six channels make 8640 rows
+a day, about 1 MB. Rows are kept for 30 days, so the page shows WWV for
+days whose raw buffers are gone. If the directory cannot be written, the
+results are kept in memory only (logged).
+
+- A request measures at most two files itself (a drill-down, or the
+  newest ten minutes). Concurrent requests for one file share one
+  measurement.
+- More than that (a cold day) is queued for one background thread, one
+  file at a time, at a quarter duty cycle (it sleeps three times as long
+  as each file took). The card says how many files are still queued, and
+  the page reloads itself every 30 s until none are.
+- With `CARRIER_BROWSER_WWV_PREFILL=1` (the default) the same thread keeps
+  the current UTC day measured as files arrive: six files every ten
+  minutes, a few seconds of CPU.
+
+**WWV and WWVH.** WWVH (Kauai) transmits on 2.5, 5, 10 and 15 MHz too,
+on the same frequencies, so on the `SHARED_*` channels the spectrum holds
+both stations. Those cards say **WWV+WWVH**. The page measures the
+**stronger** peak, which may be WWVH's. If the two Dopplers differ by
+less than about 0.05 Hz, they are one blended peak. When the minute's
+spectrum resolves a second peak within ±1.5 Hz, no more than 10 dB below
+the first, at least 0.05 Hz (3 bins) from it and with a dip of 3 dB or
+more between them, both are reported (`hz2`, `ppb2`, `snr2`) and the
+minute is marked **two carriers**. The cycle's WWV value is still the
+stronger peak. WWV 20 and 25 MHz are WWV only; a second peak there is
+multipath.
+
+**The fallback.** If no root has a raw-buffer directory for a
+frequency's channel, the old reader answers instead, labelled
+**hf-timestd L2 doppler_hz (unreliable)**. The card says so, and no
+WW0WWV − WWV difference or median is given against it. Its own ±0.5 Hz
+range applies. It reads `L2_tick_timing` (`station = 'WWV'` rows) of
+`/var/lib/timestd/phase2/timestd.db`, read-only, and says **hf-timestd
+not running** when the WAL files are gone. `--timestd-db none` turns it
+off; `--raw-buffer none` uses only it.
+
+The service user (`wsprrec`) must be able to read the raw-buffer
+directories and files (and, for the fallback, `timestd.db` with its
+`-wal` and `-shm`). Any other source can be plugged in through
+`ww0wwv.WwvSource.series()`.
 
 ### ppb or Hz
 
@@ -263,17 +341,21 @@ chart, on the cards and in the drill-down:
 - **ppb** (the default) is the comparison: WW0WWV and WWV on one scale.
 - **Hz** shows each signal's own offset from its own nominal, the way
   other charts show it:
-  - WWV: hf-timestd's `doppler_hz`, unchanged;
+  - WWV: its carrier's offset from nominal, as measured;
   - WW0WWV: its RF minus its nominal.
 
   Hz at different carrier frequencies do not compare directly. The alias
-  lines become WWV's ±0.5 Hz.
+  lines become WWV's ±1.5 Hz search window.
 
 The JSON carries both units:
 
-- `/api/compare`: `ppb` and `hz` per cycle and per WWV point, plus
-  `wwv_ppb` and `wwv_hz` per cycle;
-- `/api/cycle`: `summary.hz`, `hz` on every track window, and `wwv_hz`.
+- `/api/compare`: `ppb` and `hz` per cycle and per WWV point (with
+  `snr`, `q`, `ok`, `two`, and `hz2`/`ppb2`/`snr2` for a second carrier),
+  plus `wwv_ppb`, `wwv_hz`, `wwv_two` and `wwv_unreliable` per cycle, and
+  `wwv_blend` (`WWV` or `WWV+WWVH`), `wwv_two_minutes` and the series'
+  `source`, `reliable` and `pending` per band;
+- `/api/cycle`: `summary.hz`, `hz` on every track window, `wwv_hz`,
+  `wwv_two` and `wwv_blend`.
 
 The switch is remembered in the browser.
 
@@ -327,41 +409,38 @@ dB). The level adds wsprd's integer SNR (±1 dB, own noise estimate),
 which is not exactly the FFT floor's estimator. Read a level as about
 ±3 dB absolute, much better relative from cycle to cycle.
 
-**WWV has no calibrated level.**
-
-- hf-timestd stores no per-channel carrier power: `L2_tick_timing` has
-  `mean_snr_db`, a relative tick matched-filter SNR.
-- The L1 `channel_observables` schema has a `carrier_power_db`, but
-  nothing writes it.
-- The `authority_snapshot` table's `t6_baseband_power` is only the T6
-  pilot channel.
-
-The page says so and does not invent one. The WWV SNR panel stays.
+**WWV has no calibrated level.** The raw IQ is in radiod's uncalibrated
+units, and hf-timestd stores no calibrated carrier power either (its L1
+`carrier_power_db` is never written). The page says so and does not
+invent one. WWV's SNR (peak over median noise) stays on the SNR panel.
 
 ### WWV's alias range
 
-hf-timestd resolves `doppler_hz` only within **±0.5 Hz**: beyond that the
-tick phase wraps between ticks and a larger Doppler aliases into the range.
-In ppb that is:
+WWV's peak is searched only within **±1.5 Hz** of nominal. (The old
+tick-phase `doppler_hz` resolved only ±0.5 Hz.) A larger true Doppler
+leaves the carrier outside the window, and the strongest thing inside it
+(a sidelobe, WWVH, noise) is measured instead. In ppb that is:
 
-| WWV | resolvable |
+| WWV | searched |
 |---|---|
-| 10 MHz | ±50 ppb |
-| 15 MHz | ±33 ppb |
-| 20 MHz | ±25 ppb |
-| 25 MHz | ±20 ppb |
+| 2.5 MHz | ±600 ppb |
+| 5 MHz | ±300 ppb |
+| 10 MHz | ±150 ppb |
+| 15 MHz | ±100 ppb |
+| 20 MHz | ±75 ppb |
+| 25 MHz | ±60 ppb |
 
-The KPH study's 12 m medians (−22 to −28 ppb) are already past 25 MHz's
-range. Each card states the range and draws it as dashed lines. A cycle is
+Each card states the range and draws it as dashed lines. A cycle is
 flagged **WWV may be aliased** (a hollow square, no difference given, left
 out of the median) when:
 
-- WW0WWV's ppb lies outside WWV's resolvable range (same path, so WWV's
-  true Doppler is probably outside it too); or
-- WWV's value is within 10 % of the ±0.5 Hz edge.
+- WW0WWV's ppb lies outside WWV's range (same path, so WWV's true Doppler
+  is probably outside it too); or
+- WWV's value is within 10 % of the edge (beyond 1.35 Hz).
 
-`/api/compare` gives `wwv_limit_ppb` and `wwv_limit_hz` per band, and
-`wwv_alias` and `diff_ppb` (null when flagged) per cycle.
+`/api/compare` gives `wwv_limit_ppb` and `wwv_limit_hz` per band (0.5 Hz
+when the series is the unreliable fallback), and `wwv_alias` and
+`diff_ppb` (null when flagged or unreliable) per cycle.
 
 ### All spots
 
@@ -401,7 +480,10 @@ The unit takes its settings from the environment. Change them with
 | `CARRIER_BROWSER_BIND` | `127.0.0.1` | listen address (`--bind`) |
 | `CARRIER_BROWSER_PORT` | `8089` | port (`--port`) |
 | `CARRIER_BROWSER_ALLOWED_HOSTS` | empty | extra host names the page answers to, comma-separated (`--allow-host`) |
-| `TIMESTD_DB` | `/var/lib/timestd/phase2/timestd.db` | hf-timestd's database, or `none` |
+| `TIMESTD_RAW_BUFFER` | `/var/lib/timestd/raw_buffer:/dev/shm/timestd/raw_buffer` | hf-timestd's raw IQ roots, colon-separated, first wins (`--raw-buffer`), or `none` |
+| `CARRIER_BROWSER_WWV_PREFILL` | `1` | measure the current UTC day's WWV in the background (`--wwv-prefill`) |
+| `CARRIER_BROWSER_WWV_CACHE` | empty (`$CACHE_DIRECTORY`, i.e. `/var/cache/wspr-carrier-browser`) | where the WWV cache lives (`--wwv-cache-dir`) |
+| `TIMESTD_DB` | `/var/lib/timestd/phase2/timestd.db` | hf-timestd's database, the unreliable fallback only, or `none` |
 | `CARRIER_BROWSER_SINK_DB` | empty (found as hamsci_sink finds it) | the sink with wspr-recorder's noise rows, for dBm levels (`--sink-db`), or `none` |
 
 #### Reaching it through a host relay
@@ -433,12 +515,17 @@ Environment=CARRIER_BROWSER_ALLOWED_HOSTS=station.example.org
 - **Bounded.** At most 8 requests are served at once (more get 503).
   Concurrent requests for one day's comparison share one computation. The
   per-file cache is LRU-bounded (8000 summaries, 300 tracks: a few MB),
-  and the unit sets `MemoryMax=256M` and `CPUQuota=50%`. A bad carrier
+  and the unit sets `MemoryMax=256M` and `CPUQuota=50%` (zstd runs in the
+  same cgroup, so it counts too). WWV's raw IQ is measured one file at a
+  time, streamed in 7.7 MB chunks. A bad carrier
   file is skipped (logged once), or answered with a JSON error, never a
   dropped connection.
-- **Read-only.** It answers only GET, and never creates or writes
-  anything. The hf-timestd database is opened `mode=ro`. The unit runs it
-  with `ProtectSystem=strict` and no writable paths.
+- **Read-only.** It answers only GET. It never writes the archive or
+  hf-timestd's files; the hf-timestd database is opened `mode=ro` and the
+  raw buffers are only read by `zstd -dc`. The one thing it writes is its
+  WWV cache, `/var/cache/wspr-carrier-browser/wwv-carrier.sqlite`. The
+  unit runs it with `ProtectSystem=strict`, no `ReadWritePaths=`, and
+  only that `CacheDirectory=` writable.
 - **Only `--root` is served.** `/file` resolves symlinks and refuses any
   file whose real path is outside the root. The listings skip symlinks,
   so a link cannot reveal another file's name or comment. `date`, `hhmm`
@@ -465,7 +552,10 @@ The following is not built yet.
   can already keep other calls (`calls`). Comparing them against WWV, or
   against WWVH and CHU, needs their nominal frequencies and a choice of
   reference per path.
-- **WWV inside the minute.** hf-timestd publishes one Doppler a minute,
-  and the drill-down draws it as a bar. A finer WWV track (from
-  hf-timestd's per-second `L2_tick_phase` carrier phase) would match
-  WW0WWV's 2 s windows.
+- **WWV inside the minute.** WWV is one value a minute, drawn as a bar
+  in the drill-down. A finer track from the same raw IQ (10 s windows,
+  0.1 Hz bins, or a phase-slope estimate) would match WW0WWV's 2 s
+  windows.
+- **Telling WWV from WWVH.** On shared frequencies the stronger peak is
+  taken. Their minute schedules (WWVH's 1200 Hz tones and voice slots)
+  could identify which station each peak is.

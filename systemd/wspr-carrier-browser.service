@@ -32,7 +32,16 @@ Environment=CARRIER_BROWSER_PORT=8089
 # Host names (besides IP addresses, localhost and this host's name) the page
 # answers to; comma-separated.  Anything else gets 403 (DNS rebinding).
 Environment=CARRIER_BROWSER_ALLOWED_HOSTS=
-# hf-timestd's database, for WWV's Doppler (read-only; "none" for no WWV).
+# WWV's Doppler is measured on hf-timestd's raw IQ buffers (read-only,
+# through /usr/bin/zstd -dc): these roots, colon-separated, first wins;
+# "none" to use only the database below.
+Environment=TIMESTD_RAW_BUFFER=/var/lib/timestd/raw_buffer:/dev/shm/timestd/raw_buffer
+# 1: measure the current UTC day's WWV in the background (one file at a
+# time, a quarter duty cycle); 0: only when a page asks.
+Environment=CARRIER_BROWSER_WWV_PREFILL=1
+# hf-timestd's database: only a fallback, labelled unreliable, for a WWV
+# frequency with no raw buffer (its L2 doppler_hz is noise on hf-timestd
+# 5.0.0).  Read-only; "none" for no fallback.
 Environment=TIMESTD_DB=/var/lib/timestd/phase2/timestd.db
 # The sink with wspr-recorder's noise rows, for signal levels in dBm
 # (read-only).  Empty: found as hamsci_sink finds it; "none" for no levels.
@@ -52,14 +61,20 @@ SyslogIdentifier=wspr-carrier-browser
 
 Nice=10
 MemoryMax=256M
-# A day's first comparison measures every carrier (numpy FFTs); keep it
-# from starving the recorders.
+# A day's first comparison measures every carrier (numpy FFTs), and WWV's
+# raw IQ is decompressed and decimated once per 10-minute file (~0.3-1 s
+# of CPU each, then cached); keep it from starving the recorders.
 CPUQuota=50%
 MemorySwapMax=0
 
-# Read-only by construction: the page never writes, and the sandbox makes the
-# whole file system read-only for it anyway (ProtectSystem=strict, no
-# ReadWritePaths).
+# Read-only by construction: the page never writes the archive or
+# hf-timestd's files, and the sandbox makes the whole file system read-only
+# for it (ProtectSystem=strict, no ReadWritePaths) except its own cache of
+# WWV carrier results, /var/cache/wspr-carrier-browser/wwv-carrier.sqlite
+# (~1 MB a day, 30 days kept; $CACHE_DIRECTORY).  Deleting it only costs
+# re-measuring what the raw buffers still hold.
+CacheDirectory=wspr-carrier-browser
+CacheDirectoryMode=0750
 NoNewPrivileges=true
 ProtectSystem=strict
 ProtectHome=true

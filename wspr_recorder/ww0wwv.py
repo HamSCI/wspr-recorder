@@ -23,17 +23,22 @@ read):
   * SNR in 2500 Hz: the power within 0.5 Hz of the peak over the mean
     density of the bins 3 Hz or more away.
 
-WWV's side comes from hf-timestd (``TimestdWwv``): its L2 tick-timing
-product, one Doppler a minute per channel and station, in the SQLite
-``timestd.db``.  Anything else that can answer ``WwvSource.series`` can
-stand in for it.
+WWV's side is its carrier measured on hf-timestd's raw IQ
+(``wwv_raw.RawBufferWwv``): one Doppler a minute per channel, the peak of
+the minute's spectrum within +-1.5 Hz of nominal.  hf-timestd's own L2
+``doppler_hz`` (``TimestdWwv``) turned out to be noise on hf-timestd 5.0.0
+and is kept only as a labelled fallback (``reliable`` False: no
+difference is given against it).  Anything else that can answer
+``WwvSource.series`` can stand in.
 
-That Doppler is measured from nominal, on the raw IQ, but only within
-+-0.5 Hz (``WWV_DOPPLER_LIMIT_HZ``: the phase of 1 Hz ticks wraps beyond
-that): +-50 ppb at 10 MHz, +-33 at 15, +-25 at 20, +-20 at 25.  A larger
-true Doppler aliases into that range, so a cycle whose WW0WWV ppb lies
+The raw-IQ Doppler is unambiguous only within its search window,
++-1.5 Hz (``WWV_DOPPLER_LIMIT_HZ``): +-600 ppb at 2.5 MHz, +-150 at 10,
++-75 at 20, +-60 at 25.  A larger true Doppler puts the peak at (or the
+wrong peak inside) the window's edge, so a cycle whose WW0WWV ppb lies
 outside it, or whose WWV value is within 10 % of its edge, is flagged
-(``wwv_may_alias``) and no difference is given for it.
+(``wwv_may_alias``) and no difference is given for it.  The fallback's
+tick-phase method resolved only +-0.5 Hz (``TICK_PHASE_LIMIT_HZ``); a
+series carries its own ``limit_hz``.
 
 Standard library and numpy only.
 """
@@ -80,26 +85,29 @@ WWV_FOR_BAND: Dict[str, float] = dict(BAND_PAIRS)
 
 WIN_S, WEAK_WIN_S, STEP_S, WEAK_SNR_DB = 10.0, 30.0, 2.0, -15.0
 
-# hf-timestd's tick-phase Doppler (tick_edge_detector._estimate_doppler)
-# is unambiguous only within +-0.5 Hz; within 10 % of that edge it may
-# already be an alias.
-WWV_DOPPLER_LIMIT_HZ = 0.5
+# WWV's carrier is searched within +-1.5 Hz of nominal (wwv_raw.SEARCH_HZ);
+# within 10 % of that edge the peak may be the window's edge, not the
+# carrier.  hf-timestd's tick-phase doppler_hz (the unreliable fallback)
+# wrapped at +-0.5 Hz.
+WWV_DOPPLER_LIMIT_HZ = 1.5
+TICK_PHASE_LIMIT_HZ = 0.5
 WWV_EDGE_FRACTION = 0.9
 
 
-def wwv_limit_ppb(mhz: float) -> float:
-    """The largest Doppler, ppb, hf-timestd resolves on WWV ``mhz`` MHz."""
-    return WWV_DOPPLER_LIMIT_HZ / (mhz * 1e6) * 1e9
+def wwv_limit_ppb(mhz: float, limit_hz: float = WWV_DOPPLER_LIMIT_HZ) -> float:
+    """The largest Doppler, ppb, resolved on WWV ``mhz`` MHz by a method
+    that resolves +-``limit_hz``."""
+    return limit_hz / (mhz * 1e6) * 1e9
 
 
 def wwv_may_alias(ww0wwv_ppb: Optional[float], wwv_ppb: Optional[float],
-                  mhz: float) -> bool:
+                  mhz: float, limit_hz: float = WWV_DOPPLER_LIMIT_HZ) -> bool:
     """True when WWV's value for a cycle may be an alias: WW0WWV's Doppler
     (the same path) lies outside what WWV ``mhz`` resolves, or WWV's own
     value is within 10 % of that edge.  False when there is no WWV value."""
     if wwv_ppb is None:
         return False
-    lim = wwv_limit_ppb(mhz)
+    lim = wwv_limit_ppb(mhz, limit_hz)
     if abs(float(wwv_ppb)) >= WWV_EDGE_FRACTION * lim:
         return True
     return ww0wwv_ppb is not None and bool(abs(float(ww0wwv_ppb)) > lim)
@@ -251,19 +259,42 @@ def carrier_track(meta: dict, rate: int, iq: np.ndarray, band: str,
 class WwvSource:
     """Where WWV's carrier Doppler comes from.  ``series(mhz, t0, t1)``
     returns ``{"available": bool, "reason": str, "source": str,
-    "channel": str|None, "points": [{"t": epoch, "ppb": float,
-    "hz": float, "snr": float|None}]}``: WWV's Doppler, in ppb of
-    ``mhz``, between epochs t0 and t1.  This one has none."""
+    "channel": str|None, "limit_hz": float, "reliable": bool,
+    "blend": "WWV"|"WWV+WWVH", "pending": int, "points": [{"t": epoch,
+    "ppb": float, "hz": float, "snr": float|None, "ok": bool, ...}]}``:
+    WWV's Doppler, in ppb of ``mhz``, between epochs t0 and t1, one point
+    per minute (``t`` its start).  Points with ``ok`` False are shown but
+    not used.  This one has none."""
 
     name = "none"
+    limit_hz = WWV_DOPPLER_LIMIT_HZ
+    reliable = True
+
+    def _none(self, reason: str, mhz: float = 0.0) -> dict:
+        return {"available": False, "reason": reason, "source": self.name,
+                "channel": None, "points": [], "limit_hz": self.limit_hz,
+                "reliable": self.reliable, "blend": blend_label(mhz), "pending": 0}
 
     def series(self, mhz: float, t0: float, t1: float) -> dict:
-        return {"available": False, "reason": "no WWV data source configured",
-                "source": self.name, "channel": None, "points": []}
+        return self._none("no WWV data source configured", mhz)
+
+
+SHARED_MHZ = (2.5, 5.0, 10.0, 15.0)     # WWVH transmits on these too
+
+
+def blend_label(mhz: float) -> str:
+    """'WWV+WWVH' where WWVH shares the frequency, else 'WWV'."""
+    return "WWV+WWVH" if any(abs(mhz - s) < 1e-6 for s in SHARED_MHZ) else "WWV"
 
 
 class TimestdWwv(WwvSource):
-    """WWV's Doppler from hf-timestd's L2 tick-timing product.
+    """WWV's Doppler from hf-timestd's L2 tick-timing product: UNRELIABLE.
+
+    On hf-timestd 5.0.0 ``doppler_hz`` is noise (KPH1, 24 h, all six
+    channels: mean ~0, std 0.04-0.05 Hz, lag-1 autocorrelation 0.00,
+    uncorrelated with the carrier measured on the raw IQ).  It is kept
+    only as a fallback where no raw buffer exists, labelled so, and no
+    WW0WWV - WWV difference is given against it.
 
     hf-timestd writes, per channel, station and UTC minute, one row of
     table ``L2_tick_timing`` in its SQLite database (default
@@ -276,7 +307,9 @@ class TimestdWwv(WwvSource):
     'WWV'`` rows are used.  The database is opened read-only, per query.
     """
 
-    name = "hf-timestd"
+    name = "hf-timestd L2 doppler_hz (unreliable)"
+    limit_hz = TICK_PHASE_LIMIT_HZ
+    reliable = False
     TABLE = "L2_tick_timing"
     # timestamp_utc is the row's write time (indexed with channel); a
     # minute's row is written within seconds, but allow the writer to lag.
@@ -324,10 +357,6 @@ class TimestdWwv(WwvSource):
                     f"read-only ({exc})")
         return f"cannot read {self.db_path}: {exc}"
 
-    def _none(self, reason: str) -> dict:
-        return {"available": False, "reason": reason, "source": self.name,
-                "channel": None, "points": []}
-
     def series(self, mhz: float, t0: float, t1: float) -> dict:
         key = (mhz, int(t0), int(t1))
         now = time.monotonic()
@@ -344,7 +373,7 @@ class TimestdWwv(WwvSource):
 
     def _query(self, mhz: float, t0: float, t1: float) -> dict:
         if not os.path.isfile(self.db_path):
-            return self._none(f"no hf-timestd database at {self.db_path}")
+            return self._none(f"no hf-timestd database at {self.db_path}", mhz)
         q, args = self.query_sql(mhz, t0, t1)
         names = self._channel_names(mhz)
         con = None
@@ -353,13 +382,13 @@ class TimestdWwv(WwvSource):
             con = sqlite3.connect(uri, uri=True, timeout=2)
             rows = con.execute(q, args).fetchall()
         except sqlite3.Error as exc:
-            return self._none(self._why(exc))
+            return self._none(self._why(exc), mhz)
         finally:
             if con is not None:
                 con.close()
         if not rows:
             return self._none(f"no WWV {mhz:g} MHz Doppler from hf-timestd "
-                              f"({' or '.join(names)}) in this period")
+                              f"({' or '.join(names)}) in this period", mhz)
         # one channel: the one with the most rows (a station records a
         # frequency once; this only matters if it has two names)
         count: Dict[str, int] = {}
@@ -380,9 +409,11 @@ class TimestdWwv(WwvSource):
             seen.add(t)
             pts.append({"t": int(t), "hz": round(hz, 6),
                         "ppb": round(hz / nominal * 1e9, 4),
-                        "snr": None if snr is None else round(float(snr), 2)})
-        return {"available": bool(pts), "reason": "" if pts else "no usable rows",
-                "source": self.name, "channel": ch, "points": pts}
+                        "snr": None if snr is None else round(float(snr), 2),
+                        "ok": True, "two": False})
+        out = self._none("" if pts else "no usable rows", mhz)
+        out.update({"available": bool(pts), "channel": ch, "points": pts})
+        return out
 
 
 def _iso(t: float) -> str:
@@ -393,9 +424,10 @@ def _iso(t: float) -> str:
 
 
 def wwv_over(series: dict, t0: float, t1: float, key: str = "ppb") -> Optional[float]:
-    """Mean WWV ``key`` (ppb, or hz) over the minutes starting in [t0, t1),
-    or None."""
-    v = [p[key] for p in series.get("points", []) if t0 <= p["t"] < t1]
+    """Mean WWV ``key`` (ppb, or hz) over the usable (``ok``) minutes
+    starting in [t0, t1), or None."""
+    v = [p[key] for p in series.get("points", [])
+         if t0 <= p["t"] < t1 and p.get("ok", True)]
     return round(float(np.mean(v)), 6) if v else None
 
 
