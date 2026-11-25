@@ -49,7 +49,7 @@ Standard library and numpy only.
 """
 from __future__ import annotations
 
-import collections
+import contextlib
 import json
 import logging
 import os
@@ -59,6 +59,7 @@ import shutil
 import sqlite3
 import subprocess
 import threading
+import math
 import time
 from typing import Callable, Dict, List, Optional, Sequence, Tuple
 
@@ -71,7 +72,7 @@ logger = logging.getLogger(__name__)
 DEFAULT_ROOTS = ("/var/lib/timestd/raw_buffer", "/dev/shm/timestd/raw_buffer")
 DEFAULT_CACHE_DIR = "/var/cache/wspr-carrier-browser"
 CACHE_FILE = "wwv-carrier.sqlite"
-SCHEMA = 1
+SCHEMA = 2
 
 SEARCH_HZ = 1.5             # the peak is searched within +-1.5 Hz of nominal
 OUT_RATE = 100.0            # Hz after the boxcar
@@ -88,6 +89,39 @@ SYNC_FILES = 2              # a request measures at most this many files itself
 FILE_S = 600                # hf-timestd's files: 10 minutes
 KEEP_DAYS = 30              # cache rows kept (raw buffers last ~2 days)
 NAME_RE = re.compile(r"^(\d{9,11})\.bin\.zst$")
+# The unit's MemoryMax=256M counts the zstd children: at most two
+# measurements at once (request threads and the background thread
+# together), each zstd held to 64 MB of decompression memory.
+MAX_CONCURRENT_MEASUREMENTS = 2
+_MEASURE_SLOTS = threading.BoundedSemaphore(MAX_CONCURRENT_MEASUREMENTS)
+ZSTD_MEMORY = "--memory=64MB"
+READ_TIMEOUT_S = 120.0      # zstd is killed after this
+FOLLOW_TIMEOUT_S = 150.0    # a request waiting on another's measurement gives up
+RETRY_S = 600.0             # a transient failure is retried after 10 minutes
+MAX_FS, MAX_DUR_S = 48000.0, 1200.0     # the read cap trusts the sidecar no further
+PRUNE_EVERY_S = 3600.0
+PENDING = "pending"         # _measure's answer when it gave up waiting
+
+
+class CorruptFile(ValueError):
+    """The file's data is bad: cached, never retried (until it changes)."""
+
+
+class TransientError(Exception):
+    """Could not measure now (killed, timed out, unreadable, out of memory):
+    retried after RETRY_S."""
+
+
+class FlightTimeout(Exception):
+    """A single-flight follower stopped waiting."""
+
+
+def _now() -> float:
+    return time.time()
+
+
+def _finite(v) -> bool:
+    return v is not None and math.isfinite(v)
 
 
 # ---- single flight -----------------------------------------------------------
@@ -100,14 +134,17 @@ class SingleFlight:
         self._lock = threading.Lock()
         self._running: Dict[object, list] = {}
 
-    def do(self, key, fn: Callable):
+    def do(self, key, fn: Callable, timeout: Optional[float] = None):
+        """Run ``fn`` once per key at a time; a follower waits at most
+        ``timeout`` seconds (FlightTimeout), the leader as long as it takes."""
         with self._lock:
             slot = self._running.get(key)
             leader = slot is None
             if leader:
                 slot = self._running[key] = [threading.Event(), None, None]
         if not leader:
-            slot[0].wait()
+            if not slot[0].wait(timeout):
+                raise FlightTimeout(key)
             if slot[2] is not None:
                 raise slot[2]
             return slot[1]
@@ -195,6 +232,8 @@ def measure_window(y: np.ndarray, rate: float = OUT_RATE) -> dict:
     logp = np.log(P)
     hz = float(sp.fr[i] + _parabola(logp, i) * sp.df)
     snr = float(10 * np.log10(P[i] / noise)) if noise > 0 else None
+    if not _finite(snr):
+        snr = None
     out = {"hz": hz, "snr": snr, "hz2": None, "snr2": None}
     # a second, resolved peak: a local maximum away from the first, strong
     # enough, with a real dip between them
@@ -209,8 +248,10 @@ def measure_window(y: np.ndarray, rate: float = OUT_RATE) -> dict:
         if (P[j] >= P[i] * 10 ** (-TWO_CARRIER_DB / 10)
                 and dip <= P[j] * 10 ** (-TWO_CARRIER_DIP_DB / 10)
                 and noise > 0 and 10 * np.log10(P[j] / noise) >= MIN_SNR_DB):
-            out["hz2"] = float(sp.fr[j] + _parabola(logp, j) * sp.df)
-            out["snr2"] = float(10 * np.log10(P[j] / noise))
+            hz2 = float(sp.fr[j] + _parabola(logp, j) * sp.df)
+            snr2 = float(10 * np.log10(P[j] / noise))
+            if _finite(hz2) and _finite(snr2):
+                out["hz2"], out["snr2"] = hz2, snr2
     return out
 
 
@@ -218,7 +259,7 @@ def quality(m: dict, gaps: bool) -> str:
     """'weak' (SNR under MIN_SNR_DB), 'edge' (peak near the edge of the
     search window: the carrier may be beyond it), 'gaps' (the file had
     gaps), else 'ok'.  Only 'ok' and 'gaps' minutes are used."""
-    if m.get("snr") is None or m["snr"] < MIN_SNR_DB:
+    if not _finite(m.get("snr")) or not _finite(m.get("hz")) or m["snr"] < MIN_SNR_DB:
         return "weak"
     if abs(m["hz"]) >= EDGE_FRACTION * SEARCH_HZ:
         return "edge"
@@ -234,6 +275,8 @@ def measure_decimated(y: np.ndarray, rate: float, t0: float, offset_hz: float = 
     rows = []
     for m in range(len(y) // n):
         r = measure_window(y[m * n:(m + 1) * n], rate)
+        if not _finite(r["hz"]):
+            continue                                   # never written
         q = quality(r, gaps)
         rows.append({"t": int(round(t0 + 60 * m)), "hz": r["hz"] + offset_hz,
                      "snr": r["snr"], "q": q,
@@ -259,38 +302,92 @@ def nominal_offset_hz(meta: dict, mhz: float) -> float:
         return 0.0
 
 
+_CORRUPT = ("unsupported format", "premature end", "corrupt", "checksum",
+            "unknown frame descriptor", "not in zstd format", "truncated")
+
+
+def classify_zstd(rc: int, err: str, killed: bool) -> str:
+    """'corrupt' when zstd says the data is bad; 'transient' when it was
+    killed (watchdog, OOM), ran out of its memory limit, or could not read."""
+    if killed or rc < 0:
+        return "transient"
+    e = (err or "").lower()
+    if "memory" in e:
+        return "transient"
+    return "corrupt" if any(k in e for k in _CORRUPT) else "transient"
+
+
+def read_cap(fs: float, dur: float) -> int:
+    """Samples read at most from one file: its duration plus a minute,
+    with the sidecar's rate and duration clamped (48 kHz, 1200 s)."""
+    fs = min(max(float(fs), 0.0), MAX_FS)
+    dur = min(max(float(dur), 0.0), MAX_DUR_S)
+    return int(fs * (dur + 60))
+
+
 def measure_file(bin_path: str, meta: dict, mhz: float, zstd: str = "zstd") -> dict:
     """Stream ``bin_path`` through ``zstd -dc``, decimate it to 100 Hz and
     measure each whole minute.  Returns ``{"rows": [...], "cpu_s":
-    float}``; raises on a bad file."""
-    if meta.get("dtype", "complex64") != "complex64" or meta.get("byte_order", "little") != "little":
-        raise ValueError(f"unsupported sample format {meta.get('dtype')}/{meta.get('byte_order')}")
-    fs = float(meta["sample_rate"])
-    factor = int(round(fs / OUT_RATE))
-    if factor < 1 or abs(fs / factor - OUT_RATE) > 1e-9:
-        raise ValueError(f"sample rate {fs} is not a multiple of {OUT_RATE} Hz")
-    t0 = float(meta["minute_boundary"])
-    dur = float(meta.get("file_duration_sec") or FILE_S)
-    max_samples = int(fs * (dur + 60))          # never read past what a file can hold
-    gaps = float(meta.get("completeness_pct", 100.0) or 0.0) < GAPS_PCT
-    c0 = resource.getrusage(resource.RUSAGE_CHILDREN)
-    tt0 = time.thread_time()
-    proc = subprocess.Popen([zstd, "-dcq", "--", bin_path], stdin=subprocess.DEVNULL,
-                            stdout=subprocess.PIPE, stderr=subprocess.DEVNULL, bufsize=0)
+    float}``.  Raises CorruptFile for bad data (or a malformed sidecar),
+    TransientError for anything worth retrying.  At most
+    MAX_CONCURRENT_MEASUREMENTS run at once, process-wide."""
     try:
-        y = decimate_stream(proc.stdout, factor, max_samples)
-    finally:
-        proc.stdout.close()
+        if (meta.get("dtype", "complex64") != "complex64"
+                or meta.get("byte_order", "little") != "little"):
+            raise ValueError(f"unsupported sample format {meta.get('dtype')}/"
+                             f"{meta.get('byte_order')}")
+        fs = float(meta["sample_rate"])
+        factor = int(round(fs / OUT_RATE))
+        if not math.isfinite(fs) or factor < 1 or abs(fs / factor - OUT_RATE) > 1e-9:
+            raise ValueError(f"sample rate {fs} is not a multiple of {OUT_RATE} Hz")
+        t0 = float(meta["minute_boundary"])
+        max_samples = read_cap(fs, float(meta.get("file_duration_sec") or FILE_S))
+        gaps = float(meta.get("completeness_pct", 100.0) or 0.0) < GAPS_PCT
+    except (KeyError, TypeError, ValueError, OverflowError) as exc:
+        raise CorruptFile(f"malformed sidecar: {exc}") from None
+    with _MEASURE_SLOTS:
+        c0 = resource.getrusage(resource.RUSAGE_CHILDREN)
+        tt0 = time.thread_time()
         try:
-            rc = proc.wait(timeout=30)
-        except subprocess.TimeoutExpired:
+            proc = subprocess.Popen([zstd, "-dcq", ZSTD_MEMORY, "--", bin_path],
+                                    stdin=subprocess.DEVNULL, stdout=subprocess.PIPE,
+                                    stderr=subprocess.PIPE, bufsize=0)
+        except OSError as exc:
+            raise TransientError(f"cannot run {zstd}: {exc}") from None
+        killed = []
+        dog = threading.Timer(READ_TIMEOUT_S, lambda: (killed.append(1), proc.kill()))
+        dog.daemon = True
+        dog.start()
+        try:
+            y = decimate_stream(proc.stdout, factor, max_samples)
+        except OSError as exc:
             proc.kill()
-            rc = proc.wait()
-    capped = len(y) * factor >= max_samples - factor   # we stopped reading: SIGPIPE is fine
-    if rc != 0 and not capped:
-        raise ValueError(f"zstd -dc exited {rc}")
-    rows = measure_decimated(y, OUT_RATE, t0, nominal_offset_hz(meta, mhz), gaps)
-    c1 = resource.getrusage(resource.RUSAGE_CHILDREN)
+            raise TransientError(f"reading zstd's output: {exc}") from None
+        finally:
+            dog.cancel()
+            proc.stdout.close()
+            try:
+                err = proc.stderr.read(4096).decode("utf-8", "replace").strip()
+            except OSError:
+                err = ""
+            proc.stderr.close()
+            try:
+                rc = proc.wait(timeout=30)
+            except subprocess.TimeoutExpired:
+                proc.kill()
+                rc = proc.wait()
+        if killed:
+            raise TransientError(f"zstd killed after {READ_TIMEOUT_S:g} s")
+        capped = len(y) * factor >= max_samples - factor   # we stopped reading: SIGPIPE is fine
+        if rc != 0 and not capped:
+            msg = f"zstd -dc exited {rc}: {err or 'no message'}"
+            if classify_zstd(rc, err, False) == "corrupt":
+                raise CorruptFile(msg)
+            raise TransientError(msg)
+        if len(y) < int(60 * OUT_RATE):
+            raise CorruptFile(f"short payload: {len(y) * factor} samples, not one minute")
+        rows = measure_decimated(y, OUT_RATE, t0, nominal_offset_hz(meta, mhz), gaps)
+        c1 = resource.getrusage(resource.RUSAGE_CHILDREN)
     cpu = (time.thread_time() - tt0) + (c1.ru_utime - c0.ru_utime) + (c1.ru_stime - c0.ru_stime)
     return {"rows": rows, "cpu_s": cpu}
 
@@ -302,7 +399,7 @@ CREATE TABLE IF NOT EXISTS meta (k TEXT PRIMARY KEY, v TEXT);
 CREATE TABLE IF NOT EXISTS files (
     channel TEXT NOT NULL, epoch INTEGER NOT NULL, size INTEGER NOT NULL,
     mtime_ns INTEGER NOT NULL, completeness REAL, n_minutes INTEGER NOT NULL,
-    error TEXT, cpu_s REAL, measured_at REAL NOT NULL,
+    error TEXT, cpu_s REAL, measured_at REAL NOT NULL, retry_after REAL,
     PRIMARY KEY (channel, epoch));
 CREATE TABLE IF NOT EXISTS minutes (
     channel TEXT NOT NULL, t INTEGER NOT NULL, hz REAL NOT NULL, snr REAL,
@@ -313,108 +410,100 @@ CREATE TABLE IF NOT EXISTS minutes (
 
 class CarrierStore:
     """Per-minute WWV carrier results in SQLite: ``<cache_dir>/wwv-carrier.sqlite``.
-    Falls back to a private in-memory database (logged) when the directory
-    cannot be written."""
+    Falls back to one private in-memory connection (logged) when the
+    directory cannot be written.  Writes are serialized by one lock; so is
+    every use of the in-memory connection."""
 
     def __init__(self, cache_dir: Optional[str]):
-        self._lock = threading.Lock()
+        self._lock = threading.RLock()
         self.path = None
-        self._keep = None
+        self._mem: Optional[sqlite3.Connection] = None
         if cache_dir:
             try:
                 os.makedirs(cache_dir, exist_ok=True)
                 self.path = os.path.join(cache_dir, CACHE_FILE)
-                self._init(self._connect())
+                self._init()
             except (OSError, sqlite3.Error) as exc:
                 logger.warning("carrier browser: WWV cache %s unusable (%s); "
                                "keeping results in memory only", cache_dir, exc)
                 self.path = None
         if self.path is None:
-            self._uri = f"file:wwvcarrier{id(self)}?mode=memory&cache=shared"
-            self._keep = sqlite3.connect(self._uri, uri=True, check_same_thread=False)
-            self._init(self._keep)
+            self._mem = sqlite3.connect(":memory:", check_same_thread=False)
+            self._init()
 
-    def _connect(self) -> sqlite3.Connection:
-        if self.path is None:
-            return sqlite3.connect(self._uri, uri=True, timeout=10)
-        return sqlite3.connect(self.path, timeout=10)
-
-    def _init(self, con: sqlite3.Connection) -> None:
-        with self._lock:
+    @contextlib.contextmanager
+    def _use(self, write: bool = False):
+        if self._mem is not None:
+            with self._lock:
+                yield self._mem
+            return
+        with (self._lock if write else contextlib.nullcontext()):
+            con = sqlite3.connect(self.path, timeout=10)
             try:
-                if self.path is not None:
-                    con.execute("PRAGMA journal_mode=WAL")
-                con.executescript(_DDL)
-                row = con.execute("SELECT v FROM meta WHERE k='schema'").fetchone()
-                if row is None or row[0] != str(SCHEMA):
-                    con.executescript("DELETE FROM files; DELETE FROM minutes;")
-                    con.execute("INSERT OR REPLACE INTO meta VALUES ('schema', ?)", (str(SCHEMA),))
-                con.commit()
+                yield con
             finally:
-                if con is not self._keep:
-                    con.close()
+                con.close()
+
+    def _init(self) -> None:
+        with self._use(write=True) as con:
+            if self.path is not None:
+                con.execute("PRAGMA journal_mode=WAL")
+            con.executescript(_DDL)
+            row = con.execute("SELECT v FROM meta WHERE k='schema'").fetchone()
+            if row is None or row[0] != str(SCHEMA):
+                con.executescript("DROP TABLE IF EXISTS files; DROP TABLE IF EXISTS minutes;")
+                con.executescript(_DDL)
+                con.execute("INSERT OR REPLACE INTO meta VALUES ('schema', ?)", (str(SCHEMA),))
+            con.commit()
 
     def known(self, channel: str, epochs: Sequence[int]) -> Dict[int, Tuple[int, int]]:
-        """{epoch: (size, mtime_ns)} of the files of ``channel`` measured."""
+        """{epoch: (size, mtime_ns)} of the files of ``channel`` measured
+        (a transient failure counts until its retry time)."""
         if not epochs:
             return {}
-        con = self._connect()
-        try:
-            out = {}
-            ep = list(epochs)
+        out = {}
+        ep = list(epochs)
+        now = _now()
+        with self._use() as con:
             for k in range(0, len(ep), 500):
                 part = ep[k:k + 500]
                 q = (f"SELECT epoch, size, mtime_ns FROM files WHERE channel=? "
+                     f"AND (retry_after IS NULL OR retry_after > ?) "
                      f"AND epoch IN ({','.join('?' * len(part))})")
-                for e, s, m in con.execute(q, (channel, *part)):
-                    out[int(e)] = (int(s), int(m))
-            return out
-        finally:
-            con.close()
+                for e, sz, m in con.execute(q, (channel, now, *part)):
+                    out[int(e)] = (int(sz), int(m))
+        return out
 
     def put(self, channel: str, epoch: int, size: int, mtime_ns: int, completeness,
-            rows: List[dict], error: Optional[str], cpu_s: Optional[float]) -> None:
-        with self._lock:
-            con = self._connect()
-            try:
-                con.execute("DELETE FROM minutes WHERE channel=? AND file_epoch=?", (channel, epoch))
-                con.executemany(
-                    "INSERT OR REPLACE INTO minutes VALUES (?,?,?,?,?,?,?,?)",
-                    [(channel, r["t"], r["hz"], r["snr"], r["q"], r["hz2"], r["snr2"], epoch)
-                     for r in rows])
-                con.execute("INSERT OR REPLACE INTO files VALUES (?,?,?,?,?,?,?,?,?)",
-                            (channel, epoch, size, mtime_ns, completeness, len(rows), error,
-                             cpu_s, time.time()))
-                con.commit()
-            finally:
-                con.close()
+            rows: List[dict], error: Optional[str], cpu_s: Optional[float],
+            retry_after: Optional[float] = None) -> None:
+        with self._use(write=True) as con:
+            con.execute("DELETE FROM minutes WHERE channel=? AND file_epoch=?", (channel, epoch))
+            con.executemany(
+                "INSERT OR REPLACE INTO minutes VALUES (?,?,?,?,?,?,?,?)",
+                [(channel, r["t"], r["hz"], r["snr"], r["q"], r["hz2"], r["snr2"], epoch)
+                 for r in rows if _finite(r.get("hz"))])
+            con.execute("INSERT OR REPLACE INTO files VALUES (?,?,?,?,?,?,?,?,?,?)",
+                        (channel, epoch, size, mtime_ns, completeness, len(rows), error,
+                         cpu_s, _now(), retry_after))
+            con.commit()
 
     def minutes(self, channel: str, t0: float, t1: float) -> List[tuple]:
-        con = self._connect()
-        try:
+        with self._use() as con:
             return con.execute("SELECT t, hz, snr, q, hz2, snr2 FROM minutes WHERE channel=? "
                                "AND t >= ? AND t < ? ORDER BY t",
                                (channel, int(t0), int(np.ceil(t1)))).fetchall()
-        finally:
-            con.close()
 
     def channels_with_rows(self, names: Sequence[str]) -> List[str]:
-        con = self._connect()
-        try:
+        with self._use() as con:
             return [n for n in names
                     if con.execute("SELECT 1 FROM minutes WHERE channel=? LIMIT 1", (n,)).fetchone()]
-        finally:
-            con.close()
 
     def prune(self, before: float) -> None:
-        with self._lock:
-            con = self._connect()
-            try:
-                con.execute("DELETE FROM minutes WHERE t < ?", (int(before),))
-                con.execute("DELETE FROM files WHERE epoch < ?", (int(before),))
-                con.commit()
-            finally:
-                con.close()
+        with self._use(write=True) as con:
+            con.execute("DELETE FROM minutes WHERE t < ?", (int(before),))
+            con.execute("DELETE FROM files WHERE epoch < ?", (int(before),))
+            con.commit()
 
 
 # ---- the source --------------------------------------------------------------
@@ -450,7 +539,7 @@ class RawBufferWwv(WwvSource):
         self.sync_files = sync_files
         self.flight = SingleFlight()
         self._qlock = threading.Lock()
-        self._queue: "collections.OrderedDict" = collections.OrderedDict()
+        self._queue: Dict[Tuple[str, int], tuple] = {}
         self._wake = threading.Event()
         self._worker: Optional[threading.Thread] = None
         self._bad: set = set()
@@ -474,7 +563,11 @@ class RawBufferWwv(WwvSource):
         for n in names:
             if any(os.path.isdir(os.path.join(r, n)) for r in self.roots):
                 return n
-        have = self.store.channels_with_rows(names)
+        try:
+            have = self.store.channels_with_rows(names)
+        except sqlite3.Error as exc:
+            self._db_warn(exc)
+            return None
         return have[0] if have else None
 
     def files(self, channel: str, t0: float, t1: float) -> Dict[int, dict]:
@@ -509,29 +602,65 @@ class RawBufferWwv(WwvSource):
                     out[e] = {"bin": b, "json": j, "size": st.st_size, "mtime_ns": st.st_mtime_ns}
         return out
 
+    def _warn_once(self, key, msg: str, *args) -> None:
+        if key in self._bad:
+            return
+        if len(self._bad) > 10000:
+            self._bad.clear()
+        self._bad.add(key)
+        logger.warning(msg, *args)
+
+    def _db_warn(self, exc: Exception) -> None:
+        self._warn_once(("db", str(exc)), "carrier browser: WWV cache %s: %s",
+                        self.store.path or "(memory)", exc)
+
     def _measure(self, channel: str, mhz: float, epoch: int, f: dict):
-        """Measure one file into the cache (single-flight per file)."""
+        """Measure one file into the cache (single-flight per file).
+        Returns its rows (also when the cache cannot be written), None when
+        it was already measured or failed, PENDING when another thread is
+        measuring it and did not finish within FOLLOW_TIMEOUT_S."""
         key = (channel, epoch, f["size"], f["mtime_ns"])
 
         def run():
-            have = self.store.known(channel, [epoch]).get(epoch)
-            if have == (f["size"], f["mtime_ns"]):
-                return
-            rows, err, cpu, comp = [], None, None, None
             try:
-                meta = read_sidecar(f["json"])
+                have = self.store.known(channel, [epoch]).get(epoch)
+            except sqlite3.Error as exc:
+                self._db_warn(exc)
+                have = None
+            if have == (f["size"], f["mtime_ns"]):
+                return None
+            rows, err, cpu, comp, retry = [], None, None, None, None
+            try:
+                try:
+                    meta = read_sidecar(f["json"])
+                except OSError as exc:
+                    raise TransientError(f"cannot read {f['json']}: {exc}") from None
+                except ValueError as exc:
+                    raise CorruptFile(f"bad sidecar: {exc}") from None
                 comp = meta.get("completeness_pct")
                 r = measure_file(f["bin"], meta, mhz, self.zstd)
                 rows, cpu = r["rows"], r["cpu_s"]
-            except Exception as exc:                  # noqa: BLE001 -- a bad file
-                err = f"{type(exc).__name__}: {exc}"[:300]
-                if f["bin"] not in self._bad:
-                    self._bad.add(f["bin"])
-                    logger.warning("carrier browser: cannot measure WWV in %s: %s", f["bin"], err)
-            self.store.put(channel, epoch, f["size"], f["mtime_ns"], comp, rows, err, cpu)
+            except CorruptFile as exc:
+                err = f"corrupt: {exc}"[:300]
+            except Exception as exc:                  # noqa: BLE001 -- retried later
+                err = f"transient: {type(exc).__name__}: {exc}"[:300]
+                retry = _now() + RETRY_S
+            if err:
+                self._warn_once((f["bin"], err), "carrier browser: cannot measure WWV in %s: %s%s",
+                                f["bin"], err, " (retried in 10 min)" if retry else "")
+            if not isinstance(comp, (int, float)) or not math.isfinite(comp):
+                comp = None
+            try:
+                self.store.put(channel, epoch, f["size"], f["mtime_ns"], comp, rows, err, cpu,
+                               retry)
+            except sqlite3.Error as exc:
+                self._db_warn(exc)
             self.measured += 1
-            return cpu
-        return self.flight.do(key, run)
+            return rows
+        try:
+            return self.flight.do(key, run, timeout=FOLLOW_TIMEOUT_S)
+        except FlightTimeout:
+            return PENDING
 
     # -- background ----------------------------------------------------------------
 
@@ -543,7 +672,7 @@ class RawBufferWwv(WwvSource):
 
     def enqueue(self, channel: str, mhz: float, todo: Dict[int, dict]) -> None:
         with self._qlock:
-            for e in sorted(todo, reverse=True):          # newest first
+            for e in todo:
                 self._queue[(channel, e)] = (mhz, todo[e])
         if self.background:
             self._start()
@@ -554,15 +683,24 @@ class RawBufferWwv(WwvSource):
         with self._qlock:
             return sum(1 for (c, e) in self._queue if c == channel and t0 - FILE_S < e < t1)
 
+    def _pop(self):
+        """The queued file with the latest epoch: today's (prefill) ahead
+        of a request's historical ones."""
+        with self._qlock:
+            if not self._queue:
+                return None
+            k = max(self._queue, key=lambda ce: (ce[1], ce[0]))
+            return k, self._queue.pop(k)
+
     def drain(self, limit: Optional[int] = None) -> int:
         """Measure queued files now, in this thread (tests; the worker runs
         the same steps)."""
         n = 0
         while limit is None or n < limit:
-            with self._qlock:
-                if not self._queue:
-                    break
-                (ch, e), (mhz, f) = self._queue.popitem(last=False)
+            item = self._pop()
+            if item is None:
+                break
+            (ch, e), (mhz, f) = item
             self._measure(ch, mhz, e, f)
             n += 1
         return n
@@ -570,8 +708,7 @@ class RawBufferWwv(WwvSource):
     def _run(self) -> None:
         while True:
             try:
-                with self._qlock:
-                    item = self._queue.popitem(last=False) if self._queue else None
+                item = self._pop()
                 if item is None:
                     if self.prefill:
                         self._prefill_today()
@@ -594,10 +731,8 @@ class RawBufferWwv(WwvSource):
                 time.sleep(30)
 
     def _prefill_today(self) -> None:
+        self._maybe_prune()
         now = time.time()
-        if now - self._last_prune > 86400:
-            self._last_prune = now
-            self.store.prune(now - self.keep_days * 86400)
         day0 = now // 86400 * 86400
         for mhz in sorted({m for _b, m in BAND_PAIRS}):
             ch = self.channel_for(mhz)
@@ -609,6 +744,18 @@ class RawBufferWwv(WwvSource):
                     for e in sorted(todo, reverse=True):
                         self._queue.setdefault((ch, e), (mhz, todo[e]))
 
+    def _maybe_prune(self) -> None:
+        """Drop cache rows older than keep_days, at most once an hour
+        (from the request path too, so it happens without prefill)."""
+        now = _now()
+        if now - self._last_prune < PRUNE_EVERY_S:
+            return
+        self._last_prune = now
+        try:
+            self.store.prune(now - self.keep_days * 86400)
+        except sqlite3.Error as exc:
+            self._db_warn(exc)
+
     def _missing(self, channel: str, fs: Dict[int, dict]) -> Dict[int, dict]:
         have = self.store.known(channel, list(fs))
         return {e: f for e, f in fs.items() if have.get(e) != (f["size"], f["mtime_ns"])}
@@ -616,6 +763,7 @@ class RawBufferWwv(WwvSource):
     # -- the series ----------------------------------------------------------------
 
     def series(self, mhz: float, t0: float, t1: float) -> dict:
+        self._maybe_prune()
         ch = self.channel_for(mhz)
         if ch is None:
             if self.fallback is not None:
@@ -623,31 +771,63 @@ class RawBufferWwv(WwvSource):
             return self._none(f"no raw buffer for WWV {mhz:g} MHz "
                               f"({' or '.join(self.channel_names(mhz))}) under "
                               f"{' or '.join(self.roots) or 'no root'}", mhz)
-        todo = self._missing(ch, self.files(ch, t0, t1))
+        fs = self.files(ch, t0, t1)
+        try:
+            have = self.store.known(ch, list(fs))
+        except sqlite3.Error as exc:
+            self._db_warn(exc)
+            out = self._none(f"WWV cache unreadable ({exc}); not measuring", mhz)
+            out["channel"] = ch
+            return out
+        todo = {e: f for e, f in fs.items() if have.get(e) != (f["size"], f["mtime_ns"])}
+        fresh: Dict[int, tuple] = {}
+        waiting = 0
         if todo and len(todo) <= self.sync_files:
             for e in sorted(todo):
-                self._measure(ch, mhz, e, todo[e])
+                r = self._measure(ch, mhz, e, todo[e])
+                if r is PENDING:
+                    waiting += 1
+                elif r:                       # kept even if the cache could not take them
+                    for row in r:
+                        fresh[row["t"]] = (row["t"], row["hz"], row["snr"], row["q"],
+                                           row["hz2"], row["snr2"])
         elif todo:
             self.enqueue(ch, mhz, todo)
+        dberr = None
+        try:
+            rows = self.store.minutes(ch, t0, t1)
+        except sqlite3.Error as exc:
+            self._db_warn(exc)
+            rows, dberr = [], str(exc)
+        merged = {int(r[0]): r for r in rows}
+        merged.update({t: r for t, r in fresh.items() if t0 <= t < t1})
         nominal = mhz * 1e6
         pts = []
-        for t, hz, snr, q, hz2, snr2 in self.store.minutes(ch, t0, t1):
+        for t, hz, snr, q, hz2, snr2 in (merged[k] for k in sorted(merged)):
+            if not _finite(hz):
+                continue
+            if not _finite(snr):
+                snr, q = None, "weak"
             p = {"t": int(t), "hz": round(hz, 6), "ppb": round(hz / nominal * 1e9, 4),
                  "snr": None if snr is None else round(snr, 2), "q": q,
-                 "ok": q in ("ok", "gaps"), "two": hz2 is not None}
-            if hz2 is not None:
+                 "ok": q in ("ok", "gaps"), "two": _finite(hz2)}
+            if _finite(hz2):
                 p.update({"hz2": round(hz2, 6), "ppb2": round(hz2 / nominal * 1e9, 4),
-                          "snr2": None if snr2 is None else round(snr2, 2)})
+                          "snr2": round(snr2, 2) if _finite(snr2) else None})
             pts.append(p)
-        pend = self.pending(ch, t0, t1)
+        pend = self.pending(ch, t0, t1) + waiting
         out = self._none("", mhz)
         out.update({"channel": ch, "points": pts, "pending": pend,
                     "available": any(p["ok"] for p in pts)})
         if not out["available"]:
-            out["reason"] = (f"measuring WWV {mhz:g} MHz ({ch}): {pend} ten-minute files queued"
-                             if pend else
-                             f"no usable WWV {mhz:g} MHz carrier in {ch}'s raw buffer "
-                             f"in this period")
+            if dberr:
+                out["reason"] = f"WWV cache unreadable ({dberr})"
+            elif pend:
+                out["reason"] = (f"measuring WWV {mhz:g} MHz ({ch}): {pend} ten-minute "
+                                 f"files queued")
+            else:
+                out["reason"] = (f"no usable WWV {mhz:g} MHz carrier in {ch}'s raw buffer "
+                                 f"in this period")
         return out
 
 
@@ -668,5 +848,6 @@ def cache_dir_from(value: Optional[str], env: Optional[Dict[str, str]] = None) -
     return cd or DEFAULT_CACHE_DIR
 
 
-__all__ = ["RawBufferWwv", "CarrierStore", "SingleFlight", "decimate_stream", "measure_window",
+__all__ = ["RawBufferWwv", "CarrierStore", "SingleFlight", "FlightTimeout", "CorruptFile",
+           "TransientError", "classify_zstd", "read_cap", "decimate_stream", "measure_window",
            "measure_decimated", "measure_file", "roots_from", "cache_dir_from"]

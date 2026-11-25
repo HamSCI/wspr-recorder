@@ -344,3 +344,229 @@ def test_page_and_docs_explain_the_source_change():
     doc = (REPO / "docs" / "CARRIER-ARCHIVE.md").read_text()
     assert "raw_buffer" in doc and "WWV+WWVH" in doc and "noise" in doc
     assert "5.0.0" in doc and "unreliable" in doc
+
+
+# ---- fix round 1 ----------------------------------------------------------------------------
+
+@needs_zstd
+def test_at_most_two_measurements_at_once(tmp_path, monkeypatch):
+    f = make_raw(tmp_path / "raw", "WWV_20000", T0, 60, [(0.05, 1.0)])
+    meta = json.loads((f.parent / f"{T0}.json").read_text())
+    lock, now, peak = threading.Lock(), [0], [0]
+    real = R.decimate_stream
+
+    def slow(*a, **k):
+        with lock:
+            now[0] += 1
+            peak[0] = max(peak[0], now[0])
+        time.sleep(0.2)
+        try:
+            return real(*a, **k)
+        finally:
+            with lock:
+                now[0] -= 1
+    monkeypatch.setattr(R, "decimate_stream", slow)
+    th = [threading.Thread(target=R.measure_file, args=(str(f), meta, 20.0)) for _ in range(5)]
+    for t in th:
+        t.start()
+    for t in th:
+        t.join(30)
+    assert peak[0] == 2
+
+
+@needs_zstd
+def test_zstd_runs_with_a_memory_limit(tmp_path, monkeypatch):
+    f = make_raw(tmp_path / "raw", "WWV_20000", T0, 60, [(0.05, 1.0)])
+    meta = json.loads((f.parent / f"{T0}.json").read_text())
+    seen = []
+    real = subprocess.Popen
+    monkeypatch.setattr(R.subprocess, "Popen", lambda args, **k: seen.append(args) or real(args, **k))
+    assert R.measure_file(str(f), meta, 20.0)["rows"]
+    assert "--memory=64MB" in seen[0]
+
+
+def test_non_finite_is_weak_and_never_written():
+    nan = float("nan")
+    assert R.quality({"hz": nan, "snr": 50.0}, False) == "weak"
+    assert R.quality({"hz": 0.1, "snr": nan}, False) == "weak"
+    assert R.quality({"hz": 0.1, "snr": float("inf")}, False) == "weak"
+    y = _tone(0.2)
+    y[100] = nan
+    rows = R.measure_decimated(np.concatenate([y, _tone(0.3)]), 100.0, T0)
+    for r in rows:
+        assert r["hz"] is not None and np.isfinite(r["hz"])
+        assert r["snr"] is None or np.isfinite(r["snr"])
+    assert [r["t"] for r in rows if r["q"] != "weak"] == [T0 + 60]
+
+
+@needs_zstd
+def test_store_write_failure_still_returns_the_measurement(tmp_path, monkeypatch, caplog):
+    make_raw(tmp_path / "raw", "WWV_20000", T0, 60, [(0.05, 1.0)])
+    w = src(tmp_path)
+
+    def boom(*a, **k):
+        raise R.sqlite3.OperationalError("disk I/O error")
+    monkeypatch.setattr(w.store, "put", boom)
+    s = w.series(20.0, T0, T0 + 600)
+    assert s["available"] and abs(s["points"][0]["hz"] - 0.05) < 0.005
+    w.series(20.0, T0, T0 + 600)
+    assert sum("disk I/O error" in r.getMessage() for r in caplog.records) == 1
+
+
+def test_cache_read_errors_degrade(tmp_path, monkeypatch):
+    (tmp_path / "raw" / "WWV_20000").mkdir(parents=True)
+    w = src(tmp_path)
+
+    def boom(*a, **k):
+        raise R.sqlite3.DatabaseError("file is not a database")
+    for name in ("known", "minutes", "channels_with_rows"):
+        monkeypatch.setattr(w.store, name, boom)
+    s = w.series(20.0, T0, T0 + 600)
+    assert s["available"] is False and "cache" in s["reason"]
+
+
+def test_memory_store_is_one_shared_connection(tmp_path):
+    blocker = tmp_path / "file"
+    blocker.write_text("x")
+    st = R.CarrierStore(str(blocker / "cache"))
+    assert st.path is None and not hasattr(st, "_uri")
+    errs = []
+
+    def work(k):
+        try:
+            for i in range(20):
+                st.put(f"C{k}", T0 + 600 * i, 1, 2, 100.0,
+                       [{"t": T0 + 600 * i, "hz": 0.1, "snr": 50.0, "q": "ok",
+                         "hz2": None, "snr2": None}], None, 0.1)
+                st.minutes(f"C{k}", T0, T0 + 10 ** 6)
+                st.known(f"C{k}", [T0])
+        except Exception as exc:                     # noqa: BLE001
+            errs.append(exc)
+    th = [threading.Thread(target=work, args=(k,)) for k in range(4)]
+    for t in th:
+        t.start()
+    for t in th:
+        t.join(30)
+    assert errs == [] and len(st.minutes("C0", T0, T0 + 10 ** 6)) == 20
+
+
+@pytest.mark.parametrize("rc, err, killed, kind", [
+    (1, "zstd: x.zst: unsupported format", False, "corrupt"),
+    (1, "x.zst : Read error (39) : premature end", False, "corrupt"),
+    (1, "x.zst : Decoding error (36) : Data corruption detected", False, "corrupt"),
+    (1, "x.zst : Decoding error (36) : Frame requires too much memory for decoding", False,
+     "transient"),
+    (1, "x.zst: Permission denied", False, "transient"),
+    (-9, "", False, "transient"),
+    (0, "", True, "transient"),
+])
+def test_zstd_failures_classified(rc, err, killed, kind):
+    assert R.classify_zstd(rc, err, killed) == kind
+
+
+@needs_zstd
+def test_transient_errors_expire_corrupt_ones_stay(tmp_path, monkeypatch):
+    make_raw(tmp_path / "raw", "WWV_20000", T0, 60, [(0.05, 1.0)])
+    calls, real = [], R.measure_file
+
+    def flaky(*a, **k):
+        calls.append(1)
+        raise OSError(13, "Permission denied")
+    monkeypatch.setattr(R, "measure_file", flaky)
+    w = src(tmp_path)
+    w.series(20.0, T0, T0 + 600)
+    w.series(20.0, T0, T0 + 600)
+    assert len(calls) == 1                           # not hammered
+    t = time.time()
+    monkeypatch.setattr(R, "_now", lambda: t + 601)
+    w.series(20.0, T0, T0 + 600)
+    assert len(calls) == 2                           # but retried after 10 minutes
+    # a corrupt file stays cached
+    d = tmp_path / "raw" / "WWV_25000" / time.strftime("%Y%m%d", time.gmtime(T0))
+    d.mkdir(parents=True)
+    (d / f"{T0}.bin.zst").write_bytes(b"not zstd at all")
+    (d / f"{T0}.json").write_text(json.dumps({"minute_boundary": T0, "sample_rate": FS}))
+    monkeypatch.setattr(R, "measure_file", real)
+    w.series(25.0, T0, T0 + 600)
+    n = w.measured
+    monkeypatch.setattr(R, "_now", lambda: t + 10 ** 6)
+    w.series(25.0, T0, T0 + 600)
+    assert w.measured == n
+
+
+def test_watchdog_kills_a_stuck_zstd(tmp_path, monkeypatch):
+    fake = tmp_path / "zstd"
+    fake.write_text("#!/bin/sh\nexec sleep 30\n")
+    fake.chmod(0o755)
+    monkeypatch.setattr(R, "READ_TIMEOUT_S", 0.5)
+    t = time.monotonic()
+    with pytest.raises(R.TransientError):
+        R.measure_file(str(tmp_path / "x.bin.zst"), {"minute_boundary": T0, "sample_rate": FS},
+                       20.0, str(fake))
+    assert time.monotonic() - t < 10
+
+
+def test_single_flight_follower_times_out():
+    sf = R.SingleFlight()
+    go = threading.Event()
+    th = threading.Thread(target=lambda: sf.do("k", lambda: go.wait(10)))
+    th.start()
+    time.sleep(0.1)
+    with pytest.raises(R.FlightTimeout):
+        sf.do("k", lambda: None, timeout=0.2)
+    go.set()
+    th.join(10)
+
+
+@needs_zstd
+def test_follower_that_times_out_reports_pending(tmp_path, monkeypatch):
+    make_raw(tmp_path / "raw", "WWV_20000", T0, 60, [(0.05, 1.0)])
+    started, release = threading.Event(), threading.Event()
+    real = R.measure_file
+
+    def slow(*a, **k):
+        started.set()
+        release.wait(10)
+        return real(*a, **k)
+    monkeypatch.setattr(R, "measure_file", slow)
+    monkeypatch.setattr(R, "FOLLOW_TIMEOUT_S", 0.2)
+    w = src(tmp_path)
+    th = threading.Thread(target=w.series, args=(20.0, T0, T0 + 600))
+    th.start()
+    assert started.wait(10)
+    s = w.series(20.0, T0, T0 + 600)
+    release.set()
+    th.join(20)
+    assert s["pending"] >= 1 and not s["available"]
+
+
+def test_read_cap_clamped():
+    assert R.read_cap(24000, 600) == 24000 * 660
+    assert R.read_cap(10 ** 9, 10 ** 9) == 48000 * (1200 + 60)
+    assert R.read_cap(24000, -5) == 24000 * 60
+
+
+def test_queue_takes_the_most_recent_first(tmp_path, monkeypatch):
+    w = src(tmp_path)
+    order = []
+    monkeypatch.setattr(w, "_measure", lambda ch, mhz, e, f: order.append(e))
+    f = {"bin": "", "json": "", "size": 0, "mtime_ns": 0}
+    w.enqueue("WWV_20000", 20.0, {T0 - 86400 + 600 * k: f for k in range(3)})   # yesterday
+    w.enqueue("WWV_20000", 20.0, {T0 + 600 * k: f for k in range(2)})          # today, later
+    w.drain()
+    assert order == [T0 + 600, T0, T0 - 86400 + 1200, T0 - 86400 + 600, T0 - 86400]
+
+
+def test_prune_hourly_even_without_prefill(tmp_path, monkeypatch):
+    (tmp_path / "raw" / "WWV_20000").mkdir(parents=True)
+    w = src(tmp_path, prefill=False)
+    pruned = []
+    monkeypatch.setattr(w.store, "prune", lambda before: pruned.append(before))
+    t = time.time()
+    monkeypatch.setattr(R, "_now", lambda: t)
+    w.series(20.0, T0, T0 + 600)
+    w.series(20.0, T0, T0 + 600)
+    assert len(pruned) == 1 and pruned[0] == pytest.approx(t - R.KEEP_DAYS * 86400)
+    monkeypatch.setattr(R, "_now", lambda: t + 3601)
+    w.series(20.0, T0, T0 + 600)
+    assert len(pruned) == 2

@@ -286,7 +286,13 @@ dependency and a venv rebuild on every station) and decimated 960 000
 samples (7.7 MB) at a time, so the 115 MB of a whole file is never held at
 once. On a synthetic 10-minute file this took about 0.3 s of CPU (zstd
 included) on the development VM; budget up to ~1 s on a station's
-Beelink. Peak memory is the Python process plus ~20 MB, and zstd's ~40 MB.
+Beelink. Peak memory is the Python process plus ~20 MB, and zstd's ~40 MB. At most two files are measured at once (requests and the
+background thread together), each zstd runs with `--memory=64MB`, and a
+zstd that runs longer than 120 s is killed. Bad data (zstd reports
+corruption, a short payload, a malformed sidecar) is cached as a failure
+until the file changes; anything else (killed, timed out, unreadable, out
+of zstd memory) is logged and retried after 10 minutes. If the cache
+itself cannot be read or written, the page degrades and logs, never 500s.
 
 **The cache.** Each file is measured once. Its minutes go into
 `/var/cache/wspr-carrier-browser/wwv-carrier.sqlite` (the unit's
