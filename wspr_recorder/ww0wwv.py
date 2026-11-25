@@ -239,6 +239,7 @@ def carrier_track(meta: dict, rate: int, iq: np.ndarray, band: str,
         rf = ref + peak_near(z, rate, whole, 2.0)
         pts.append({"t": round(t0 + (s + nw / 2) / rate, 3),
                     "ppb": round(ppb(rf, nominal), 4),
+                    "hz": round(rf - nominal, 6),
                     "snr": round(snr_db(z, rate), 2)})
     return {"win_s": win, "points": pts}
 
@@ -389,7 +390,33 @@ def _iso(t: float) -> str:
     return time.strftime("%Y-%m-%dT%H:%M:%S", time.gmtime(t))
 
 
-def wwv_over(series: dict, t0: float, t1: float) -> Optional[float]:
-    """Mean WWV ppb over the minutes starting in [t0, t1), or None."""
-    v = [p["ppb"] for p in series.get("points", []) if t0 <= p["t"] < t1]
-    return round(float(np.mean(v)), 4) if v else None
+def wwv_over(series: dict, t0: float, t1: float, key: str = "ppb") -> Optional[float]:
+    """Mean WWV ``key`` (ppb, or hz) over the minutes starting in [t0, t1),
+    or None."""
+    v = [p[key] for p in series.get("points", []) if t0 <= p["t"] < t1]
+    return round(float(np.mean(v)), 6) if v else None
+
+
+# ---- absolute levels -------------------------------------------------------------
+#
+# wsprd's SNR is the signal's power over the noise in 2500 Hz.  The
+# recorder's noise rows (noise.py, wsprdaemon's method) are calibrated dBm
+# in 1 Hz ("dBm in 1Hz" on wsprdaemon's noise graphs: _RMS_NL_ADJUST holds
+# 10*log10(1/noise-equivalent bandwidth)).  So the signal, in dBm at the
+# antenna feed, is SNR + noise + 10*log10(2500).
+
+TEN_LOG_2500 = 10 * float(np.log10(2500.0))
+
+
+def noise_in_2500_dbm(noise_dbm_hz: Optional[float]) -> Optional[float]:
+    return None if noise_dbm_hz is None else noise_dbm_hz + TEN_LOG_2500
+
+
+def signal_dbm(snr_db_2500: Optional[float], noise_dbm_hz: Optional[float]) -> Optional[float]:
+    """Signal level, dBm, from an SNR in 2500 Hz and a noise density in dBm/Hz."""
+    if snr_db_2500 is None or noise_dbm_hz is None:
+        return None
+    try:
+        return float(snr_db_2500) + float(noise_dbm_hz) + TEN_LOG_2500
+    except (TypeError, ValueError):
+        return None

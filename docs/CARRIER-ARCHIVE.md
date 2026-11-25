@@ -253,6 +253,89 @@ plugged in through `ww0wwv.WwvSource.series()`.
 The service user (`wsprrec`) must be able to read `timestd.db`, and its
 `-wal` and `-shm` files.
 
+### ppb or Hz
+
+The **Doppler in [ppb] [Hz]** switch in the header changes every Doppler
+chart, on the cards and in the drill-down:
+
+- **ppb** (the default) is the comparison: WW0WWV and WWV on one scale.
+- **Hz** shows each signal's own offset from its own nominal, the way
+  other charts show it:
+  - WWV: hf-timestd's `doppler_hz`, unchanged;
+  - WW0WWV: its RF minus its nominal.
+
+  Hz at different carrier frequencies do not compare directly. The alias
+  lines become WWV's ±0.5 Hz.
+
+The JSON carries both units:
+
+- `/api/compare`: `ppb` and `hz` per cycle and per WWV point, plus
+  `wwv_ppb` and `wwv_hz` per cycle;
+- `/api/cycle`: `summary.hz`, `hz` on every track window, and `wwv_hz`.
+
+The switch is remembered in the browser.
+
+### Signal levels (dBm)
+
+Each card has a third panel: WW0WWV's signal level in **dBm at the antenna
+feed**, one point per cycle, with the noise floor in 2500 Hz as a grey
+line. The drill-down shows the same level per track window.
+
+**How it is computed.** wsprd's SNR is the signal over the noise in
+2500 Hz. The recorder's noise rows are calibrated **dBm in 1 Hz**: the
+`noise.py` port of wsprdaemon's method, the same numbers as wsprdaemon's
+noise graphs ("dBm in 1Hz"). So:
+
+```
+level_dbm = wsprd SNR + noise_dbm_hz + 10·log10(2500)        (+33.98 dB)
+```
+
+The track windows use the carrier's own per-window SNR, measured the same
+way, in 2500 Hz.
+
+**Where the noise comes from.** These are the rows the recorder ships to
+wsprdaemon.org:
+
+- They live in the sink's queue: `pending_uploads` with `target_db` `wspr`
+  (or `$SIGMOND_SQLITE_DB_WSPR`) and `target_table` `noise`.
+- Each holds JSON with `time`, `band`, `reporter_id`, `rx_source`,
+  `fft_noise_dbm` and `rms_noise_dbm`.
+- The FFT value (wsprd's own 1369.5–1630.5 Hz passband) is used, else
+  the RMS one. A 0.0 means "not measured".
+- A row matches a carrier by receiver directory (the safe reporter id, with
+  `_<source>` for multi-source), band and cycle start.
+
+The sink is found as `hamsci_sink` finds it:
+`$CARRIER_BROWSER_SINK_DB` / `--sink-db`, `$HAMSCI_SINK_PATH`,
+`$SIGMOND_SQLITE_PATH`, `/etc/hs-uploader/sink.toml`,
+`/var/lib/sigmond/sink.db`, `/var/lib/hs-uploader/sink.db`. It is opened
+`mode=ro`. sigmond trims noise rows after about **24 h**
+(`WSPR_RETENTION_MIN`), so older days show no level.
+
+**How solid it is.** The calibration has these parts:
+
+- wsprdaemon's KiwiSDR-derived base constants;
+- the per-band KA9Q/RX888 offsets measured at AI6VN against a co-located
+  calibrated KiwiSDR (±0.3 dB RMS, ±0.1 dB C2 against it);
+- a Kiwi source's `noise_offset_db`.
+
+That makes it a good **relative** calibration between bands and sites.
+Absolute accuracy is only as good as that reference KiwiSDR's own (a few
+dB). The level adds wsprd's integer SNR (±1 dB, own noise estimate),
+which is not exactly the FFT floor's estimator. Read a level as about
+±3 dB absolute, much better relative from cycle to cycle.
+
+**WWV has no calibrated level.**
+
+- hf-timestd stores no per-channel carrier power: `L2_tick_timing` has
+  `mean_snr_db`, a relative tick matched-filter SNR.
+- The L1 `channel_observables` schema has a `carrier_power_db`, but
+  nothing writes it.
+- The `authority_snapshot` table's `t6_baseband_power` is only the T6
+  pilot channel.
+
+The page says so and does not invent one. The WWV SNR panel stays.
+
 ### WWV's alias range
 
 hf-timestd resolves `doppler_hz` only within **±0.5 Hz**: beyond that the
@@ -317,6 +400,7 @@ The unit takes its settings from the environment. Change them with
 | `CARRIER_BROWSER_PORT` | `8089` | port (`--port`) |
 | `CARRIER_BROWSER_ALLOWED_HOSTS` | empty | extra host names the page answers to, comma-separated (`--allow-host`) |
 | `TIMESTD_DB` | `/var/lib/timestd/phase2/timestd.db` | hf-timestd's database, or `none` |
+| `CARRIER_BROWSER_SINK_DB` | empty (found as hamsci_sink finds it) | the sink with wspr-recorder's noise rows, for dBm levels (`--sink-db`), or `none` |
 
 #### Reaching it through a host relay
 

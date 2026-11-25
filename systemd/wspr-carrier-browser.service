@@ -34,6 +34,9 @@ Environment=CARRIER_BROWSER_PORT=8089
 Environment=CARRIER_BROWSER_ALLOWED_HOSTS=
 # hf-timestd's database, for WWV's Doppler (read-only; "none" for no WWV).
 Environment=TIMESTD_DB=/var/lib/timestd/phase2/timestd.db
+# The sink with wspr-recorder's noise rows, for signal levels in dBm
+# (read-only).  Empty: found as hamsci_sink finds it; "none" for no levels.
+Environment=CARRIER_BROWSER_SINK_DB=
 
 WorkingDirectory=/opt/git/sigmond/wspr-recorder
 # --bind, --port, the Host list and the database come from the environment.
