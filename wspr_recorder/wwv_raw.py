@@ -73,6 +73,11 @@ DEFAULT_ROOTS = ("/var/lib/timestd/raw_buffer", "/dev/shm/timestd/raw_buffer")
 DEFAULT_CACHE_DIR = "/var/cache/wspr-carrier-browser"
 CACHE_FILE = "wwv-carrier.sqlite"
 SCHEMA = 2
+# hf-timestd's raw sample formats (hf_timestd.core.iq_codec): complex64, or
+# binary16 components scaled by F16_SCALE (archive_dtype = "f16", its default).
+DTYPE_C64 = "complex64"
+DTYPE_F16 = "complex-f16"
+F16_SCALE = 4096.0
 
 SEARCH_HZ = 1.5             # the peak is searched within +-1.5 Hz of nominal
 OUT_RATE = 100.0            # Hz after the boxcar
@@ -163,18 +168,24 @@ class SingleFlight:
 # ---- decimation and measurement ---------------------------------------------
 
 def decimate_stream(f, factor: int, max_samples: int,
-                    chunk_samples: int = CHUNK_SAMPLES) -> np.ndarray:
-    """Boxcar-average blocks of ``factor`` complex64 samples read from the
+                    chunk_samples: int = CHUNK_SAMPLES,
+                    fmt: str = DTYPE_C64) -> np.ndarray:
+    """Boxcar-average blocks of ``factor`` complex samples read from the
     binary stream ``f`` (anything with ``readinto``), ``chunk_samples`` at
     a time into one reused buffer; at most ``max_samples`` are read.  A
-    last partial block is dropped.  Returns complex128."""
+    last partial block is dropped.  Returns complex128.
+
+    ``fmt`` is the sidecar's dtype: ``complex64``, or ``complex-f16``
+    (hf-timestd's default archive: interleaved little-endian binary16 of
+    each component times F16_SCALE)."""
+    width = 4 if fmt == DTYPE_F16 else 8
     chunk = max(factor, chunk_samples // factor * factor)
-    buf = bytearray(chunk * 8)
+    buf = bytearray(chunk * width)
     mv = memoryview(buf)
     out: List[np.ndarray] = []
     total = 0
     while total < max_samples:
-        want = min(chunk, (max_samples - total) // factor * factor) * 8
+        want = min(chunk, (max_samples - total) // factor * factor) * width
         if want <= 0:
             break
         got = 0
@@ -183,9 +194,13 @@ def decimate_stream(f, factor: int, max_samples: int,
             if not n:
                 break
             got += n
-        nblk = got // 8 // factor
+        nblk = got // width // factor
         if nblk:
-            x = np.frombuffer(buf, dtype="<c8", count=nblk * factor)
+            if fmt == DTYPE_F16:
+                comp = np.frombuffer(buf, dtype="<f2", count=2 * nblk * factor)
+                x = (comp.astype(np.float32) / np.float32(F16_SCALE)).view(np.complex64)
+            else:
+                x = np.frombuffer(buf, dtype="<c8", count=nblk * factor)
             out.append(x.reshape(nblk, factor).mean(axis=1, dtype=np.complex128))
             total += nblk * factor
         if got < want:
@@ -332,7 +347,8 @@ def measure_file(bin_path: str, meta: dict, mhz: float, zstd: str = "zstd") -> d
     TransientError for anything worth retrying.  At most
     MAX_CONCURRENT_MEASUREMENTS run at once, process-wide."""
     try:
-        if (meta.get("dtype", "complex64") != "complex64"
+        fmt = meta.get("dtype", DTYPE_C64)
+        if (fmt not in (DTYPE_C64, DTYPE_F16)
                 or meta.get("byte_order", "little") != "little"):
             raise ValueError(f"unsupported sample format {meta.get('dtype')}/"
                              f"{meta.get('byte_order')}")
@@ -359,7 +375,7 @@ def measure_file(bin_path: str, meta: dict, mhz: float, zstd: str = "zstd") -> d
         dog.daemon = True
         dog.start()
         try:
-            y = decimate_stream(proc.stdout, factor, max_samples)
+            y = decimate_stream(proc.stdout, factor, max_samples, fmt=fmt)
         except OSError as exc:
             proc.kill()
             raise TransientError(f"reading zstd's output: {exc}") from None
@@ -454,6 +470,8 @@ class CarrierStore:
                 con.executescript("DROP TABLE IF EXISTS files; DROP TABLE IF EXISTS minutes;")
                 con.executescript(_DDL)
                 con.execute("INSERT OR REPLACE INTO meta VALUES ('schema', ?)", (str(SCHEMA),))
+            # Files refused before complex-f16 was readable get measured now.
+            con.execute("DELETE FROM files WHERE error LIKE '%unsupported sample format%'")
             con.commit()
 
     def known(self, channel: str, epochs: Sequence[int]) -> Dict[int, Tuple[int, int]]:

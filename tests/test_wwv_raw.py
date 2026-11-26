@@ -34,7 +34,7 @@ needs_zstd = pytest.mark.skipif(shutil.which("zstd") is None, reason="zstd CLI n
 
 
 def make_raw(root: Path, channel: str, epoch: int, seconds: int, carriers, noise=0.3,
-             freq_hz=None, completeness=100.0) -> Path:
+             freq_hz=None, completeness=100.0, dtype="complex64") -> Path:
     """One raw-buffer file: <root>/<channel>/<yyyymmdd>/<epoch>.bin.zst + .json."""
     d = root / channel / time.strftime("%Y%m%d", time.gmtime(epoch))
     d.mkdir(parents=True, exist_ok=True)
@@ -48,14 +48,17 @@ def make_raw(root: Path, channel: str, epoch: int, seconds: int, carriers, noise
             for hz, amp in carriers:
                 x = x + amp * np.exp(2j * np.pi * hz * t)
             x = np.round(x * 8) / 8
-            f.write(x.astype("<c8").tobytes())
+            if dtype == "complex-f16":   # hf-timestd's default: interleaved binary16 x 4096
+                f.write((x.astype("<c8").view("<f4") * 4096.0).astype("<f2").tobytes())
+            else:
+                f.write(x.astype("<c8").tobytes())
     subprocess.run(["zstd", "-q", "-f", "--rm", str(raw), "-o", str(raw) + ".zst"], check=True)
     if freq_hz is None:
         freq_hz = int(channel.split("_")[1]) * 1000
     (d / f"{epoch}.json").write_text(json.dumps({
         "minute_boundary": epoch, "channel_name": channel, "frequency_hz": freq_hz,
         "sample_rate": FS, "samples_written": seconds * FS, "samples_expected": 600 * FS,
-        "file_duration_sec": 600, "completeness_pct": completeness, "dtype": "complex64",
+        "file_duration_sec": 600, "completeness_pct": completeness, "dtype": dtype,
         "byte_order": "little", "compression": "zstd"}))
     return d / f"{epoch}.bin.zst"
 
@@ -570,3 +573,43 @@ def test_prune_hourly_even_without_prefill(tmp_path, monkeypatch):
     monkeypatch.setattr(R, "_now", lambda: t + 3601)
     w.series(20.0, T0, T0 + 600)
     assert len(pruned) == 2
+
+
+# ---- hf-timestd's F16 archives (archive_dtype = "f16", the default since v3.95) -------
+
+@needs_zstd
+def test_f16_chunk_measured_like_complex64(tmp_path):
+    make_raw(tmp_path / "raw", "WWV_20000", T0, 120, [(-0.155, 1.0)], dtype="complex-f16")
+    s = src(tmp_path).series(20.0, T0, T0 + 600)
+    assert s["available"] and [p["t"] for p in s["points"]] == [T0, T0 + 60]
+    for p in s["points"]:
+        assert abs(p["hz"] - (-0.155)) < 0.005 and p["q"] == "ok"
+
+
+def test_decimate_stream_f16_matches_complex64():
+    rng = np.random.default_rng(7)
+    x = (rng.standard_normal(4800) + 1j * rng.standard_normal(4800)).astype("<c8")
+    f16 = (x.view("<f4") * 4096.0).astype("<f2").tobytes()
+    a = R.decimate_stream(io.BytesIO(x.tobytes()), 240, 4800)
+    b = R.decimate_stream(io.BytesIO(f16), 240, 4800, fmt="complex-f16")
+    assert len(a) == len(b) == 20
+    assert np.allclose(a, b, atol=1e-3)
+
+
+def test_unknown_dtype_still_refused():
+    with pytest.raises(R.CorruptFile, match="unsupported sample format"):
+        R.measure_file("/nonexistent", {"dtype": "complex-f8", "sample_rate": FS,
+                                        "minute_boundary": T0}, 20.0)
+
+
+def test_files_refused_for_format_before_f16_support_are_retried(tmp_path):
+    cache = tmp_path / "cache"
+    st = R.CarrierStore(str(cache))
+    with st._use(write=True) as con:
+        con.execute("INSERT INTO files VALUES ('WWV_20000', ?, 1, 1, 100, 0, ?, 0, 0, NULL)",
+                    (T0, "corrupt: malformed sidecar: unsupported sample format complex-f16/little"))
+        con.execute("INSERT INTO files VALUES ('WWV_20000', ?, 1, 1, 100, 0, ?, 0, 0, NULL)",
+                    (T0 + 600, "corrupt: zstd: unsupported format"))
+        con.commit()
+    st2 = R.CarrierStore(str(cache))
+    assert set(st2.known("WWV_20000", [T0, T0 + 600])) == {T0 + 600}
