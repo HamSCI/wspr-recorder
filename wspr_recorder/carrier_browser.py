@@ -994,7 +994,7 @@ async function loadCompare(){const date=$("date").value;$("status").textContent=
  try{cmp=await j("/api/compare?date="+date);}catch(e){$("status").textContent=String(e);return;}
  const cur=rxSel();$("crx").innerHTML="";cmp.receivers.forEach(r=>opt($("crx"),r));if(cmp.receivers.includes(cur))$("crx").value=cur;
  $("rxwrap").hidden=view!=="compare"||cmp.receivers.length<2;
- const n=cmp.bands.reduce((a,b)=>a+b.cycles.length,0),pc={};cmp.bands.forEach(b=>{const w=b.wwv||{};if(w.pending)pc[w.channel]=w.pending;}),pend=Object.values(pc).reduce((a,x)=>a+x,0);
+ const n=cmp.bands.reduce((a,b)=>a+b.cycles.length,0),pc={};cmp.bands.forEach(b=>{const w=b.wwv||{};if(w.pending)pc[w.channel]=w.pending;});const pend=Object.values(pc).reduce((a,x)=>a+x,0);
  $("status").textContent=(n?"":"No "+cmp.call+" carriers on "+dayLabel(date)+". ")+(pend?"Measuring WWV: "+pend+" ten-minute files queued; this page reloads itself.":"");
  drawCompare();clearTimeout(window._reload);if(pend)window._reload=setTimeout(()=>{if(view==="compare"&&$("date").value===date)loadCompare();},30000);}
 function bandCycles(b){const rx=rxSel();return b.cycles.filter(c=>!rx||c.receiver===rx);}
