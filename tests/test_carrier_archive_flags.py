@@ -1,7 +1,7 @@
 """Decoder options for the carrier archive: wsprd -I DIR, jt9 --carrier-dir DIR.
 
 Passed only when the archive is enabled AND the binary's help text lists the
-option (ubersdr 5eeeb53, madpsy PR #6).  Otherwise the command lines are
+option (ubersdr e8c2c52, madpsy PR #8).  Otherwise the command lines are
 exactly today's.
 """
 from __future__ import annotations

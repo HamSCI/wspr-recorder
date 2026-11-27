@@ -1,14 +1,15 @@
 """Carrier archive: each WSPR / FST4W spot's carrier, its modulation removed.
 
 Once wsprd or jt9 has decoded a spot it knows the tones, so the ubersdr
-builds (5eeeb53 and later, madpsy PR #6) can multiply the samples by the
+builds (e8c2c52 and later, madpsy PR #8) can multiply the samples by the
 conjugate of the decoded signal and write what is left, the bare carrier: a
 2-channel 32-bit float IQ .wav at 15 Hz (about 13 KB for a WSPR-2 spot), with
 the decode's particulars as JSON in its LIST/INFO/ICMT chunk.  The options
 are ``wsprd -I DIR`` and ``jt9 --fst4w --carrier-dir DIR``; in DIR each
 decode becomes ``CALL_AUDIOHZ.wav`` (carrier_iq.cpp file_name: the call with
 ``<>`` taken off and every non-alphanumeric as ``_``, the audio frequency
-``%.3f``).
+``%.3f``), or ``CALL_AUDIOHZ_YYMMDD_HHMM.wav`` once the decoder adds the
+period to the name, as madpsy proposed; both are filed the same way.
 
 After each decode this module files those files, as wsprdaemon's
 carrier-archive.sh does, at::
@@ -45,8 +46,30 @@ from typing import Callable, List, Optional, Sequence, Union
 
 logger = logging.getLogger(__name__)
 
-# CALL_AUDIOHZ.wav as the decoder names it (the call may itself hold '_').
-_CARRIER_NAME_RE = re.compile(r"^(?P<call>.+)_(?P<hz>\d+(?:\.\d+)?)\.wav$")
+# The decoder's names for a carrier (the call may itself hold '_'):
+#   CALL_AUDIOHZ.wav                as ubersdr e8c2c52 (PR #8) names it;
+#   CALL_AUDIOHZ_YYMMDD_HHMM.wav    with the period added, as madpsy proposed
+#                                   after merging #8, so carriers of several
+#                                   periods can share one directory.
+# The timed form is tried first: the untimed pattern's greedy call would
+# otherwise swallow "_AUDIOHZ_YYMMDD" and read HHMM as the frequency.  The
+# decoder writes AUDIOHZ as %.3f, so an untimed name never ends in
+# "_<6 digits>_<4 digits>.wav".  The name's own period is not used: each
+# decoder run gets its own scratch dir for one cycle, and the archive files
+# by that cycle's start.
+_CARRIER_NAME_RES = (
+    re.compile(r"^(?P<call>.+)_(?P<hz>\d+(?:\.\d+)?)_(?P<yymmdd>\d{6})_(?P<hhmm>\d{4})\.wav$"),
+    re.compile(r"^(?P<call>.+)_(?P<hz>\d+(?:\.\d+)?)\.wav$"),
+)
+
+
+def _match_carrier_name(name: str) -> Optional["re.Match[str]"]:
+    """The decoder's carrier file name parsed (call, hz), or None."""
+    for rx in _CARRIER_NAME_RES:
+        m = rx.match(name)
+        if m:
+            return m
+    return None
 # A root is only purged if it holds this file, which the recorder writes when
 # it creates the root (or first uses an empty / archive-shaped one): purge
 # can then never empty a directory that was not made for the archive.
@@ -359,7 +382,7 @@ class CarrierArchive:
                 except OSError:
                     continue
                 for name in names:
-                    m = _CARRIER_NAME_RE.match(name)
+                    m = _match_carrier_name(name)
                     if not m:
                         continue
                     call = m.group("call")

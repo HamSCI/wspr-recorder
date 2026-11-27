@@ -33,6 +33,12 @@ For each decode the decoder writes a small `.wav`:
   frequency, w50 spread, start offset) are stored as JSON in the WAV's
   `LIST/INFO/ICMT` comment.
 
+The decoder names it `CALL_AUDIOHZ.wav`, or `CALL_AUDIOHZ_YYMMDD_HHMM.wav`
+if the decoder puts the period in the name (proposed upstream after PR #8,
+so several periods can share one directory). wspr-recorder accepts both. It
+gives each decoder run its own scratch directory for one cycle, and takes
+the date and time from the cycle, not from the name.
+
 wspr-recorder files each one as:
 
 ```
@@ -56,7 +62,8 @@ at present, so only one pass runs.
 
 ## Requirements
 
-The ubersdr decoders at **5eeeb53 or later** (madpsy ubersdr_wsprd PR #6),
+The ubersdr decoders at **e8c2c52 or later** (madpsy ubersdr_wsprd PR #8,
+merged 2026-11-27; sigmond pinned Rob's fork at 668cfd2 before that),
 which add:
 
 - `wsprd -I DIR`: usage line `-I dir: write each decode's carrier, ...`

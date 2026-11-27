@@ -109,7 +109,7 @@ def wav_format_tag(path: Path) -> Optional[int]:
 # arguments) lists "-F fine", `jt9 --help` lists "--fine-freq".  Cached per
 # (path, mtime), so a decoder-set swap is seen at the next decode.
 #
-# The carrier archive's options (ubersdr 5eeeb53, madpsy PR #6) are probed
+# The carrier archive's options (ubersdr e8c2c52, madpsy PR #8) are probed
 # the same way: wsprd's usage lists "-I dir:", `jt9 --help` "--carrier-dir".
 _WSPRD_FINE_RE = re.compile(r"^ *-F fine", re.MULTILINE)
 _WSPRD_CARRIER_RE = re.compile(r"^ *-I dir", re.MULTILINE)

@@ -232,7 +232,7 @@ modes = ["W2"]
 # Keeps each WSPR / FST4W spot's carrier, its modulation removed, as a small
 # 15 Hz IQ .wav (about 13 KB per WSPR-2 spot):
 #   <root>/YYYYMMDD/<reporter id>/<band>/HHMM_MODE_CALL_RFHZ.wav
-# Needs the ubersdr decoders at 5eeeb53 or later (wsprd -I, jt9
+# Needs the ubersdr decoders at e8c2c52 or later (wsprd -I, jt9
 # --carrier-dir); with older decoders nothing is written and decoding is
 # unchanged.  Browse it with the wspr-carrier-browser.service unit
 # (127.0.0.1:8089; reach it with ssh -L 8089:127.0.0.1:8089 <host>).

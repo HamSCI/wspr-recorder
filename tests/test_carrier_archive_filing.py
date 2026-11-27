@@ -102,6 +102,39 @@ def test_fst4w_mode_and_band_names(tmp_path):
         "20261123/AC0G-B1/630/1408_F15_G3ZIL_475735.123.wav"]
 
 
+def test_files_names_with_the_period(tmp_path):
+    """madpsy's proposed CALL_AUDIOHZ_YYMMDD_HHMM.wav (after PR #8) files
+    exactly as CALL_AUDIOHZ.wav does: the call is not read as
+    CALL_AUDIOHZ_YYMMDD, nor HHMM as the frequency.  Both forms may sit in
+    one dir (an older and a newer decoder, the -n pass and the other)."""
+    p = tmp_path / "p1"
+    _wav(p, "K1ABC_1500.124_261123_1408.wav")
+    _wav(p, "PJ4_K1ABC_1460.000_261123_1408.wav")
+    _wav(p, "W2XYZ_1420.500.wav")
+    n = _arch(tmp_path).file_cycle([p], band="20", when=WHEN, mode="W2",
+                                   dial_hz=14_095_600)
+    assert n == 3
+    assert _filed(tmp_path) == [
+        "20261123/AC0G-B1/20/1408_W2_K1ABC_14097100.124.wav",
+        "20261123/AC0G-B1/20/1408_W2_PJ4_K1ABC_14097060.000.wav",
+        "20261123/AC0G-B1/20/1408_W2_W2XYZ_14097020.500.wav",
+    ]
+
+
+def test_period_name_passes_the_call_filter(tmp_path):
+    """The default calls = ["WW0WWV"] keeps WW0WWV's timed name; a misparse
+    (call "WW0WWV_1500.049_261123") would have discarded it silently."""
+    p = tmp_path / "p1"
+    _wav(p, "WW0WWV_1500.049_261123_1408.wav")
+    _wav(p, "K1ABC_1500.124_261123_1408.wav")
+    arch = CarrierArchive(root=tmp_path / "archive", receiver="AC0G-B1",
+                          calls=["WW0WWV"])
+    assert arch.file_cycle([p], band="40", when=WHEN, mode="W2",
+                           dial_hz=7_038_600) == 1
+    assert _filed(tmp_path) == [
+        "20261123/AC0G-B1/40/1408_W2_WW0WWV_7040100.049.wav"]
+
+
 def test_ignores_partial_and_foreign_files(tmp_path):
     p = tmp_path / "p1"
     _wav(p, "K1ABC_1500.124.wav.tmp")      # write_wav's in-progress name

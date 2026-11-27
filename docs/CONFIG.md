@@ -104,7 +104,7 @@ unknown frequencies get directory `"<hz>Hz"`.
 ## `[carrier_archive]` (optional, off by default)
 
 Keeps each WSPR/FST4W spot's carrier (`wsprd -I`, `jt9 --carrier-dir`;
-ubersdr decoders 5eeeb53+) as `<root>/YYYYMMDD/RECEIVER/BAND/HHMM_MODE_CALL_RFHZ.wav`.
+ubersdr decoders e8c2c52+) as `<root>/YYYYMMDD/RECEIVER/BAND/HHMM_MODE_CALL_RFHZ.wav`.
 See [CARRIER-ARCHIVE.md](CARRIER-ARCHIVE.md).
 
 **Changed 2026-11-25:** enabling the archive now keeps only WW0WWV's
